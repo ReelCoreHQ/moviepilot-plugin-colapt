@@ -206,7 +206,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.3.0"
+    plugin_version = "0.3.1"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -232,6 +232,8 @@ class ColaCrossSeed(_PluginBase):
     _iyuu_json = ""
     _event = Event()
     _csrf = ""
+    # host -> 可用的 pieces-hash 路径（憨憨是 /nexusapi/pieces-hash，其余多为 /api/pieces-hash）；"" 表示不支持
+    _pieces_paths: Dict[str, str] = {}
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -400,18 +402,40 @@ class ColaCrossSeed(_PluginBase):
         return rsp.content if _valid_torrent(rsp.content) else b""
 
     def _site_lookup(self, site: Dict[str, Any], pieces_hash: str) -> Tuple[Optional[str], str]:
-        url = (site.get("url") or "").rstrip("/") + "/api/pieces-hash"
-        try:
-            rsp = requests.post(url, json={"passkey": site.get("passkey", ""), "pieces_hash": [pieces_hash]},
-                                timeout=REQUEST_TIMEOUT)
+        host = (site.get("url") or "").split("://", 1)[-1].split("/")[0].lower()
+        cached = self._pieces_paths.get(host, None)
+        if cached == "":
+            return None, "站点不支持 pieces-hash 接口"
+        paths = [cached] if cached else ["/api/pieces-hash", "/nexusapi/pieces-hash"]
+        last = ""
+        for path in paths:
+            url = (site.get("url") or "").rstrip("/") + path
+            try:
+                rsp = requests.post(url, json={"passkey": site.get("passkey", ""), "pieces_hash": [pieces_hash]},
+                                    timeout=REQUEST_TIMEOUT)
+            except Exception as err:
+                last = str(err)
+                continue
+            if rsp.status_code == 404 or rsp.status_code == 405:
+                last = f"HTTP {rsp.status_code}（无此接口）"
+                continue
             if rsp.status_code != 200:
-                return None, f"HTTP {rsp.status_code}"
-            data = ((rsp.json() or {}).get("data") or {})
-            if isinstance(data, dict):
-                return data.get(pieces_hash), ""
-            return None, "response data is not a dict"
-        except Exception as err:
-            return None, str(err)
+                last = f"HTTP {rsp.status_code}"
+                continue
+            try:
+                data = ((rsp.json() or {}).get("data") or {})
+            except Exception:
+                last = "返回不是 JSON"
+                continue
+            if not isinstance(data, dict):
+                last = "返回格式不匹配"
+                continue
+            self._pieces_paths[host] = path
+            return data.get(pieces_hash), ""
+        # 只有 404/405 才算“不支持”；超时/500 下次还会重试
+        if last.startswith("HTTP 404") or last.startswith("HTTP 405"):
+            self._pieces_paths[host] = ""
+        return None, last
 
     def _site_download(self, site: Dict[str, Any], torrent_id: str) -> bytes:
         url = f"{(site.get('url') or '').rstrip('/')}/download.php"
@@ -623,27 +647,38 @@ class ColaCrossSeed(_PluginBase):
         return lines
 
     def _test_one_site(self, site: Dict[str, str]) -> Tuple[str, bool, str]:
-        url = site["url"].rstrip("/") + "/api/pieces-hash"
-        try:
-            rsp = requests.post(
-                url,
-                json={"passkey": site["passkey"], "pieces_hash": ["0" * 40]},
-                timeout=8,
-                headers={"User-Agent": "MoviePilot-ColaCrossSeed/0.3"},
-            )
-            if rsp.status_code == 200:
-                try:
-                    body = rsp.json()
-                except Exception:
-                    return site["name"], False, "返回不是 JSON（可能不是 NexusPHP 站）"
-                if isinstance(body.get("data"), (dict, list)):
-                    return site["name"], True, "连接成功"
-                return site["name"], False, "接口返回格式不匹配"
+        host = site["url"].split("://", 1)[-1].split("/")[0].lower()
+        last = ""
+        for path in ("/api/pieces-hash", "/nexusapi/pieces-hash"):
+            url = site["url"].rstrip("/") + path
+            try:
+                rsp = requests.post(
+                    url,
+                    json={"passkey": site["passkey"], "pieces_hash": ["0" * 40]},
+                    timeout=8,
+                    headers={"User-Agent": "MoviePilot-ColaCrossSeed/0.3"},
+                )
+            except Exception as err:
+                last = f"连不上：{type(err).__name__}"
+                continue
+            if rsp.status_code in (404, 405):
+                last = "站点没有 pieces-hash 接口（辅种匹配用不了）"
+                continue
             if rsp.status_code in (401, 403):
                 return site["name"], False, f"passkey 不对或被拒绝（HTTP {rsp.status_code}）"
-            return site["name"], False, f"HTTP {rsp.status_code}"
-        except Exception as err:
-            return site["name"], False, f"连不上：{type(err).__name__}"
+            if rsp.status_code != 200:
+                last = f"HTTP {rsp.status_code}"
+                continue
+            try:
+                body = rsp.json()
+            except Exception:
+                last = "返回不是 JSON（可能不是 NexusPHP 站）"
+                continue
+            if isinstance(body.get("data"), (dict, list)):
+                self._pieces_paths[host] = path
+                return site["name"], True, f"连接成功（{path}）"
+            last = "接口返回格式不匹配"
+        return site["name"], False, last or "未知错误"
 
     def _test_sites(self) -> List[str]:
         sites = self._other_sites()
