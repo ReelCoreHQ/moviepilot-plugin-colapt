@@ -3,7 +3,7 @@
     "name": "可乐PT辅种",
     "description": "参考 ReseedPuppy / IYUU 辅种插件：扫客户端已有资源，与可乐PT 对照，存在就自动拉可乐种子辅种；支持直接导入 IYUU 站点配置、按行填写其他站（域名+passkey）与下载器（地址+账号密码）。",
     "labels": "做种",
-    "version": "0.4.6",
+    "version": "0.4.7",
     "icon": "https://www.colapt.com/favicon.ico",
     "author": "ColaPT",
     "level": 1,

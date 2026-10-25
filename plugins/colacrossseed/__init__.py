@@ -256,7 +256,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.6"
+    plugin_version = "0.4.7"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1030,7 +1030,10 @@ class ColaCrossSeed(_PluginBase):
                 # 方向二：客户端已是可乐种子，去别的站补同 pieces 的种
                 elif self._direction in ("both", "other_only") and self._iyuu_token and sid_map:
                     # IYUU 云端匹配：把客户端 hash 发过去，拿回「站点 + torrent_id」。
-                    for entry in iyuu_hits.get(torrent["hash"]) or []:
+                    entries = iyuu_hits.get(torrent["hash"]) or []
+                    if entries:
+                        logger.info(f"IYUU 待处理 hash={torrent['hash'][:8]} 条目 {len(entries)}")
+                    for entry in entries:
                         site = sid_map.get(int(entry.get("sid") or 0))
                         torrent_id = str(entry.get("torrent_id") or "")
                         if not site or not torrent_id:
