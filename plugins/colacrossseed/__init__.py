@@ -582,13 +582,14 @@ class ColaCrossSeed(_PluginBase):
         cutoff = time.time() - 3600
         return [t for t in times if isinstance(t, (int, float)) and t > cutoff]
 
-    def _take_slot(self) -> bool:
+    def _budget_left(self) -> int:
+        return max(0, self._max_per_hour - len(self._add_times()))
+
+    def _record_add(self) -> None:
+        """只有真正加进客户端的种子才占配额；扫描、匹配、失败都不占。"""
         times = self._add_times()
-        if len(times) >= self._max_per_hour:
-            return False
         times.append(time.time())
         self.save_data("add_times", times)
-        return True
 
     def _done(self) -> List[str]:
         return self.get_data("done") or []
@@ -657,8 +658,8 @@ class ColaCrossSeed(_PluginBase):
                     if key in done:
                         stats["skipped"] += 1
                         continue
-                    if not self._take_slot():
-                        logger.info("已达到每小时辅种上限，结束本次")
+                    if self._budget_left() <= 0:
+                        logger.info("已达到每小时辅种上限（只统计成功添加的种子），结束本次")
                         self._finish(stats)
                         return
                     data = self._download_cola(int(hit.get("id")))
@@ -667,6 +668,7 @@ class ColaCrossSeed(_PluginBase):
                         continue
                     if client.add(data, torrent.get("save_path", ""), self._skip_check, torrent.get("category", "")):
                         stats["added"] += 1
+                        self._record_add()
                         done.add(key)
                         self._remember(key)
                     else:
@@ -686,8 +688,8 @@ class ColaCrossSeed(_PluginBase):
                         if key in done:
                             stats["skipped"] += 1
                             continue
-                        if not self._take_slot():
-                            logger.info("已达到每小时辅种上限，结束本次")
+                        if self._budget_left() <= 0:
+                            logger.info("已达到每小时辅种上限（只统计成功添加的种子），结束本次")
                             self._finish(stats)
                             return
                         remote = self._site_download(site, str(remote_id))
@@ -696,6 +698,7 @@ class ColaCrossSeed(_PluginBase):
                             continue
                         if client.add(remote, torrent.get("save_path", ""), self._skip_check, torrent.get("category", "")):
                             stats["filled"] += 1
+                            self._record_add()
                             done.add(key)
                             self._remember(key)
                         else:
