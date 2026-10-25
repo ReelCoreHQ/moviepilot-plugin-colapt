@@ -256,7 +256,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.7"
+    plugin_version = "0.4.8"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -393,13 +393,16 @@ class ColaCrossSeed(_PluginBase):
     def _match(self, hashes: List[str]) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
         """批量 match，返回 client_hash -> [匹配行]（同一 hash 可能同时命中 info_hash 与 source_info_hash）。"""
         by_hash: Dict[str, List[Dict[str, Any]]] = {}
-        for start in range(0, len(hashes), COLA_MATCH_BATCH):
-            chunk = hashes[start:start + COLA_MATCH_BATCH]
+        # 465 个 hash 的 query 约 19KB，Cloudflare/网关会直接拒掉；按 100 个一批。
+        for start in range(0, len(hashes), 100):
+            chunk = hashes[start:start + 100]
             rsp = self._cola("GET", "/api/v1/plugin/match", params={"hashes": ",".join(chunk)})
             if rsp is None:
-                return by_hash, "可乐PT 匹配请求失败"
+                logger.warn("可乐PT 匹配请求失败（网络），跳过这批")
+                continue
             if rsp.status_code != 200:
-                return by_hash, f"可乐PT 匹配返回 {rsp.status_code}"
+                logger.warn(f"可乐PT 匹配返回 {rsp.status_code}，跳过这批")
+                continue
             for item in (rsp.json() or {}).get("matched") or []:
                 by_hash.setdefault(item.get("client_hash", ""), []).append(item)
         return by_hash, ""
@@ -995,7 +998,7 @@ class ColaCrossSeed(_PluginBase):
             by_hash, err = self._match(hashes)
             if err:
                 logger.error(err)
-                continue
+                by_hash = {}
             for torrent in torrents:
                 if self._event.is_set():
                     break
