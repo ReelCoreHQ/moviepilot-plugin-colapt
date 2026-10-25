@@ -15,6 +15,7 @@
 import base64
 import hashlib
 import json
+import re
 import time
 import uuid
 from datetime import datetime
@@ -195,7 +196,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.1.0"
+    plugin_version = "0.2.0"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -215,7 +216,10 @@ class ColaCrossSeed(_PluginBase):
     _direction = "both"
     _use_mp_clients = True
     _clients_json = ""
+    _clients_lines = ""
     _sites_json = ""
+    _sites_lines = ""
+    _iyuu_json = ""
     _event = Event()
     _csrf = ""
 
@@ -234,7 +238,10 @@ class ColaCrossSeed(_PluginBase):
             self._direction = str(config.get("direction") or "both")
             self._use_mp_clients = bool(config.get("use_mp_clients", True))
             self._clients_json = str(config.get("clients_json") or "")
+            self._clients_lines = str(config.get("clients_lines") or "")
             self._sites_json = str(config.get("sites_json") or "")
+            self._sites_lines = str(config.get("sites_lines") or "")
+            self._iyuu_json = str(config.get("iyuu_json") or "")
             try:
                 self._max_per_hour = max(1, min(200, int(config.get("max_per_hour", 20) or 20)))
             except Exception:
@@ -261,7 +268,10 @@ class ColaCrossSeed(_PluginBase):
             "direction": self._direction,
             "use_mp_clients": self._use_mp_clients,
             "clients_json": self._clients_json,
+            "clients_lines": self._clients_lines,
             "sites_json": self._sites_json,
+            "sites_lines": self._sites_lines,
+            "iyuu_json": self._iyuu_json,
         })
 
     # ---------------- 站点登录 / 匹配 / 下载 ----------------
@@ -400,6 +410,120 @@ class ColaCrossSeed(_PluginBase):
             logger.warn(f"站点 {site.get('name')} 下载种子失败：{err}")
         return b""
 
+    # ---------------- 配置解析（给不写代码的人用行文本） ----------------
+
+    @staticmethod
+    def _split_line(line: str) -> List[str]:
+        return [p.strip() for p in re.split(r"[,，]", line.strip()) if p.strip()]
+
+    def _normalise_url(self, raw: str, default_scheme: str = "http") -> str:
+        raw = (raw or "").strip().rstrip("/")
+        if not raw:
+            return ""
+        if not raw.startswith("http://") and not raw.startswith("https://"):
+            raw = f"{default_scheme}://{raw}"
+        return raw
+
+    def _line_clients(self) -> List[_Client]:
+        """每行一个客户端：`地址,用户名,密码`，或 `qb|tr,地址,用户名,密码`，可再带名称。"""
+        out: List[_Client] = []
+        for line in (self._clients_lines or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = self._split_line(line)
+            if len(parts) < 3:
+                logger.warn(f"下载器配置行格式不对（至少 地址,用户名,密码）：{line}")
+                continue
+            kind = "qb"
+            name = ""
+            if parts[0].lower() in ("qb", "qbittorrent", "tr", "transmission"):
+                kind = "tr" if parts[0].lower() in ("tr", "transmission") else "qb"
+                parts = parts[1:]
+            if len(parts) >= 4:
+                name = parts[0]
+                parts = parts[1:]
+            url = self._normalise_url(parts[0], "http")
+            if not name:
+                name = url.split("://", 1)[-1]
+            if kind == "tr":
+                out.append(TransmissionClient(name, url, parts[1], parts[2]))
+            else:
+                out.append(QBittorrentClient(name, url, parts[1], parts[2]))
+        return out
+
+    def _line_sites(self) -> List[Dict[str, str]]:
+        """每行一个站点：`域名,passkey`，或 `名称,域名,passkey`。"""
+        out: List[Dict[str, str]] = []
+        for line in (self._sites_lines or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = self._split_line(line)
+            if len(parts) == 2:
+                name, url, passkey = "", parts[0], parts[1]
+            elif len(parts) >= 3:
+                name, url, passkey = parts[0], parts[1], parts[2]
+            else:
+                logger.warn(f"站点配置行格式不对（域名,passkey）：{line}")
+                continue
+            url = self._normalise_url(url, "https")
+            if not url or not passkey:
+                continue
+            out.append({"name": name or url.split("://", 1)[-1].split("/")[0], "url": url + "/", "passkey": passkey})
+        return out
+
+    def _iyuu_sites(self) -> List[Dict[str, str]]:
+        """直接导入 IYUU 导出的站点 JSON：只取启用且有 passkey 的站点。"""
+        raw = (self._iyuu_json or "").strip()
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except Exception as err:
+            logger.warn(f"IYUU 站点 JSON 解析失败：{err}")
+            return []
+        if isinstance(data, dict):
+            data = data.get("sites") or list(data.values())
+        if not isinstance(data, list):
+            return []
+        out: List[Dict[str, str]] = []
+        for item in data:
+            if not isinstance(item, dict) or item.get("disabled"):
+                continue
+            options = item.get("options") or {}
+            if isinstance(options, str):
+                try:
+                    options = json.loads(options)
+                except Exception:
+                    options = {}
+            if not isinstance(options, dict):
+                options = {}
+            passkey = str(options.get("passkey") or "").strip()
+            if not passkey:
+                continue
+            base = (item.get("mirror") or item.get("base_url") or "").strip()
+            if not base:
+                continue
+            scheme = "http" if str(item.get("is_https")) == "0" else "https"
+            url = self._normalise_url(base, scheme)
+            if not url:
+                continue
+            out.append({"name": item.get("nickname") or item.get("site") or url, "url": url + "/", "passkey": passkey})
+        return out
+
+    def _other_sites(self) -> List[Dict[str, str]]:
+        """手动行文本 + IYUU 导入，按域名去重。"""
+        sites: List[Dict[str, str]] = []
+        seen = set()
+        for site in self._line_sites() + self._iyuu_sites():
+            host = site["url"].split("://", 1)[-1].split("/")[0].lower()
+            if not host or host in seen:
+                continue
+            seen.add(host)
+            sites.append(site)
+        return sites
+
     # ---------------- 下载器 ----------------
 
     def _clients(self) -> List[_Client]:
@@ -423,7 +547,10 @@ class ColaCrossSeed(_PluginBase):
                     out.append(_MPClient("MP-TR", tr.get_completed_torrents, tr.add_torrent))
             except Exception as err:
                 logger.warn(f"读取 MoviePilot Transmission 失败：{err}")
-        raw = (self._clients_json or "").strip()
+        line_clients = self._line_clients()
+        if line_clients:
+            out.extend(line_clients)
+        raw = (self._clients_json or "").strip() if not line_clients else ""
         if raw:
             try:
                 for idx, item in enumerate(json.loads(raw)):
@@ -477,10 +604,14 @@ class ColaCrossSeed(_PluginBase):
             return
         sites = []
         if self._direction in ("both", "other_only"):
-            try:
-                sites = [s for s in json.loads(self._sites_json or "[]") if s.get("url") and s.get("passkey")]
-            except Exception:
-                sites = []
+            sites = self._other_sites()
+            if not sites:
+                try:
+                    sites = [s for s in json.loads(self._sites_json or "[]") if s.get("url") and s.get("passkey")]
+                except Exception:
+                    sites = []
+        if sites:
+            logger.info(f"其他站 {len(sites)} 个：{', '.join(s['name'] for s in sites[:6])}{'...' if len(sites) > 6 else ''}")
         stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0}
         done = set(self._done())
         # 先把所有客户端扫一遍：tracker 不允许同一账号同一颗种子在多个客户端同时做种，
@@ -671,13 +802,21 @@ class ColaCrossSeed(_PluginBase):
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VTextarea", "props": {"model": "clients_json", "rows": 4, "label": "额外下载器（JSON）",
-                             "placeholder": "[{\"name\":\"QB-2\",\"type\":\"qbittorrent\",\"url\":\"http://192.168.1.2:8080\",\"username\":\"admin\",\"password\":\"xxx\"}]"}}]},
+                            {"component": "VTextarea", "props": {"model": "clients_lines", "rows": 4,
+                             "label": "下载器（每行一个：地址,用户名,密码；TR 写成 tr,地址,用户名,密码）",
+                             "placeholder": "192.168.1.100:8080,admin,密码\ntr,192.168.1.101:9091,admin,密码"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VTextarea", "props": {"model": "sites_json", "rows": 4, "label": "其他站（JSON，方向二用）",
-                             "placeholder": "[{\"name\":\"Pter\",\"url\":\"https://pt.example.com/\",\"passkey\":\"xxx\"}]"}}]},
+                            {"component": "VTextarea", "props": {"model": "sites_lines", "rows": 4,
+                             "label": "其他站（每行一个：域名,passkey；可写 名称,域名,passkey）",
+                             "placeholder": "https://pt.example.com,abcdef123456\n朋友,https://pt.keepfrds.com,abcdef123456"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VTextarea", "props": {"model": "iyuu_json", "rows": 4,
+                             "label": "直接导入 IYUU 站点配置（把 IYUU 导出的 JSON 整个粘贴进来，自动取启用的站点）",
+                             "placeholder": "[{\"site\":\"keepfrds\",\"nickname\":\"朋友\",\"base_url\":\"pt.keepfrds.com\",\"options\":{\"passkey\":\"...\"}}]"}}]},
                     ]},
                 ],
             }
@@ -685,7 +824,7 @@ class ColaCrossSeed(_PluginBase):
             "enabled": False, "notify": True, "cron": "0 */1 * * *",
             "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
             "skip_check": False, "max_per_hour": 20, "direction": "both",
-            "use_mp_clients": True, "clients_json": "", "sites_json": "",
+            "use_mp_clients": True, "clients_json": "", "clients_lines": "", "sites_json": "", "sites_lines": "", "iyuu_json": "",
         }
 
 

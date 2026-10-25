@@ -29,13 +29,15 @@
 | 可乐PT 用户名 / 密码 | 你的可乐PT 账号（登录一次后会保存会话 token，不用反复填） |
 | 验证码 | **先打开插件详情页**，页面会显示一张验证码图片，把 4 位数字填到这里，保存即完成登录 |
 | 两步验证码 | 账号开了 2FA 时填（可选） |
-| 使用 MoviePilot 已配置下载器 | 勾选后使用 MP 里的 qB/TR；再配合下面「额外下载器」可同时管多个 |
-| 额外下载器（JSON） | `[{"name":"QB-2","type":"qbittorrent","url":"http://ip:8080","username":"admin","password":"xxx"}]`，`type` 也可以是 `transmission` |
+| 使用 MoviePilot 已配置下载器 | 勾选后使用 MP 里的 qB/TR |
+| 下载器 | 每行一个：`地址,用户名,密码`；Transmission 写 `tr,地址,用户名,密码`（qB 可写 `qb,地址,用户名,密码`） |
+| 其他站 | 每行一个：`域名,passkey`，也可写 `名称,域名,passkey` |
+| 直接导入 IYUU 站点配置 | 把 IYUU 导出的站点 JSON 整个粘贴进来，自动取「启用且有 passkey」的站点 |
 | 辅种方向 | 双向 / 只补可乐 / 只补其他站 |
 | 每小时最多添加 | 默认 20，可调（1–200） |
 | 跳过校验 | 默认关闭（默认校验）；Transmission 无跳过选项，等价于总是校验 |
 | 执行周期 | cron，默认每小时 |
-| 其他站（JSON） | `[{"name":"Pter","url":"https://pt.example.com/","passkey":"xxx"}]`，方向二用；站点需支持 `/api/pieces-hash` |
+| 其他站（方向二） | 站点需支持 `/api/pieces-hash`；也可以直接用上面的 IYUU 导入 |
 
 ## 注意
 
