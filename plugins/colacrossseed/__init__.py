@@ -16,6 +16,7 @@ import base64
 import hashlib
 import json
 import time
+import uuid
 from datetime import datetime
 from threading import Event
 from typing import Any, Dict, List, Optional, Tuple
@@ -216,6 +217,7 @@ class ColaCrossSeed(_PluginBase):
     _clients_json = ""
     _sites_json = ""
     _event = Event()
+    _csrf = ""
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -322,8 +324,53 @@ class ColaCrossSeed(_PluginBase):
                 by_hash.setdefault(item.get("client_hash", ""), []).append(item)
         return by_hash, ""
 
+    def _csrf_token(self) -> str:
+        """会话登录后拿 CSRF（POST /authorizations 要带）。"""
+        if self._csrf:
+            return self._csrf
+        rsp = self._cola("GET", "/api/v1/me")
+        if rsp is None or rsp.status_code != 200:
+            return ""
+        try:
+            self._csrf = ((rsp.json() or {}).get("session") or {}).get("csrf_token") or ""
+        except Exception:
+            self._csrf = ""
+        return self._csrf
+
     def _download_cola(self, torrent_id: int) -> bytes:
-        rsp = self._cola("GET", f"/api/v1/torrents/{torrent_id}/download")
+        """站点的下载要两步：先签发 authorization，再带 authorization_id 取字节。"""
+        csrf = self._csrf_token()
+        if not csrf:
+            logger.warn("可乐PT 下载失败：拿不到 CSRF（会话可能已过期）")
+            return b""
+        try:
+            rsp = requests.post(
+                f"{COLA_BASE}/api/v1/torrents/{torrent_id}/authorizations",
+                headers={
+                    "Cookie": f"reelcore_session={self._session_token}",
+                    "X-CSRF-Token": csrf,
+                    "Origin": COLA_BASE,
+                    "Content-Type": "application/json",
+                    "Idempotency-Key": str(uuid.uuid4()),
+                },
+                json={},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except Exception as err:
+            logger.error(f"可乐PT 签发下载授权失败：{err}")
+            return b""
+        if rsp.status_code != 200:
+            logger.warn(f"可乐PT 签发下载授权返回 {rsp.status_code}：{rsp.text[:160]}")
+            return b""
+        try:
+            authorization = int((rsp.json() or {}).get("id") or 0)
+        except Exception:
+            authorization = 0
+        if not authorization:
+            logger.warn("可乐PT 下载授权响应缺少 id")
+            return b""
+        rsp = self._cola("GET", f"/api/v1/torrents/{torrent_id}/download",
+                         params={"authorization_id": authorization})
         if rsp is None or rsp.status_code != 200:
             return b""
         return rsp.content
