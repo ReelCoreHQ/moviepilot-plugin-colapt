@@ -16,8 +16,9 @@ import base64
 import hashlib
 import json
 import re
+import subprocess
 import time
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 import uuid
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -44,6 +45,45 @@ SITE_SKIP = {
 }
 COLA_MATCH_BATCH = 500
 REQUEST_TIMEOUT = 20
+
+
+class _HttpResult:
+    def __init__(self, status: int, content: bytes, text: str):
+        self.status_code = status
+        self.content = content
+        self.text = text
+
+    def json(self):
+        return json.loads(self.text)
+
+
+def _curl(method: str, url: str, headers=None, params=None, json_body=None, data=None, timeout: int = 20) -> _HttpResult:
+    """用系统 curl 发请求。
+
+    为什么不用 requests：这台 NAS 上 python/OpenSSL 的 TLS 指纹被 Cloudflare 卡住（握手超时），
+    而 curl 同一台机器可以正常访问；插件里对可乐PT 的请求因此走 curl，其它站点仍用 requests。
+    """
+    cmd = ["curl", "-sS", "--max-time", str(timeout), "-X", method]
+    if params:
+        sep = "&" if "?" in url else "?"
+        url = url + sep + urlencode(params)
+    if json_body is not None:
+        cmd += ["-H", "Content-Type: application/json", "--data-binary", json.dumps(json_body)]
+    elif data is not None:
+        cmd += ["--data", urlencode(data)]
+    for key, value in (headers or {}).items():
+        cmd += ["-H", f"{key}: {value}"]
+    cmd += ["-w", "\n%{http_code}", url]
+    proc = subprocess.run(cmd, capture_output=True)
+    body = proc.stdout
+    status = 0
+    if b"\n" in body:
+        body, _, tail = body.rpartition(b"\n")
+        try:
+            status = int(tail.strip() or 0)
+        except ValueError:
+            status = 0
+    return _HttpResult(status, body, body.decode("utf-8", "replace"))
 
 
 def _valid_torrent(data: bytes) -> bool:
@@ -216,7 +256,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.0"
+    plugin_version = "0.4.1"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -245,6 +285,7 @@ class ColaCrossSeed(_PluginBase):
     _csrf = ""
     # host -> 可用的 pieces-hash 路径（憨憨是 /nexusapi/pieces-hash，其余多为 /api/pieces-hash）；"" 表示不支持
     _pieces_paths: Dict[str, str] = {}
+    _iyuu_rate_limited = False
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -330,11 +371,11 @@ class ColaCrossSeed(_PluginBase):
             logger.error(f"可乐PT 登录异常：{err}")
         return False
 
-    def _cola(self, method: str, path: str, **kwargs) -> Optional[requests.Response]:
+    def _cola(self, method: str, path: str, **kwargs) -> Optional[_HttpResult]:
         headers = kwargs.pop("headers", {})
         headers["Cookie"] = f"reelcore_session={self._session_token}"
         try:
-            rsp = requests.request(method, f"{COLA_BASE}{path}", headers=headers, timeout=REQUEST_TIMEOUT, **kwargs)
+            rsp = _curl(method, f"{COLA_BASE}{path}", headers=headers, timeout=REQUEST_TIMEOUT, **kwargs)
         except Exception as err:
             logger.error(f"可乐PT 请求失败 {path}：{err}")
             return None
@@ -383,16 +424,16 @@ class ColaCrossSeed(_PluginBase):
             logger.warn("可乐PT 下载失败：拿不到 CSRF（会话可能已过期）")
             return b""
         try:
-            rsp = requests.post(
+            rsp = _curl(
+                "POST",
                 f"{COLA_BASE}/api/v1/torrents/{torrent_id}/authorizations",
                 headers={
                     "Cookie": f"reelcore_session={self._session_token}",
                     "X-CSRF-Token": csrf,
                     "Origin": COLA_BASE,
-                    "Content-Type": "application/json",
                     "Idempotency-Key": str(uuid.uuid4()),
                 },
-                json={},
+                json_body={},
                 timeout=REQUEST_TIMEOUT,
             )
         except Exception as err:
@@ -674,6 +715,11 @@ class ColaCrossSeed(_PluginBase):
     def _iyuu_sid_sha1(self, sids: List[int]) -> str:
         if not sids:
             return ""
+        # IYUU 的 sid_sha1 有效期 7 天；缓存 6 小时，避免每次检测/运行都去汇报触发限流。
+        cached = self.get_data("sid_sha1") or {}
+        stamp = int(cached.get("at") or 0)
+        if cached.get("sha1") and time.time() - stamp < 6 * 3600 and cached.get("sids") == sids:
+            return str(cached["sha1"])
         try:
             rsp = requests.post(
                 f"{self.IYUU_API}/reseed/sites/reportExisting",
@@ -686,9 +732,17 @@ class ColaCrossSeed(_PluginBase):
             logger.warn(f"IYUU 汇报站点失败：{err}")
             return ""
         if body.get("code") not in (0, "0", None):
-            logger.warn(f"IYUU 汇报站点返回：{body.get('msg')}")
+            msg = str(body.get("msg") or "")
+            if "频率" in msg:
+                if cached.get("sha1"):
+                    return str(cached["sha1"])
+                self._iyuu_rate_limited = True
+            logger.warn(f"IYUU 汇报站点返回：{msg}")
             return ""
-        return str((body.get("data") or {}).get("sid_sha1") or "")
+        sha1 = str((body.get("data") or {}).get("sid_sha1") or "")
+        if sha1:
+            self.save_data("sid_sha1", {"at": int(time.time()), "sids": sids, "sha1": sha1})
+        return sha1
 
     def _iyuu_reseed(self, hashes: List[str], sid_sha1: str) -> Dict[str, List[Dict[str, Any]]]:
         """返回：客户端 info_hash -> 可辅的站点种子列表。"""
@@ -806,12 +860,16 @@ class ColaCrossSeed(_PluginBase):
         if not self._session_token:
             return "❌ 可乐PT：未登录（打开插件页取验证码填一次）"
         rsp = self._cola("GET", "/api/v1/me")
-        if rsp is not None and rsp.status_code == 200:
+        if rsp is None:
+            return "❌ 可乐PT：连不上（网络/防火墙），稍后重试"
+        if rsp.status_code == 200:
             try:
                 return f"✅ 可乐PT：已登录（{((rsp.json() or {}).get('username') or '')}）"
             except Exception:
                 return "✅ 可乐PT：已登录"
-        return "❌ 可乐PT：会话过期，需要重新登录"
+        if rsp.status_code == 401:
+            return "❌ 可乐PT：会话过期，需要重新登录"
+        return f"❌ 可乐PT：HTTP {rsp.status_code}"
 
     def _test_iyuu(self) -> str:
         if not self._iyuu_token:
@@ -822,6 +880,8 @@ class ColaCrossSeed(_PluginBase):
         sid_sha1 = self._iyuu_sid_sha1(sorted(sid_map))
         if sid_sha1:
             return f"✅ IYUU Token：有效（{len(sid_map)} 个站点已汇报）"
+        if getattr(self, "_iyuu_rate_limited", False):
+            return "⚠️ IYUU Token：已填，但云端限流（访问频率过快），稍后再试"
         return "❌ IYUU Token：无效或云端拒绝（检查 token）"
 
     def run_tests(self, persist: bool = True) -> Dict[str, Any]:
