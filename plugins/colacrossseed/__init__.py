@@ -490,6 +490,7 @@ class ColaCrossSeed(_PluginBase):
             if not torrents:
                 continue
             hashes = [t["hash"] for t in torrents if t.get("hash")]
+            client_hashes = set(hashes)
             by_hash, err = self._match(hashes)
             if err:
                 logger.error(err)
@@ -500,6 +501,8 @@ class ColaCrossSeed(_PluginBase):
                 hits = by_hash.get(torrent["hash"]) or []
                 cola_hits = [h for h in hits if h.get("via") == "source_info_hash"]
                 own_hits = [h for h in hits if h.get("via") == "info_hash"]
+                # 客户端已经有这颗可乐种（同一 info_hash）时不必再拉：qB 会直接回 Fails.（重复种子）。
+                cola_hits = [h for h in cola_hits if (h.get("info_hash") or "").lower() not in client_hashes]
                 stats["matched"] += 1 if hits else 0
                 # 方向一：客户端有同一份文件（来源别的站），拉可乐种子回来辅
                 if cola_hits and self._direction in ("both", "cola_only"):
