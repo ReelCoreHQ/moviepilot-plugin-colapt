@@ -256,7 +256,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.2"
+    plugin_version = "0.4.3"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -901,6 +901,9 @@ class ColaCrossSeed(_PluginBase):
     # ---------------- 任务 ----------------
 
     def auto_seed(self):
+        # 事件是类级 Event：reload/停止会把上一实例的 set 带过来，这里先清掉，
+        # 否则本次任务会在第一个 torrent 就 break（表现为 matched=0、耗时 1 秒）。
+        self._event.clear()
         if not self._enabled:
             return
         if not self._session_token:
