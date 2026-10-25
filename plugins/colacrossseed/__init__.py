@@ -813,10 +813,22 @@ class ColaCrossSeed(_PluginBase):
                 return "✅ 可乐PT：已登录"
         return "❌ 可乐PT：会话过期，需要重新登录"
 
+    def _test_iyuu(self) -> str:
+        if not self._iyuu_token:
+            return "ℹ️ IYUU Token：未配置（可选；配置后用 IYUU 云端匹配，能覆盖没有 pieces-hash 的站）"
+        sid_map = self._iyuu_sid_map()
+        if not sid_map:
+            return "❌ IYUU Token：已填，但导入的站点没有 sid（请粘贴 IYUU 站点 JSON）"
+        sid_sha1 = self._iyuu_sid_sha1(sorted(sid_map))
+        if sid_sha1:
+            return f"✅ IYUU Token：有效（{len(sid_map)} 个站点已汇报）"
+        return "❌ IYUU Token：无效或云端拒绝（检查 token）"
+
     def run_tests(self, persist: bool = True) -> Dict[str, Any]:
         report = {
             "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "cola": self._test_cola(),
+            "iyuu": self._test_iyuu(),
             "clients": self._test_clients(),
             "sites": self._test_sites(),
         }
@@ -1018,7 +1030,7 @@ class ColaCrossSeed(_PluginBase):
                                          f"可乐补种 {last.get('added', 0)}，其他站 {last.get('filled', 0)}，失败 {last.get('failed', 0)}。"}
         ]
         if report:
-            lines = [f"检测时间 {report.get('at', '')}", report.get("cola", "")]
+            lines = [f"检测时间 {report.get('at', '')}", report.get("cola", ""), report.get("iyuu", "")]
             lines += report.get("clients") or []
             lines += report.get("sites") or []
             blocks.append({"component": "div", "text": "\n".join([x for x in lines if x]),
