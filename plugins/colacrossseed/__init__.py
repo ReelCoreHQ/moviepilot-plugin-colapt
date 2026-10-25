@@ -256,7 +256,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.4"
+    plugin_version = "0.4.5"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -857,7 +857,7 @@ class ColaCrossSeed(_PluginBase):
         if not sites:
             return ["ℹ️ 没有配置其他站（可粘贴 IYUU 配置或填「域名,passkey」）"]
         lines: List[str] = []
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             for name, ok, msg in pool.map(self._test_one_site, sites):
                 lines.append(f"{'✅' if ok else '❌'} {name}：{msg}")
         good = sum(1 for line in lines if line.startswith("✅"))
