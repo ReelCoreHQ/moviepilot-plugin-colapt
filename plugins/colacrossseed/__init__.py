@@ -256,7 +256,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.5"
+    plugin_version = "0.4.6"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -568,7 +568,7 @@ class ColaCrossSeed(_PluginBase):
             if host in SITE_REMAP:
                 url = SITE_REMAP[host]
             out.append({"name": name or url.split("://", 1)[-1].split("/")[0], "url": url.rstrip("/") + "/",
-                        "passkey": passkey, "sid": 0, "download_page": ""})
+                        "passkey": passkey, "sid": 0, "download_page": "", "x_api_key": ""})
         return out
 
     def _iyuu_sites(self) -> List[Dict[str, str]]:
@@ -619,6 +619,7 @@ class ColaCrossSeed(_PluginBase):
                 "passkey": passkey,
                 "sid": int(item.get("sid") or 0),
                 "download_page": item.get("download_page") or "",
+                "x_api_key": str((options or {}).get("x_api_key") or ""),
             })
         return out
 
@@ -791,7 +792,36 @@ class ColaCrossSeed(_PluginBase):
         path = template.replace("{}", str(torrent_id)).replace("{id}", str(torrent_id)).replace("{passkey}", site.get("passkey", ""))
         return urljoin(site["url"], path)
 
+    def _download_mteam(self, site: Dict[str, str], torrent_id: str) -> bytes:
+        """M-Team 没有 pieces-hash，也没有 download.php：先 POST genDlToken 换下载地址，再取。"""
+        api_key = site.get("x_api_key") or ""
+        if not api_key:
+            return b""
+        base = (site.get("url") or "").rstrip("/")
+        try:
+            rsp = requests.post(f"{base}/api/torrent/genDlToken", data={"id": torrent_id},
+                                headers={"x-api-key": api_key, "User-Agent": "MoviePilot-ColaCrossSeed/0.5"},
+                                timeout=REQUEST_TIMEOUT)
+            body = rsp.json() if rsp.status_code == 200 else {}
+        except Exception as err:
+            logger.warn(f"M-Team 换取下载地址失败：{err}")
+            return b""
+        if str(body.get("code")) != "0" or not body.get("data"):
+            logger.warn(f"M-Team 换取下载地址返回：{body.get('message')}")
+            return b""
+        try:
+            torrent = requests.get(str(body["data"]), timeout=REQUEST_TIMEOUT, allow_redirects=True,
+                                   headers={"User-Agent": "Mozilla/5.0"})
+            if torrent.status_code == 200 and _valid_torrent(torrent.content):
+                return torrent.content
+        except Exception as err:
+            logger.warn(f"M-Team 下载种子失败：{err}")
+        return b""
+
     def _download_site_torrent(self, site: Dict[str, str], torrent_id: str) -> bytes:
+        host = (site.get("url") or "").split("://", 1)[-1].split("/")[0].lower()
+        if "m-team" in host:
+            return self._download_mteam(site, torrent_id)
         url = self._site_torrent_url(site, torrent_id)
         try:
             rsp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
@@ -820,6 +850,10 @@ class ColaCrossSeed(_PluginBase):
 
     def _test_one_site(self, site: Dict[str, str]) -> Tuple[str, bool, str]:
         host = site["url"].split("://", 1)[-1].split("/")[0].lower()
+        if "m-team" in host:
+            if site.get("x_api_key"):
+                return site["name"], True, "M-Team：用 IYUU 匹配 + x-api-key 下载（不走 pieces-hash）"
+            return site["name"], False, "M-Team：缺少 x_api_key（IYUU 导出里应该有）"
         last = ""
         for path in ("/api/pieces-hash", "/nexusapi/pieces-hash"):
             url = site["url"].rstrip("/") + path
