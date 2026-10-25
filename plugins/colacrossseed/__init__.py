@@ -17,6 +17,7 @@ import hashlib
 import json
 import re
 import time
+from urllib.parse import urljoin
 import uuid
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -215,7 +216,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.3.2"
+    plugin_version = "0.4.0"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -239,6 +240,7 @@ class ColaCrossSeed(_PluginBase):
     _sites_json = ""
     _sites_lines = ""
     _iyuu_json = ""
+    _iyuu_token = ""
     _event = Event()
     _csrf = ""
     # host -> 可用的 pieces-hash 路径（憨憨是 /nexusapi/pieces-hash，其余多为 /api/pieces-hash）；"" 表示不支持
@@ -263,6 +265,7 @@ class ColaCrossSeed(_PluginBase):
             self._sites_json = str(config.get("sites_json") or "")
             self._sites_lines = str(config.get("sites_lines") or "")
             self._iyuu_json = str(config.get("iyuu_json") or "")
+            self._iyuu_token = str(config.get("iyuu_token") or "")
             try:
                 self._max_per_hour = max(1, min(200, int(config.get("max_per_hour", 20) or 20)))
             except Exception:
@@ -297,6 +300,7 @@ class ColaCrossSeed(_PluginBase):
             "sites_json": self._sites_json,
             "sites_lines": self._sites_lines,
             "iyuu_json": self._iyuu_json,
+            "iyuu_token": self._iyuu_token,
         })
 
     # ---------------- 站点登录 / 匹配 / 下载 ----------------
@@ -522,7 +526,8 @@ class ColaCrossSeed(_PluginBase):
                 continue
             if host in SITE_REMAP:
                 url = SITE_REMAP[host]
-            out.append({"name": name or url.split("://", 1)[-1].split("/")[0], "url": url.rstrip("/") + "/", "passkey": passkey})
+            out.append({"name": name or url.split("://", 1)[-1].split("/")[0], "url": url.rstrip("/") + "/",
+                        "passkey": passkey, "sid": 0, "download_page": ""})
         return out
 
     def _iyuu_sites(self) -> List[Dict[str, str]]:
@@ -567,7 +572,13 @@ class ColaCrossSeed(_PluginBase):
                 continue
             if host in SITE_REMAP:
                 url = SITE_REMAP[host]
-            out.append({"name": item.get("nickname") or item.get("site") or url, "url": url.rstrip("/") + "/", "passkey": passkey})
+            out.append({
+                "name": item.get("nickname") or item.get("site") or url,
+                "url": url.rstrip("/") + "/",
+                "passkey": passkey,
+                "sid": int(item.get("sid") or 0),
+                "download_page": item.get("download_page") or "",
+            })
         return out
 
     def _other_sites(self) -> List[Dict[str, str]]:
@@ -648,6 +659,85 @@ class ColaCrossSeed(_PluginBase):
         if key not in done:
             done.append(key)
         self.save_data("done", done[-10000:])
+
+    # ---------------- IYUU 云端辅种（有 token 时优先用，覆盖面比 pieces-hash 大得多） ----------------
+
+    IYUU_API = "http://2025.iyuu.cn"
+    IYUU_CHUNK = 200
+
+    def _iyuu_sid_map(self) -> Dict[int, Dict[str, str]]:
+        return {int(s["sid"]): s for s in self._other_sites() if s.get("sid")}
+
+    def _iyuu_headers(self) -> Dict[str, str]:
+        return {"token": self._iyuu_token, "User-Agent": "MoviePilot-ColaCrossSeed/0.4"}
+
+    def _iyuu_sid_sha1(self, sids: List[int]) -> str:
+        if not sids:
+            return ""
+        try:
+            rsp = requests.post(
+                f"{self.IYUU_API}/reseed/sites/reportExisting",
+                data={"sid_list[]": sids},
+                headers=self._iyuu_headers(),
+                timeout=15,
+            )
+            body = rsp.json() if rsp.status_code == 200 else {}
+        except Exception as err:
+            logger.warn(f"IYUU 汇报站点失败：{err}")
+            return ""
+        if body.get("code") not in (0, "0", None):
+            logger.warn(f"IYUU 汇报站点返回：{body.get('msg')}")
+            return ""
+        return str((body.get("data") or {}).get("sid_sha1") or "")
+
+    def _iyuu_reseed(self, hashes: List[str], sid_sha1: str) -> Dict[str, List[Dict[str, Any]]]:
+        """返回：客户端 info_hash -> 可辅的站点种子列表。"""
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for start in range(0, len(hashes), self.IYUU_CHUNK):
+            chunk = sorted(hashes[start:start + self.IYUU_CHUNK])
+            payload = json.dumps(chunk, separators=(",", ":"))
+            data = {
+                "hash": payload,
+                "sha1": hashlib.sha1(payload.encode()).hexdigest(),
+                "sid_sha1": sid_sha1,
+                "timestamp": int(time.time()),
+                "version": "4.0.0",
+            }
+            try:
+                rsp = requests.post(f"{self.IYUU_API}/reseed/index/index", data=data,
+                                    headers=self._iyuu_headers(), timeout=30)
+                body = rsp.json() if rsp.status_code == 200 else {}
+            except Exception as err:
+                logger.warn(f"IYUU 辅种查询失败：{err}")
+                break
+            code = body.get("code")
+            if code == 429:
+                logger.warn("IYUU 云端限流，稍后再试")
+                break
+            if code not in (0, "0", None):
+                logger.warn(f"IYUU 辅种查询返回：{body.get('msg')}")
+                break
+            for client_hash, item in (body.get("data") or {}).items():
+                torrents = (item or {}).get("torrent") or []
+                if torrents:
+                    out[str(client_hash).lower()] = torrents
+            time.sleep(0.5)
+        return out
+
+    def _site_torrent_url(self, site: Dict[str, str], torrent_id: str) -> str:
+        template = (site.get("download_page") or "").strip() or "download.php?id={}&passkey={passkey}"
+        path = template.replace("{}", str(torrent_id)).replace("{id}", str(torrent_id)).replace("{passkey}", site.get("passkey", ""))
+        return urljoin(site["url"], path)
+
+    def _download_site_torrent(self, site: Dict[str, str], torrent_id: str) -> bytes:
+        url = self._site_torrent_url(site, torrent_id)
+        try:
+            rsp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+            if rsp.status_code == 200 and _valid_torrent(rsp.content):
+                return rsp.content
+        except Exception as err:
+            logger.warn(f"站点 {site.get('name')} 下载种子失败：{err}")
+        return b""
 
     # ---------------- 连通性检测（保存后自动跑，结果显示在插件页） ----------------
 
@@ -769,6 +859,17 @@ class ColaCrossSeed(_PluginBase):
             if torrents:
                 scanned.append((client, torrents))
                 all_hashes.update(t["hash"] for t in torrents if t.get("hash"))
+        # IYUU 云端匹配（有 token 时）：把客户端 hash 发过去，拿回「站点 + torrent_id」。
+        sid_map: Dict[int, Dict[str, str]] = {}
+        iyuu_hits: Dict[str, List[Dict[str, Any]]] = {}
+        if self._iyuu_token and self._direction in ("both", "other_only"):
+            sid_map = self._iyuu_sid_map()
+            if sid_map:
+                hashes_all = sorted(all_hashes)
+                sid_sha1 = self._iyuu_sid_sha1(sorted(sid_map))
+                if sid_sha1:
+                    iyuu_hits = self._iyuu_reseed(hashes_all, sid_sha1)
+                    logger.info(f"IYUU 云端查询 {len(hashes_all)} 个 hash，命中 {len(iyuu_hits)} 个可辅种")
         for client, torrents in scanned:
             if self._event.is_set():
                 break
@@ -810,6 +911,32 @@ class ColaCrossSeed(_PluginBase):
                     else:
                         stats["failed"] += 1
                 # 方向二：客户端已是可乐种子，去别的站补同 pieces 的种
+                elif self._direction in ("both", "other_only") and self._iyuu_token and sid_map:
+                    # IYUU 云端匹配：把客户端 hash 发过去，拿回「站点 + torrent_id」。
+                    for entry in iyuu_hits.get(torrent["hash"]) or []:
+                        site = sid_map.get(int(entry.get("sid") or 0))
+                        torrent_id = str(entry.get("torrent_id") or "")
+                        if not site or not torrent_id:
+                            continue
+                        key = f"{client.name}:{site.get('name') or site.get('url')}:{torrent_id}"
+                        if key in done:
+                            stats["skipped"] += 1
+                            continue
+                        if self._budget_left() <= 0:
+                            logger.info("已达到每小时辅种上限（只统计成功添加的种子），结束本次")
+                            self._finish(stats)
+                            return
+                        remote = self._download_site_torrent(site, torrent_id)
+                        if not remote:
+                            stats["failed"] += 1
+                            continue
+                        if client.add(remote, torrent.get("save_path", ""), self._skip_check, torrent.get("category", "")):
+                            stats["filled"] += 1
+                            self._record_add()
+                            done.add(key)
+                            self._remember(key)
+                        else:
+                            stats["failed"] += 1
                 elif own_hits and sites and self._direction in ("both", "other_only"):
                     hit = own_hits[0]
                     data = self._download_cola(int(hit.get("id")))
@@ -982,6 +1109,11 @@ class ColaCrossSeed(_PluginBase):
                              "placeholder": "https://pt.example.com,abcdef123456\n朋友,https://pt.keepfrds.com,abcdef123456"}}]},
                     ]},
                     {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VTextField", "props": {"model": "iyuu_token", "label": "IYUU Token（可选，填了就用 IYUU 云端辅种匹配）",
+                             "placeholder": "IYUU..."}}]},
+                    ]},
+                    {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VTextarea", "props": {"model": "iyuu_json", "rows": 4,
                              "label": "直接导入 IYUU 站点配置（把 IYUU 导出的 JSON 整个粘贴进来，自动取启用的站点）",
@@ -993,7 +1125,7 @@ class ColaCrossSeed(_PluginBase):
             "enabled": False, "notify": True, "cron": "0 */1 * * *",
             "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
             "skip_check": False, "max_per_hour": 20, "direction": "both",
-            "use_mp_clients": True, "clients_json": "", "clients_lines": "", "sites_json": "", "sites_lines": "", "iyuu_json": "",
+            "use_mp_clients": True, "clients_json": "", "clients_lines": "", "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "",
         }
 
 

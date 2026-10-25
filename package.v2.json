@@ -3,14 +3,15 @@
     "name": "可乐PT辅种",
     "description": "参考 ReseedPuppy / IYUU 辅种插件：扫客户端已有资源，与可乐PT 对照，存在就自动拉可乐种子辅种；支持直接导入 IYUU 站点配置、按行填写其他站（域名+passkey）与下载器（地址+账号密码）。",
     "labels": "做种",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "icon": "https://www.colapt.com/favicon.ico",
     "author": "ColaPT",
     "level": 1,
     "history": {
       "v0.1.0": "首个版本：可乐账号密码+图形验证码登录；客户端 hash 反向匹配可乐；多 qB/TR 客户端；默认校验；默认 20 个/小时",
       "v0.2.0": "支持直接粘贴 IYUU 站点 JSON 导入；其他站改为「域名,passkey」按行填写；下载器改为「地址,用户名,密码」按行填写",
-      "v0.3.0": "保存后自动检测可乐/下载器/其他站连通性并显示在插件页；新增 /test 接口"
+      "v0.3.0": "保存后自动检测可乐/下载器/其他站连通性并显示在插件页；新增 /test 接口",
+      "v0.4.0": "支持 IYUU Token：用 IYUU 云端 index 匹配辅种（覆盖没有 pieces-hash 的站）；保留原 pieces-hash 路径作为无 token 时的回退"
     }
   }
 }
