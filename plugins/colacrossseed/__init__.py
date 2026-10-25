@@ -35,6 +35,15 @@ COLA_MATCH_BATCH = 500
 REQUEST_TIMEOUT = 20
 
 
+def _valid_torrent(data: bytes) -> bool:
+    """站点返回登录页/错误页时也常是 200，交给 qB 会得到 415。这里先做一次 bencode 校验。"""
+    try:
+        torrent = bdecode(data)
+        return isinstance(torrent, dict) and isinstance(torrent.get("info"), dict)
+    except Exception:
+        return False
+
+
 def _decode_torrent_pieces(data: bytes) -> str:
     """返回 info.pieces 的 SHA1（NexusPHP /api/pieces-hash 用的 pieces_hash）。"""
     try:
@@ -383,7 +392,7 @@ class ColaCrossSeed(_PluginBase):
                          params={"authorization_id": authorization})
         if rsp is None or rsp.status_code != 200:
             return b""
-        return rsp.content
+        return rsp.content if _valid_torrent(rsp.content) else b""
 
     def _site_lookup(self, site: Dict[str, Any], pieces_hash: str) -> Tuple[Optional[str], str]:
         url = (site.get("url") or "").rstrip("/") + "/api/pieces-hash"
@@ -404,7 +413,7 @@ class ColaCrossSeed(_PluginBase):
         try:
             rsp = requests.get(url, params={"id": torrent_id, "passkey": site.get("passkey", "")},
                                timeout=REQUEST_TIMEOUT)
-            if rsp.status_code == 200:
+            if rsp.status_code == 200 and _valid_torrent(rsp.content):
                 return rsp.content
         except Exception as err:
             logger.warn(f"站点 {site.get('name')} 下载种子失败：{err}")
