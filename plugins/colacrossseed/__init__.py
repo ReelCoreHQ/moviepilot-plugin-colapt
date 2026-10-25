@@ -256,7 +256,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.1"
+    plugin_version = "0.4.2"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -704,7 +704,7 @@ class ColaCrossSeed(_PluginBase):
     # ---------------- IYUU 云端辅种（有 token 时优先用，覆盖面比 pieces-hash 大得多） ----------------
 
     IYUU_API = "http://2025.iyuu.cn"
-    IYUU_CHUNK = 200
+    IYUU_CHUNK = 20
 
     def _iyuu_sid_map(self) -> Dict[int, Dict[str, str]]:
         return {int(s["sid"]): s for s in self._other_sites() if s.get("sid")}
@@ -759,7 +759,7 @@ class ColaCrossSeed(_PluginBase):
             }
             try:
                 rsp = requests.post(f"{self.IYUU_API}/reseed/index/index", data=data,
-                                    headers=self._iyuu_headers(), timeout=30)
+                                    headers=self._iyuu_headers(), timeout=60)
                 body = rsp.json() if rsp.status_code == 200 else {}
             except Exception as err:
                 logger.warn(f"IYUU 辅种查询失败：{err}")
@@ -775,7 +775,7 @@ class ColaCrossSeed(_PluginBase):
                 torrents = (item or {}).get("torrent") or []
                 if torrents:
                     out[str(client_hash).lower()] = torrents
-            time.sleep(0.5)
+            time.sleep(1)
         return out
 
     def _site_torrent_url(self, site: Dict[str, str], torrent_id: str) -> str:
