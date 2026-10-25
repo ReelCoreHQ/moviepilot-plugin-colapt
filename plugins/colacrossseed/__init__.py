@@ -32,6 +32,15 @@ from app.plugins import _PluginBase
 from app.schemas import NotificationType
 
 COLA_BASE = "https://www.colapt.com"
+# 已关闭 / 已换域名的站点：IYUU 导出里常见旧地址，这里做一次纠正（2026-10-25 核对）。
+SITE_REMAP = {
+    "www.hddolby.com": "https://www.uhddolby.com",
+    "hddolby.com": "https://www.uhddolby.com",
+}
+SITE_SKIP = {
+    "ptsbao.club",       # 烧包：站点已关闭
+    "www.ptsbao.club",
+}
 COLA_MATCH_BATCH = 500
 REQUEST_TIMEOUT = 20
 
@@ -206,7 +215,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.3.1"
+    plugin_version = "0.3.2"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -508,7 +517,12 @@ class ColaCrossSeed(_PluginBase):
             url = self._normalise_url(url, "https")
             if not url or not passkey:
                 continue
-            out.append({"name": name or url.split("://", 1)[-1].split("/")[0], "url": url + "/", "passkey": passkey})
+            host = url.split("://", 1)[-1].split("/")[0].lower()
+            if host in SITE_SKIP:
+                continue
+            if host in SITE_REMAP:
+                url = SITE_REMAP[host]
+            out.append({"name": name or url.split("://", 1)[-1].split("/")[0], "url": url.rstrip("/") + "/", "passkey": passkey})
         return out
 
     def _iyuu_sites(self) -> List[Dict[str, str]]:
@@ -547,7 +561,13 @@ class ColaCrossSeed(_PluginBase):
             url = self._normalise_url(base, scheme)
             if not url:
                 continue
-            out.append({"name": item.get("nickname") or item.get("site") or url, "url": url + "/", "passkey": passkey})
+            host = url.split("://", 1)[-1].split("/")[0].lower()
+            if host in SITE_SKIP:
+                logger.info(f"IYUU 导入跳过已关闭站点：{host}")
+                continue
+            if host in SITE_REMAP:
+                url = SITE_REMAP[host]
+            out.append({"name": item.get("nickname") or item.get("site") or url, "url": url.rstrip("/") + "/", "passkey": passkey})
         return out
 
     def _other_sites(self) -> List[Dict[str, str]]:
