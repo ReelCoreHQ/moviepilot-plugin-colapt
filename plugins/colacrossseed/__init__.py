@@ -483,12 +483,18 @@ class ColaCrossSeed(_PluginBase):
                 sites = []
         stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0}
         done = set(self._done())
+        # 先把所有客户端扫一遍：tracker 不允许同一账号同一颗种子在多个客户端同时做种，
+        # 所以“另一边已经有的可乐种”必须跳过，不能只在本客户端内去重。
+        scanned = []
+        all_hashes = set()
         for client in clients:
+            torrents = client.list_completed()
+            if torrents:
+                scanned.append((client, torrents))
+                all_hashes.update(t["hash"] for t in torrents if t.get("hash"))
+        for client, torrents in scanned:
             if self._event.is_set():
                 break
-            torrents = client.list_completed()
-            if not torrents:
-                continue
             hashes = [t["hash"] for t in torrents if t.get("hash")]
             client_hashes = set(hashes)
             by_hash, err = self._match(hashes)
@@ -502,7 +508,7 @@ class ColaCrossSeed(_PluginBase):
                 cola_hits = [h for h in hits if h.get("via") == "source_info_hash"]
                 own_hits = [h for h in hits if h.get("via") == "info_hash"]
                 # 客户端已经有这颗可乐种（同一 info_hash）时不必再拉：qB 会直接回 Fails.（重复种子）。
-                cola_hits = [h for h in cola_hits if (h.get("info_hash") or "").lower() not in client_hashes]
+                cola_hits = [h for h in cola_hits if (h.get("info_hash") or "").lower() not in all_hashes]
                 stats["matched"] += 1 if hits else 0
                 # 方向一：客户端有同一份文件（来源别的站），拉可乐种子回来辅
                 if cola_hits and self._direction in ("both", "cola_only"):
