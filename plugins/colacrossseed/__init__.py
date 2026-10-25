@@ -19,6 +19,7 @@ import re
 import time
 import uuid
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -205,7 +206,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.0"
+    plugin_version = "0.3.0"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -261,6 +262,10 @@ class ColaCrossSeed(_PluginBase):
             self._captcha_code = ""
             self._persist()
         self._event.clear()
+        if self._enabled:
+            # 保存后自动检测一次连通性（后台线程，不卡保存）；结果显示在插件页。
+            import threading
+            threading.Thread(target=self.run_tests, daemon=True).start()
 
     def _persist(self) -> None:
         self.update_config({
@@ -600,6 +605,82 @@ class ColaCrossSeed(_PluginBase):
             done.append(key)
         self.save_data("done", done[-10000:])
 
+    # ---------------- 连通性检测（保存后自动跑，结果显示在插件页） ----------------
+
+    _test_report: Dict[str, Any] = {}
+
+    def _test_clients(self) -> List[str]:
+        lines: List[str] = []
+        for client in self._clients():
+            torrents = client.list_completed()
+            if torrents:
+                lines.append(f"✅ {client.name}：连接成功，已完成 {len(torrents)} 个种子")
+            else:
+                # 能连上但列表为空，和连不上要分开说。
+                lines.append(f"⚠️ {client.name}：连接成功，但没有已完成种子（或读取失败）")
+        if not lines:
+            lines.append("❌ 没有可用下载器：检查「下载器」每行格式与地址")
+        return lines
+
+    def _test_one_site(self, site: Dict[str, str]) -> Tuple[str, bool, str]:
+        url = site["url"].rstrip("/") + "/api/pieces-hash"
+        try:
+            rsp = requests.post(
+                url,
+                json={"passkey": site["passkey"], "pieces_hash": ["0" * 40]},
+                timeout=8,
+                headers={"User-Agent": "MoviePilot-ColaCrossSeed/0.3"},
+            )
+            if rsp.status_code == 200:
+                try:
+                    body = rsp.json()
+                except Exception:
+                    return site["name"], False, "返回不是 JSON（可能不是 NexusPHP 站）"
+                if isinstance(body.get("data"), (dict, list)):
+                    return site["name"], True, "连接成功"
+                return site["name"], False, "接口返回格式不匹配"
+            if rsp.status_code in (401, 403):
+                return site["name"], False, f"passkey 不对或被拒绝（HTTP {rsp.status_code}）"
+            return site["name"], False, f"HTTP {rsp.status_code}"
+        except Exception as err:
+            return site["name"], False, f"连不上：{type(err).__name__}"
+
+    def _test_sites(self) -> List[str]:
+        sites = self._other_sites()
+        if not sites:
+            return ["ℹ️ 没有配置其他站（可粘贴 IYUU 配置或填「域名,passkey」）"]
+        lines: List[str] = []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for name, ok, msg in pool.map(self._test_one_site, sites):
+                lines.append(f"{'✅' if ok else '❌'} {name}：{msg}")
+        good = sum(1 for line in lines if line.startswith("✅"))
+        lines.insert(0, f"其他站 {len(sites)} 个，成功 {good} 个，失败 {len(sites) - good} 个")
+        return lines
+
+    def _test_cola(self) -> str:
+        if not self._session_token:
+            return "❌ 可乐PT：未登录（打开插件页取验证码填一次）"
+        rsp = self._cola("GET", "/api/v1/me")
+        if rsp is not None and rsp.status_code == 200:
+            try:
+                return f"✅ 可乐PT：已登录（{((rsp.json() or {}).get('username') or '')}）"
+            except Exception:
+                return "✅ 可乐PT：已登录"
+        return "❌ 可乐PT：会话过期，需要重新登录"
+
+    def run_tests(self, persist: bool = True) -> Dict[str, Any]:
+        report = {
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "cola": self._test_cola(),
+            "clients": self._test_clients(),
+            "sites": self._test_sites(),
+        }
+        self._test_report = report
+        if persist:
+            self.save_data("test_report", report)
+        logger.info(f"连通性检测：{report['cola']}；{report['clients']}；其他站 {report['sites'][0] if report['sites'] else ''}")
+        return report
+
     # ---------------- 任务 ----------------
 
     def auto_seed(self):
@@ -749,8 +830,20 @@ class ColaCrossSeed(_PluginBase):
                 {"component": "VImg", "props": {"src": image, "max-width": 220, "class": "mt-3"}},
             ]
         last = self.get_data("last_run") or {}
-        return [{"component": "div", "text": f"已登录可乐PT。上次运行：{last.get('at', '未运行')}；"
-                                            f"可乐补种 {last.get('added', 0)}，其他站 {last.get('filled', 0)}，失败 {last.get('failed', 0)}。"}]
+        report = self.get_data("test_report") or self._test_report or {}
+        blocks: List[dict] = [
+            {"component": "div", "text": f"已登录可乐PT。上次运行：{last.get('at', '未运行')}；"
+                                         f"可乐补种 {last.get('added', 0)}，其他站 {last.get('filled', 0)}，失败 {last.get('failed', 0)}。"}
+        ]
+        if report:
+            lines = [f"检测时间 {report.get('at', '')}", report.get("cola", "")]
+            lines += report.get("clients") or []
+            lines += report.get("sites") or []
+            blocks.append({"component": "div", "text": "\n".join([x for x in lines if x]),
+                           "props": {"style": "white-space: pre-wrap; line-height: 1.8"}})
+        else:
+            blocks.append({"component": "div", "text": "保存一次配置会自动做连通性检测，结果显示在这里。"})
+        return blocks
 
     def _fetch_captcha(self) -> Tuple[str, str]:
         try:
@@ -765,13 +858,22 @@ class ColaCrossSeed(_PluginBase):
         return "", ""
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return [{
-            "path": "/run",
-            "endpoint": self.auto_seed,
-            "methods": ["POST"],
-            "summary": "立即执行一次辅种",
-            "description": "手动触发一次辅种任务（仍然遵守每小时上限）",
-        }]
+        return [
+            {
+                "path": "/run",
+                "endpoint": self.auto_seed,
+                "methods": ["POST"],
+                "summary": "立即执行一次辅种",
+                "description": "手动触发一次辅种任务（仍然遵守每小时上限）",
+            },
+            {
+                "path": "/test",
+                "endpoint": self.run_tests,
+                "methods": ["GET", "POST"],
+                "summary": "检测可乐/下载器/其他站连通性",
+                "description": "返回可乐登录、每个下载器、每个其他站的连接结果；结果也会显示在插件页",
+            },
+        ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
