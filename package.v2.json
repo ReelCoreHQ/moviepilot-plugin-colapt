@@ -3,12 +3,13 @@
     "name": "可乐PT辅种",
     "description": "参考 ReseedPuppy / IYUU 辅种插件：扫客户端已有资源，与可乐PT 对照，存在就自动拉可乐种子辅种；支持直接导入 IYUU 站点配置、按行填写其他站（域名+passkey）与下载器（地址+账号密码）。",
     "labels": "做种,辅种",
-    "version": "0.10.5",
+    "version": "0.10.6",
     "icon": "https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt/main/icons/colacrossseed.png",
     "author": "ColaPT",
     "level": 1,
     "v2": true,
     "history": {
+      "v0.10.6": "统计里新增「客户端已有」计数：matched 里有多少是同 info_hash 已经有的（之前静默跳过，导致 matched=65 / added=0 看不出原因）；附带 plugins.v2/colacrossseed/README.md 与 plugin_readme 字段，MP 详情页可直接「查看文档」",
       "v0.10.5": "自愈清理：每轮开始前把带「可乐辅种」标签、但 state=missingFiles 的种子删掉（只删种子不删文件）。跨种匹配到「合集里的单片」时 save_path 不可能总对得上，之前会留在 qB 里变成红色垃圾",
       "v0.10.4": "修馒头：genDlToken 的签名地址会再 302 到 CDN（fr1.halomt.com），下载必须带浏览器 UA + Accept: application/x-bittorrent 并跟随重定向；失败会换新 token 重试一次。实测拿到 5–8KB 有效种子",
       "v0.10.3": "站点熔断：同一轮里某站连续失败 3 次后跳过它，避免慢站/坏站把整轮拖死（实测 IYUU 返回 85 个 hash、单条最多 22 个条目时会卡住）",
@@ -44,6 +45,7 @@
       "v0.3.0": "保存后自动检测可乐/下载器/其他站连通性并显示在插件页；新增 /test 接口",
       "v0.2.0": "支持直接粘贴 IYUU 站点 JSON 导入；其他站改为「域名,passkey」按行填写；下载器改为「地址,用户名,密码」按行填写",
       "v0.1.0": "首个版本：可乐账号密码+图形验证码登录；客户端 hash 反向匹配可乐；多 qB/TR 客户端；默认校验；默认 20 个/小时"
-    }
+    },
+    "plugin_readme": "https://www.colapt.com/wiki/moviepilot-crossseed"
   }
 }

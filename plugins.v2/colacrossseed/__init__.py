@@ -400,7 +400,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.5"
+    plugin_version = "0.10.6"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1459,7 +1459,7 @@ class ColaCrossSeed(_PluginBase):
         if sites:
             logger.info(f"其他站 {len(sites)} 个：{', '.join(s['name'] for s in sites[:6])}{'...' if len(sites) > 6 else ''}")
         stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0,
-                 "duplicate": 0, "retried": 0}
+                 "duplicate": 0, "retried": 0, "already": 0}
         unknown_sids: set = set()
         by_site: Dict[str, Dict[str, int]] = {}
         self._site_counter = {}   # 每轮重置：单站上限按轮算
@@ -1536,7 +1536,10 @@ class ColaCrossSeed(_PluginBase):
                 cola_hits = [h for h in hits if h.get("via") == "source_info_hash"]
                 own_hits = [h for h in hits if h.get("via") == "info_hash"]
                 # 客户端已经有这颗可乐种（同一 info_hash）时不必再拉：qB 会直接回 Fails.（重复种子）。
-                cola_hits = [h for h in cola_hits if (h.get("info_hash") or "").lower() not in all_hashes]
+                kept = [h for h in cola_hits if (h.get("info_hash") or "").lower() not in all_hashes]
+                if len(kept) != len(cola_hits):
+                    stats["already"] = stats.get("already", 0) + (len(cola_hits) - len(kept))
+                cola_hits = kept
                 stats["matched"] += 1 if hits else 0
                 # 方向一：客户端有同一份文件（来源别的站），拉可乐种子回来辅
                 if cola_hits and self._direction in ("both", "cola_only"):
@@ -1630,6 +1633,8 @@ class ColaCrossSeed(_PluginBase):
     def _finish(self, stats: Dict[str, int]) -> None:
         self.save_data("last_run", {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), **stats})
         logger.info(f"可乐PT 辅种完成：{stats}")
+        if stats.get("already"):
+            logger.info(f"其中 {stats['already']} 个在客户端里已经有了（同一 info_hash），直接跳过")
         if self._notify and (stats["added"] or stats["filled"] or stats["failed"]):
             self.post_message(
                 mtype=NotificationType.SiteMessage,
@@ -1637,6 +1642,7 @@ class ColaCrossSeed(_PluginBase):
                 text=(f"匹配：{stats['matched']}\n可乐补种：{stats['added']}\n其他站补种：{stats['filled']}\n"
                       f"重复跳过：{stats.get('duplicate', 0)}\n校验失败后降级成功：{stats.get('retried', 0)}\n"
                       f"跳过：{stats['skipped']}\n失败：{stats['failed']}"
+                      + (f"\n客户端已有：{stats['already']}" if stats.get("already") else "")
                       + (f"\n待下一轮重试：{len(self._pending())} 个" if self._pending() else "")),
             )
 
