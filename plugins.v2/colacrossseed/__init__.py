@@ -321,7 +321,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.6.3"
+    plugin_version = "0.7.0"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -562,8 +562,12 @@ class ColaCrossSeed(_PluginBase):
                 last = "返回不是 JSON"
                 continue
             if not isinstance(data, dict):
-                last = "返回格式不匹配"
-                continue
+                # 有的站点「没命中」时把 data 序列化成 []（PHP 的空数组），按空结果处理
+                if isinstance(data, list) and not data:
+                    data = {}
+                else:
+                    last = "返回格式不匹配"
+                    continue
             self._pieces_paths[host] = path
             return data.get(pieces_hash), ""
         # 只有 404/405 才算“不支持”；超时/500 下次还会重试
@@ -1109,13 +1113,15 @@ class ColaCrossSeed(_PluginBase):
                     url,
                     json={"passkey": site["passkey"], "pieces_hash": ["0" * 40]},
                     timeout=8,
-                    headers={"User-Agent": "MoviePilot-ColaCrossSeed/0.3"},
+                    headers={"Accept": "application/json", "User-Agent": UA},
                 )
             except Exception as err:
-                last = f"连不上：{type(err).__name__}"
+                last = f"连不上（{type(err).__name__}）：检查这台机器能不能访问 {host}"
                 continue
             if rsp.status_code in (404, 405):
-                last = "站点没有 pieces-hash 接口（辅种匹配用不了）"
+                if site.get("rsskey"):
+                    return site["name"], True, "没有 pieces-hash，但有 RSS 密钥 → 走 RSS 精确匹配"
+                last = "站点没有 pieces-hash 接口，也没有填 rsskey（这个站目前没法匹配）"
                 continue
             if rsp.status_code in (401, 403):
                 return site["name"], False, f"passkey 不对或被拒绝（HTTP {rsp.status_code}）"
@@ -1125,7 +1131,7 @@ class ColaCrossSeed(_PluginBase):
             try:
                 body = rsp.json()
             except Exception:
-                last = "返回不是 JSON（可能不是 NexusPHP 站）"
+                last = "返回不是 JSON：多半被 302 到登录页（需要 Accept: application/json 或 passkey 不对）"
                 continue
             if isinstance(body.get("data"), (dict, list)):
                 self._pieces_paths[host] = path
