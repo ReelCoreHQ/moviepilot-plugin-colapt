@@ -365,7 +365,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.9.2"
+    plugin_version = "0.9.3"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1190,9 +1190,12 @@ class ColaCrossSeed(_PluginBase):
             return b""
         base = (site.get("url") or "").rstrip("/")
         try:
-            rsp = requests.post(f"{base}/api/torrent/genDlToken", data={"id": torrent_id},
-                                headers={"x-api-key": api_key, "User-Agent": "MoviePilot-ColaCrossSeed/0.5"},
-                                timeout=REQUEST_TIMEOUT)
+            # 必须用浏览器 UA：M-Team 对 curl/脚本 UA 直接 302 到 google，看起来像「接口不存在」
+            rsp = _site_request("POST", f"{base}/api/torrent/genDlToken", data={"id": torrent_id},
+                                headers={"x-api-key": api_key, "Accept": "application/json",
+                                         "Content-Type": "application/x-www-form-urlencoded",
+                                         "User-Agent": UA},
+                                proxy=site.get("proxy") or "")
             body = rsp.json() if rsp.status_code == 200 else {}
         except Exception as err:
             logger.warn(f"M-Team 换取下载地址失败：{err}")
