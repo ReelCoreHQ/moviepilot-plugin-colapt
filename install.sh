@@ -37,7 +37,7 @@ case "${1:-install}" in
     trap 'rm -rf "$tmp"' EXIT
     mkdir -p "$tmp/$PID"
     echo "下载插件到 $tmp/$PID ..."
-    curl -fsSL "$REPO_RAW/plugins/$PID/__init__.py" -o "$tmp/$PID/__init__.py"
+    curl -fsSL "$REPO_RAW/plugins.v2/$PID/__init__.py" -o "$tmp/$PID/__init__.py"
     docker exec "$C" test -d "/app/app/plugins" || {
       echo "容器内没有 /app/app/plugins，可能不是 MoviePilot v2 容器" >&2; exit 1; }
     docker exec "$C" rm -rf "$DEST"

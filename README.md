@@ -1,25 +1,42 @@
-# 可乐PT 自动辅种（MoviePilot 插件）
+# 可乐PT辅种 · MoviePilot 插件
 
-参考 [ReseedPuppy](https://github.com/tt12580/Reseed-Puppy) 与 MoviePilot 的「青蛙辅种助手」思路，做一个**只服务可乐PT 用户**的辅种插件。
+把 MoviePilot / qBittorrent / Transmission 里**已经下载完成**的资源，与 [可乐PT](https://www.colapt.com) 对照，
+命中就自动把可乐PT 的那颗种子拉回来辅种；反过来也能去你配置的其他 PT 站补种。
 
-## 逻辑
-
-1. 扫描你配置的 qBittorrent / Transmission（可多个，也可直接用 MoviePilot 已配置的下载器）里**已完成**的种子；
-2. 把这些种子的 info_hash 批量发给可乐PT：
-   - `via=source_info_hash`：客户端里有同一份文件（来源别的站），**拉可乐这颗种子回原下载器辅种**；
-   - `via=info_hash`：客户端里已经是可乐这颗种子，跳过；
-3. 可选反向：对 `via=info_hash` 的可乐种子，下载可乐的 `.torrent` 算出 `pieces_hash`，去你配置的其他 NexusPHP 站点 `/api/pieces-hash` 查同 pieces 的种子，命中就拉对方种子回来辅种；
-4. 每小时最多添加 **20** 个（滚动 60 分钟，可调）；是否跳过校验由你决定，**默认校验**。
+> 这不是 IYUU / ReseedPuppy 的替代品：它只服务可乐PT 用户，配置更少，跑在 MoviePilot 里。
 
 ## 安装
 
-### 方式一：手动放入插件目录（推荐自用）
+### 方式一：插件市场（推荐）
 
-把 `plugins/colacrossseed/` 整个目录放到 MoviePilot 的插件目录（`app/plugins/`，或挂载的 `/config/plugins/`），重启 MoviePilot，在「插件」里启用「可乐PT辅种」。
+MoviePilot → 设置 → 插件市场 → **添加仓库**，填：
 
-### 方式二：作为插件仓库
+```
+https://github.com/ReelCoreHQ/moviepilot-plugin-colapt
+```
 
-把本仓库加到 MoviePilot 的插件仓库地址（设置 → 插件市场 → 添加仓库），即可在市场中看到。
+刷新插件市场，找到「可乐PT辅种」安装、启用。
+
+### 方式二：一键脚本（直接拷进容器）
+
+在跑 MoviePilot 的宿主机上执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt/main/install.sh | bash
+# 卸载
+curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt/main/install.sh | bash -s uninstall
+```
+
+容器升级重建后要重跑一次；想跟随升级请用方式一。
+
+## 它做什么
+
+1. 扫描你配置的 qBittorrent / Transmission（可多个，也可直接用 MoviePilot 已配置的下载器）里**已完成**的种子；
+2. 把这些种子的 info_hash 批量交给可乐PT：
+   - `via=source_info_hash`：客户端里有同一份文件（来源别的站）→ **拉可乐这颗种子回原下载器辅种**；
+   - `via=info_hash`：客户端里已经是可乐这颗种子 → 跳过；
+3. 可选方向二：对可乐的种子，用 IYUU 云端匹配（或站点 `/api/pieces-hash`）去其他站找同一份文件，命中就拉回来辅种；
+4. 每小时最多添加 N 个（滚动 60 分钟窗口，默认 20），是否跳过校验由你决定（默认校验）。
 
 ## 配置
 
@@ -33,18 +50,33 @@
 | 下载器 | 每行一个：`地址,用户名,密码`；Transmission 写 `tr,地址,用户名,密码`（qB 可写 `qb,地址,用户名,密码`） |
 | 其他站 | 每行一个：`域名,passkey`，也可写 `名称,域名,passkey` |
 | 直接导入 IYUU 站点配置 | 把 IYUU 导出的站点 JSON 整个粘贴进来，自动取「启用且有 passkey」的站点 |
+| IYUU Token | 填了就用 IYUU 云端做辅种匹配（覆盖没有 pieces-hash 的站） |
 | 辅种方向 | 双向 / 只补可乐 / 只补其他站 |
 | 每小时最多添加 | 默认 20，可调（1–200） |
-| 跳过校验 | 默认关闭（默认校验）；Transmission 无跳过选项，等价于总是校验 |
+| 跳过校验 | 默认关闭（默认校验）；Transmission 无此选项，等价于总是校验 |
 | 辅种标签 | 给补进来的种子打的标签（qB 用标签、TR 用 label）；留空则沿用种子原来的分类 |
 | 校验失败降级 | 默认开。校验态下失败最常见的原因是文件不完全一致（多一个 nfo/字幕），开启后自动用「跳过校验」重试一次 |
 | 失败下一轮重试 | 默认开。真正失败的种子进队列（最多 40 条），下一轮优先重试，插件页能看到待重试清单 |
 | 执行周期 | cron，默认每小时 |
-| 其他站（方向二） | 站点需支持 `/api/pieces-hash`；也可以直接用上面的 IYUU 导入 |
+
+## 插件页与接口
+
+- 插件页显示：上次运行统计（匹配 / 可乐补种 / 其他站补种 / 重复 / 降级成功 / 失败）、待重试清单、连通性检测结果；
+- `POST /api/v1/plugin/ColaCrossSeed/run` 手动跑一次（仍守每小时上限）；
+- `POST /api/v1/plugin/ColaCrossSeed/test` 检测可乐、下载器、其他站连通性。
 
 ## 注意
 
 - 会话过期（站点返回 401）时插件会发站内通知：重新打开插件页面取验证码、填一次即可；
-- 插件不保存可乐密码以外的站点 cookie；其他站只需要域名 + passkey；
-- 可乐PT 接口限流：列表/match 60 次/分/凭据，下载 120 次/分，插件已按批（500 hash/次）调用；
-- 默认 20 个/小时是为了避免一次辅种太多触发源站风控，用户可自行调低。
+- 插件只保存可乐的会话 token，其他站只需要域名 + passkey；
+- 可乐PT 接口有限流（列表/match 60 次/分/凭据，下载 120 次/分），插件已按批调用；
+- 默认 20 个/小时是为了避免一次辅种太多触发源站风控，可自行调低。
+
+## 安全与隐私
+
+仓库里**不含任何凭据**；账号、passkey、IYUU token、下载器密码全部只存在你自己的 MoviePilot 里。
+详见 [SECURITY.md](./SECURITY.md)。
+
+## 许可证
+
+[MIT](./LICENSE)

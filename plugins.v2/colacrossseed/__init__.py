@@ -60,7 +60,7 @@ class _HttpResult:
 def _curl(method: str, url: str, headers=None, params=None, json_body=None, data=None, timeout: int = 20) -> _HttpResult:
     """用系统 curl 发请求。
 
-    为什么不用 requests：这台 NAS 上 python/OpenSSL 的 TLS 指纹被 Cloudflare 卡住（握手超时），
+    为什么不用 requests：部分 NAS/容器镜像里的 python+OpenSSL 组合会被 Cloudflare 拦（握手超时），
     而 curl 同一台机器可以正常访问；插件里对可乐PT 的请求因此走 curl，其它站点仍用 requests。
     """
     cmd = ["curl", "-sS", "--max-time", str(timeout), "-X", method]
@@ -298,7 +298,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.5.0"
+    plugin_version = "0.5.1"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
