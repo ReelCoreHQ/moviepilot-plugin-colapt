@@ -194,6 +194,14 @@ class _Client:
         """客户端里是否已有这个 info_hash；不知道时返回 False。"""
         return False
 
+    def tagged_missing(self, tag: str) -> List[str]:
+        """返回带该标签、但文件缺失（missingFiles）的种子 hash，用于自愈清理。"""
+        return []
+
+    def delete(self, hashes: List[str], delete_files: bool = False) -> bool:
+        """从客户端移除种子（默认不删文件）。"""
+        return False
+
     def close(self) -> None:
         pass
 
@@ -288,6 +296,31 @@ class QBittorrentClient(_Client):
         return "fail"
 
 
+    def tagged_missing(self, tag: str) -> List[str]:
+        try:
+            rsp = self._session.get(f"{self.url}/api/v2/torrents/info", params={"tag": tag},
+                                    timeout=REQUEST_TIMEOUT)
+            if rsp.status_code != 200:
+                return []
+            return [x.get("hash", "") for x in (rsp.json() or []) if x.get("state") == "missingFiles"]
+        except Exception as err:
+            logger.warn(f"qBittorrent ({self.name}) 查询缺失种子失败：{err}")
+            return []
+
+    def delete(self, hashes: List[str], delete_files: bool = False) -> bool:
+        if not hashes:
+            return False
+        try:
+            rsp = self._session.post(f"{self.url}/api/v2/torrents/delete",
+                                     data={"hashes": "|".join(hashes),
+                                           "deleteFiles": "true" if delete_files else "false"},
+                                     timeout=REQUEST_TIMEOUT)
+            return rsp.status_code == 200
+        except Exception as err:
+            logger.warn(f"qBittorrent ({self.name}) 删除种子失败：{err}")
+            return False
+
+
 class TransmissionClient(_Client):
     def __init__(self, name: str, url: str, username: str = "", password: str = ""):
         self.name = name
@@ -367,7 +400,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.4"
+    plugin_version = "0.10.5"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1409,6 +1442,12 @@ class ColaCrossSeed(_PluginBase):
         if not clients:
             logger.warn("没有可用的下载器")
             return
+        # 自愈：上一轮加进去但文件对不上的（state=missingFiles），清掉，别在 qB 里留垃圾
+        for client in clients:
+            missing = client.tagged_missing(MANDATORY_TAG)
+            if missing:
+                client.delete(missing)
+                logger.warn(f"{client.name}：清理 {len(missing)} 个文件缺失的辅种种（只删种子，不删文件）")
         sites = []
         if self._direction in ("both", "other_only"):
             sites = self._other_sites()
