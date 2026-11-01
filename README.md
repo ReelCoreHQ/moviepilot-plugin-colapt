@@ -5,6 +5,8 @@
 
 > 这不是 IYUU / ReseedPuppy 的替代品：它只服务可乐PT 用户，配置更少，跑在 MoviePilot 里。
 
+> 使用说明（截图 + 常见问题）：<https://www.colapt.com/wiki/moviepilot-crossseed>
+
 ## 安装
 
 ### 方式一：插件市场（推荐）
