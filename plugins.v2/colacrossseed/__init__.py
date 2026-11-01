@@ -367,7 +367,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.0"
+    plugin_version = "0.10.1"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -630,13 +630,24 @@ class ColaCrossSeed(_PluginBase):
         return None, last
 
     def _site_download(self, site: Dict[str, Any], torrent_id: str) -> bytes:
-        url = f"{(site.get('url') or '').rstrip('/')}/download.php"
+        """按站点自己的下载模板取种，不是所有站都用 download.php?id&passkey。
+
+        实测（2026-11-01，老板 NAS）：
+          · 家园 hdhome  : download.php?id={}&uid={uid}&hash={hash}（32 位 passkey 会回 "Old Passkey no Support"）
+          · 听听歌 ttg   : dl/{id}/{passkey}
+          · 春天 springsunday / 观众 / 大多数 NexusPHP : download.php?id={}&passkey={passkey}
+        模板来自 IYUU 的站点导出（download_page 字段）；再加上站点自己的 Cookie，这三家都能拿到种子。
+        """
+        url = self._site_torrent_url(site, str(torrent_id))
         try:
-            rsp = _site_request("GET", url, params={"id": torrent_id, "passkey": site.get("passkey", "")},
-                                headers=_site_headers(site, accept="application/x-bittorrent, */*"),
+            rsp = _site_request("GET", url, headers=_site_headers(site, accept="application/x-bittorrent, */*"),
                                 proxy=site.get("proxy") or "")
             if rsp.status_code == 200 and _valid_torrent(rsp.content):
                 return rsp.content
+            if rsp.status_code == 302 and "login" in (rsp.content[:200].decode("utf-8", "ignore") or "").lower():
+                logger.warn(f"站点 {site.get('name')} 需要登录态（cookie 失效或没配）")
+            else:
+                logger.warn(f"站点 {site.get('name')} 下载失败：HTTP {rsp.status_code} {len(rsp.content)} 字节")
         except Exception as err:
             logger.warn(f"站点 {site.get('name')} 下载种子失败：{err}")
         return b""
