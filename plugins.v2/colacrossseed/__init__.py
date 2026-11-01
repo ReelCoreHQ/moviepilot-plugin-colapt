@@ -109,6 +109,25 @@ def _run_curl(cmd: List[str]) -> _HttpResult:
     return _HttpResult(status, body, body.decode("utf-8", "replace"))
 
 
+def _site_request(method: str, url: str, **kw) -> _HttpResult:
+    """站点的 HTTP 请求：先试 requests，失败再走系统 curl。
+
+    真实原因（2026-11-01 在老板 NAS 上实测）：这些站大多在 Cloudflare 后面，这台机器只有 IPv6 能通，
+    Python 的 requests 先试 IPv4 就超时/重置；curl 自带回落，同一台机器上 curl 302、requests 全挂。
+    所以站点侧请求统一走这一层，谁通算谁的。
+    """
+    timeout = kw.pop("timeout", REQUEST_TIMEOUT)
+    try:
+        rsp = requests.request(method, url, timeout=timeout, **kw)
+        return _HttpResult(rsp.status_code, rsp.content, rsp.text)
+    except Exception as err:
+        res = _curl(method, url, params=kw.get("params"), json_body=kw.get("json"),
+                    data=kw.get("data"), headers=kw.get("headers"), timeout=timeout)
+        if res.status_code or res.content:
+            logger.info(f"{type(err).__name__} → 改用 curl 访问 {url.split('://')[-1].split('/')[0]}")
+        return res
+
+
 def _valid_torrent(data: bytes) -> bool:
     """站点返回登录页/错误页时也常是 200，交给 qB 会得到 415。这里先做一次 bencode 校验。"""
     try:
@@ -321,7 +340,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.8.0"
+    plugin_version = "0.8.1"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -547,9 +566,8 @@ class ColaCrossSeed(_PluginBase):
             try:
                 # Accept: application/json 是必须的：麒麟(hdkyl) 这类 Laravel 站在没有它时
                 # 会把未认证/异常请求 302 回首页，插件拿到的是一张 HTML 页而不是 JSON。
-                rsp = requests.post(url, json={"passkey": site.get("passkey", ""), "pieces_hash": [pieces_hash]},
-                                    headers={"Accept": "application/json", "User-Agent": UA},
-                                    timeout=REQUEST_TIMEOUT)
+                rsp = _site_request("POST", url, json={"passkey": site.get("passkey", ""), "pieces_hash": [pieces_hash]},
+                                    headers={"Accept": "application/json", "User-Agent": UA})
             except Exception as err:
                 last = str(err)
                 continue
@@ -581,9 +599,8 @@ class ColaCrossSeed(_PluginBase):
     def _site_download(self, site: Dict[str, Any], torrent_id: str) -> bytes:
         url = f"{(site.get('url') or '').rstrip('/')}/download.php"
         try:
-            rsp = requests.get(url, params={"id": torrent_id, "passkey": site.get("passkey", "")},
-                               headers={"Accept": "application/x-bittorrent, */*", "User-Agent": UA},
-                               timeout=REQUEST_TIMEOUT)
+            rsp = _site_request("GET", url, params={"id": torrent_id, "passkey": site.get("passkey", "")},
+                                headers={"Accept": "application/x-bittorrent, */*", "User-Agent": UA})
             if rsp.status_code == 200 and _valid_torrent(rsp.content):
                 return rsp.content
         except Exception as err:
@@ -1188,8 +1205,8 @@ class ColaCrossSeed(_PluginBase):
         for path in ("/api/pieces-hash", "/nexusapi/pieces-hash"):
             url = site["url"].rstrip("/") + path
             try:
-                rsp = requests.post(
-                    url,
+                rsp = _site_request(
+                    "POST", url,
                     json={"passkey": site["passkey"], "pieces_hash": ["0" * 40]},
                     timeout=8,
                     headers={"Accept": "application/json", "User-Agent": UA},
