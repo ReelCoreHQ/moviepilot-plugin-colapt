@@ -48,6 +48,7 @@ COLA_MATCH_BATCH = 500
 # colapt.com 在部分国内网络会被解析到连不通的 Cloudflare 段；这些是实测可用的备用段。
 COLA_FALLBACK_IPS = ("104.21.66.130", "172.67.132.88", "104.26.10.0")
 REQUEST_TIMEOUT = 20
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
 
 
 class _HttpResult:
@@ -320,7 +321,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.6.2"
+    plugin_version = "0.6.3"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -541,7 +542,10 @@ class ColaCrossSeed(_PluginBase):
         for path in paths:
             url = (site.get("url") or "").rstrip("/") + path
             try:
+                # Accept: application/json 是必须的：麒麟(hdkyl) 这类 Laravel 站在没有它时
+                # 会把未认证/异常请求 302 回首页，插件拿到的是一张 HTML 页而不是 JSON。
                 rsp = requests.post(url, json={"passkey": site.get("passkey", ""), "pieces_hash": [pieces_hash]},
+                                    headers={"Accept": "application/json", "User-Agent": UA},
                                     timeout=REQUEST_TIMEOUT)
             except Exception as err:
                 last = str(err)
@@ -571,6 +575,7 @@ class ColaCrossSeed(_PluginBase):
         url = f"{(site.get('url') or '').rstrip('/')}/download.php"
         try:
             rsp = requests.get(url, params={"id": torrent_id, "passkey": site.get("passkey", "")},
+                               headers={"Accept": "application/x-bittorrent, */*", "User-Agent": UA},
                                timeout=REQUEST_TIMEOUT)
             if rsp.status_code == 200 and _valid_torrent(rsp.content):
                 return rsp.content
