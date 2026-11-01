@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 | 两步验证码 | 账号开了 2FA 时填（可选） |
 | 使用 MoviePilot 已配置下载器 | 勾选后使用 MP 里的 qB/TR |
 | 下载器 | 每行一个：`地址,用户名,密码`；Transmission 写 `tr,地址,用户名,密码`（qB 可写 `qb,地址,用户名,密码`） |
-| 其他站 | 每行一个：`域名,passkey`，也可写 `名称,域名,passkey`，或 `名称,域名,passkey,rsskey` |
+| 其他站 | 每行一个站点，位置写法和键值写法都支持（见下） |
 | 直接导入 IYUU 站点配置 | 把 IYUU 导出的站点 JSON 整个粘贴进来，自动取「启用且有 passkey」的站点 |
 | IYUU Token | 填了就用 IYUU 云端做辅种匹配（覆盖没有 pieces-hash 的站） |
 | 辅种方向 | 双向 / 只补可乐 / 只补其他站 |
@@ -65,10 +65,28 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 - `POST /api/v1/plugin/ColaCrossSeed/run` 手动跑一次（仍守每小时上限）；
 - `POST /api/v1/plugin/ColaCrossSeed/test` 检测可乐、下载器、其他站连通性。
 
-## 站点侧接口（可选，效果最好）
+## 其他站怎么写
 
-想让某个站支持**全站精确匹配**，可以给它加一个 pieces-hash 接口：
-见 [integrations/pieces-hash](./integrations/pieces-hash/README.md)（含 SQL、接口代码、回填脚本、web 服务器配置和自检脚本）。
+```
+# 只有 passkey：走 pieces-hash / RSS（如果还配了 rsskey）
+https://pt.example.com,abcdef1234567890abcdef1234567890
+
+# 名称 + passkey
+朋友,https://pt.keepfrds.com,abcdef1234567890abcdef1234567890
+
+# 没有 pieces-hash 的站：第 4 段写 RSS 密钥（观众就是这个写法）
+观众,https://audiences.me,<passkey>,<rsskey>
+
+# 要走 IYUU 云端匹配：必须有 sid（IYUU 导出的站点 JSON 里 `"sid": 数字`）
+观众,https://audiences.me,passkey=<passkey>,sid=42
+
+# 也可以把几种信息一次写全
+麒麟,https://www.hdkyl.in,passkey=<passkey>,sid=7,uid=30695
+```
+
+`sid` 只在 IYUU 通道用得上：IYUU 云端按 sid 回结果，插件靠 sid 找到对应站点去下载。
+不知道自己的 sid 时先不写，跑一轮后日志会打印「IYUU 返回了插件里没有配置的站点 sid：42」，
+照着补 `sid=42` 即可。
 
 ## 三条匹配通道
 
