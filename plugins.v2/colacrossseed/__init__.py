@@ -116,6 +116,17 @@ def _run_curl(cmd: List[str]) -> _HttpResult:
 _CURL_ONLY_HOSTS: Dict[str, bool] = {}
 
 
+def _site_headers(site: Dict[str, Any], accept: str = "") -> Dict[str, str]:
+    """站点请求公共头：UA + 可选 Accept + 站点自己的 Cookie（天空/家园这类要登录态的站）。"""
+    headers = {"User-Agent": UA}
+    if accept:
+        headers["Accept"] = accept
+    cookie = str(site.get("cookie") or "").strip()
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
 def _site_request(method: str, url: str, **kw) -> _HttpResult:
     """站点的 HTTP 请求：先试 requests，失败再走系统 curl。
 
@@ -354,7 +365,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.9.0"
+    plugin_version = "0.9.1"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -581,7 +592,7 @@ class ColaCrossSeed(_PluginBase):
                 # Accept: application/json 是必须的：麒麟(hdkyl) 这类 Laravel 站在没有它时
                 # 会把未认证/异常请求 302 回首页，插件拿到的是一张 HTML 页而不是 JSON。
                 rsp = _site_request("POST", url, json={"passkey": site.get("passkey", ""), "pieces_hash": [pieces_hash]},
-                                    headers={"Accept": "application/json", "User-Agent": UA},
+                                    headers=_site_headers(site, accept="application/json"),
                                     proxy=site.get("proxy") or "")
             except Exception as err:
                 last = str(err)
@@ -615,7 +626,7 @@ class ColaCrossSeed(_PluginBase):
         url = f"{(site.get('url') or '').rstrip('/')}/download.php"
         try:
             rsp = _site_request("GET", url, params={"id": torrent_id, "passkey": site.get("passkey", "")},
-                                headers={"Accept": "application/x-bittorrent, */*", "User-Agent": UA},
+                                headers=_site_headers(site, accept="application/x-bittorrent, */*"),
                                 proxy=site.get("proxy") or "")
             if rsp.status_code == 200 and _valid_torrent(rsp.content):
                 return rsp.content
@@ -729,6 +740,7 @@ class ColaCrossSeed(_PluginBase):
                 channel = "auto"
             enabled = (keyed.get("enabled", "1").strip().lower() not in ("0", "false", "no", "off"))
             proxy = (keyed.get("proxy") or "").strip()
+            cookie = (keyed.get("cookie") or "").strip()
             url = self._normalise_url(url, "https")
             if not url or not passkey:
                 logger.warn(f"站点配置行缺少域名或 passkey：{line}")
@@ -750,6 +762,7 @@ class ColaCrossSeed(_PluginBase):
                 "channel": channel,
                 "enabled": enabled,
                 "proxy": proxy,
+                "cookie": cookie,
             })
         return out
 
@@ -1108,18 +1121,29 @@ class ColaCrossSeed(_PluginBase):
         if entry.get("at") and time.time() - int(entry["at"]) < self.RSS_TTL and entry.get("items") is not None:
             return {h: v for h, v in entry["items"].items()} if isinstance(entry.get("items"), dict) else {}
         url = f"{site.get('url') or 'https://' + host}/torrentrss.php"
-        try:
-            rsp = requests.get(url, params={"rsskey": rsskey, "linktype": "dl",
-                                            "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
-                               headers={"User-Agent": "MoviePilot-ColaCrossSeed/0.6"}, timeout=REQUEST_TIMEOUT)
-            if rsp.status_code != 200 or "<rss" not in (rsp.text or "")[:400]:
-                text = (rsp.text or "").strip()
+        # 参数名各站不同：观众用 rsskey、天空/hdsky 用 passkey，两种都试，谁给 XML 用谁
+        params_list = [
+            {"rsskey": rsskey, "linktype": "dl", "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
+            {"passkey": site.get("passkey") or rsskey, "linktype": "dl",
+             "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
+        ]
+        root = None
+        for params in params_list:
+            rsp = _site_request("GET", url, params=params, headers=_site_headers(site),
+                                timeout=40, proxy=site.get("proxy") or "")
+            if rsp.status_code != 200:
+                continue
+            text = (rsp.text or "").strip()
+            if "<rss" not in text[:400]:
                 if "RSS" in text:
                     logger.warn(f"{host} 的 RSS 暂时不可用：{text[:80]}")
-                return {}
-            root = ET.fromstring(rsp.content.decode("utf-8", "ignore"))
-        except Exception as err:
-            logger.warn(f"{host} 读取 RSS 失败：{err}")
+                continue
+            try:
+                root = ET.fromstring(rsp.content.decode("utf-8", "ignore"))
+                break
+            except Exception as err:
+                logger.warn(f"{host} RSS 解析失败：{err}")
+        if root is None:
             return {}
         items: Dict[str, Dict[str, Any]] = {}
         for item in root.findall(".//item"):
@@ -1227,7 +1251,7 @@ class ColaCrossSeed(_PluginBase):
                     "POST", url,
                     json={"passkey": site["passkey"], "pieces_hash": ["0" * 40]},
                     timeout=8,
-                    headers={"Accept": "application/json", "User-Agent": UA},
+                    headers=_site_headers(site, accept="application/json"),
                     proxy=site.get("proxy") or "",
                 )
             except Exception as err:
