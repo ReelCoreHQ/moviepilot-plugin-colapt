@@ -367,7 +367,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.3"
+    plugin_version = "0.10.4"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1241,33 +1241,39 @@ class ColaCrossSeed(_PluginBase):
         return urljoin(site["url"], path)
 
     def _download_mteam(self, site: Dict[str, str], torrent_id: str) -> bytes:
-        """M-Team 没有 pieces-hash，也没有 download.php：先 POST genDlToken 换下载地址，再取。"""
+        """M-Team：genDlToken 换签名地址 → 该地址会 302 到 CDN（fr1.halomt.com）→ 才拿到种子。
+
+        实测（2026-11-01）：
+          · 必须带浏览器 UA，脚本 UA 会被 302 到 google；
+          · 签名地址自己也是 302，必须跟随重定向（curl 要 -L，requests 默认跟随）；
+          · 重定向到 CDN 后要 Accept: application/x-bittorrent，否则可能回一整页 HTML（约 47KB）。
+        """
         api_key = site.get("x_api_key") or ""
         if not api_key:
             return b""
         base = (site.get("url") or "").rstrip("/")
-        try:
-            # 必须用浏览器 UA：M-Team 对 curl/脚本 UA 直接 302 到 google，看起来像「接口不存在」
+        headers = {"x-api-key": api_key, "Accept": "application/json",
+                   "Content-Type": "application/x-www-form-urlencoded", "User-Agent": UA}
+        dl_headers = {"User-Agent": UA, "Accept": "application/x-bittorrent, */*",
+                      "Referer": base + "/"}
+        for attempt in range(2):
             rsp = _site_request("POST", f"{base}/api/torrent/genDlToken", data={"id": torrent_id},
-                                headers={"x-api-key": api_key, "Accept": "application/json",
-                                         "Content-Type": "application/x-www-form-urlencoded",
-                                         "User-Agent": UA},
-                                proxy=site.get("proxy") or "")
-            body = rsp.json() if rsp.status_code == 200 else {}
-        except Exception as err:
-            logger.warn(f"M-Team 换取下载地址失败：{err}")
-            return b""
-        if str(body.get("code")) != "0" or not body.get("data"):
-            logger.warn(f"M-Team 换取下载地址返回：{body.get('message')}")
-            return b""
-        # 签名下载地址同样要浏览器 UA，且走同一条 requests→curl 通道
-        torrent = _site_request("GET", str(body["data"]), timeout=REQUEST_TIMEOUT,
-                                headers={"User-Agent": UA, "Accept": "application/x-bittorrent, */*"},
-                                proxy=site.get("proxy") or "")
-        if torrent.status_code == 200 and _valid_torrent(torrent.content):
-            return torrent.content
-        logger.warn(f"M-Team 下载种子失败：HTTP {torrent.status_code} {len(torrent.content)} 字节")
+                                headers=headers, proxy=site.get("proxy") or "")
+            try:
+                body = rsp.json() if rsp.status_code == 200 else {}
+            except Exception:
+                body = {}
+            if str(body.get("code")) != "0" or not body.get("data"):
+                logger.warn(f"M-Team 换取下载地址返回：{body.get('message') or rsp.status_code}")
+                return b""
+            torrent = _site_request("GET", str(body["data"]), headers=dl_headers,
+                                    proxy=site.get("proxy") or "")
+            if torrent.status_code == 200 and _valid_torrent(torrent.content):
+                return torrent.content
+            logger.warn(f"M-Team 下载种子第 {attempt + 1} 次失败：HTTP {torrent.status_code} "
+                        f"{len(torrent.content)} 字节（换新 token 重试）")
         return b""
+
 
     def _download_site_torrent(self, site: Dict[str, str], torrent_id: str) -> bytes:
         """IYUU / pieces-hash 两条路都从这里取种：统一按模板 + Cookie + requests→curl 回落。"""
