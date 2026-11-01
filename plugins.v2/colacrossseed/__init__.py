@@ -78,16 +78,17 @@ def _curl(method: str, url: str, headers=None, params=None, json_body=None, data
         cmd += ["-H", f"{key}: {value}"]
     cmd += ["-w", "\n%{http_code}", url]
     result = _run_curl(cmd)
-    if result.status == 0:
+    if result.status_code == 0:
         # 有些网络里 colapt.com 会被解析到连不通的 Cloudflare 段（实测 188.114.9x 在国内网络
         # 直接被 reset，而 104.21/172.67 段正常）。这时用 --resolve 逐个试已知可用的段，
         # SNI/Host 仍是 www.colapt.com，证书照样校验。
         host = url.split("://", 1)[-1].split("/")[0].split(":")[0]
         for ip in COLA_FALLBACK_IPS:
             retry = list(cmd)
-            retry[-2:-2] = ["--resolve", f"{host}:443:{ip}"]
+            # 插在 -w 之前：curl 的 -w 必须紧跟它的格式串，插在中间会把 --resolve 当成格式
+            retry[-3:-3] = ["--resolve", f"{host}:443:{ip}"]
             again = _run_curl(retry)
-            if again.status:
+            if again.status_code:
                 logger.info(f"{host} 直连失败，已改用 {ip} 连接成功")
                 result = again
                 break
@@ -319,7 +320,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.6.1"
+    plugin_version = "0.6.2"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
