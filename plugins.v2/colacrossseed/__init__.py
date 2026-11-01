@@ -367,7 +367,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.2"
+    plugin_version = "0.10.3"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -385,7 +385,9 @@ class ColaCrossSeed(_PluginBase):
     _skip_check = False
     _max_per_hour = 0        # 0 = 不限（老板 2026-11-01：不要全局上限）
     _max_per_site = 20       # 单个站点每轮最多补多少
+    _site_fail_limit = 3     # 同一个站在同一轮里失败几次后熔断
     _site_counter: Dict[str, int] = {}
+    _site_fails: Dict[str, int] = {}
     _direction = "both"
     _use_mp_clients = True
     _clients_json = ""
@@ -1034,6 +1036,16 @@ class ColaCrossSeed(_PluginBase):
     def _site_budget_left(self, site_key: str) -> int:
         return max(0, self._max_per_site - self._site_counter.get(site_key, 0))
 
+    def _site_open(self, site_key: str) -> bool:
+        """熔断：这个站本轮失败太多次就先跳过，别让慢站拖住整轮。"""
+        return self._site_fails.get(site_key, 0) < self._site_fail_limit
+
+    def _site_fail(self, site_key: str) -> None:
+        n = self._site_fails.get(site_key, 0) + 1
+        self._site_fails[site_key] = n
+        if n == self._site_fail_limit:
+            logger.warn(f"{site_key} 本轮已失败 {n} 次，先跳过（下轮再试）")
+
     def _record_add(self) -> None:
         """只有真正加进客户端的种子才占配额；扫描、匹配、失败都不占。"""
         times = self._add_times()
@@ -1406,6 +1418,7 @@ class ColaCrossSeed(_PluginBase):
         unknown_sids: set = set()
         by_site: Dict[str, Dict[str, int]] = {}
         self._site_counter = {}   # 每轮重置：单站上限按轮算
+        self._site_fails = {}     # 每轮重置：站点失败计数（熔断用）
         done = set(self._done())
         # 先把所有客户端扫一遍：tracker 不允许同一账号同一颗种子在多个客户端同时做种，
         # 所以“另一边已经有的可乐种”必须跳过，不能只在本客户端内去重。
@@ -1524,9 +1537,14 @@ class ColaCrossSeed(_PluginBase):
                             logger.info("已达到每小时辅种上限（只统计成功添加的种子），结束本次")
                             self._finish(stats)
                             return
+                        site_key = site.get("name") or site.get("url") or "?"
+                        if not self._site_open(site_key):
+                            stats["skipped"] += 1
+                            continue
                         remote = self._download_site_torrent(site, torrent_id)
                         if not remote:
                             stats["failed"] += 1
+                            self._site_fail(site_key)
                             continue
                         self._place(client, remote, torrent, key, stats, "filled", site_key=site.get("name") or site.get("url") or "?")
                         done.add(key)
