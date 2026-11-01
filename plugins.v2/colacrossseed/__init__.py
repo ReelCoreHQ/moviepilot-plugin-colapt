@@ -365,7 +365,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.9.1"
+    plugin_version = "0.9.2"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1113,7 +1113,9 @@ class ColaCrossSeed(_PluginBase):
         也不需要站点支持 /api/pieces-hash。
         """
         rsskey = str(site.get("rsskey") or "")
-        if not rsskey:
+        # 没有 rsskey 不代表不能读 RSS：天空/hdsky、春天 这类站用的是 ?passkey=…，
+        # 只要站点有 passkey 就还是能拿到 XML。
+        if not rsskey and not site.get("passkey"):
             return {}
         host = site.get("url", "").split("://", 1)[-1].split("/")[0].lower()
         cache = self.get_data("rss_cache") or {}
