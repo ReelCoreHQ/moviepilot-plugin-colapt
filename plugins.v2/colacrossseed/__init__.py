@@ -367,7 +367,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.9.6"
+    plugin_version = "0.9.7"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -744,6 +744,7 @@ class ColaCrossSeed(_PluginBase):
             proxy = (keyed.get("proxy") or "").strip()
             cookie = (keyed.get("cookie") or "").strip()
             rss_url = (keyed.get("rss_url") or "").strip()
+            downhash = (keyed.get("downhash") or keyed.get("hash") or "").strip()
             url = self._normalise_url(url, "https")
             if not url or not passkey:
                 logger.warn(f"站点配置行缺少域名或 passkey：{line}")
@@ -767,6 +768,7 @@ class ColaCrossSeed(_PluginBase):
                 "proxy": proxy,
                 "cookie": cookie,
                 "rss_url": rss_url,
+                "downhash": downhash,
             })
         return out
 
@@ -1190,7 +1192,11 @@ class ColaCrossSeed(_PluginBase):
 
     def _site_torrent_url(self, site: Dict[str, str], torrent_id: str) -> str:
         template = (site.get("download_page") or "").strip() or "download.php?id={}&passkey={passkey}"
-        path = template.replace("{}", str(torrent_id)).replace("{id}", str(torrent_id)).replace("{passkey}", site.get("passkey", ""))
+        path = (template.replace("{}", str(torrent_id))
+                .replace("{id}", str(torrent_id))
+                .replace("{passkey}", str(site.get("passkey") or ""))
+                .replace("{uid}", str(site.get("uid") or ""))
+                .replace("{hash}", str(site.get("downhash") or "")))
         return urljoin(site["url"], path)
 
     def _download_mteam(self, site: Dict[str, str], torrent_id: str) -> bytes:
