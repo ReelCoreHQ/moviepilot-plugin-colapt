@@ -115,8 +115,14 @@ class _Client:
     def list_completed(self) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
-    def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "") -> bool:
+    def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
+            hash_hint: str = "") -> str:
+        """添加一颗种子，返回 "ok" / "dup"（客户端里已经有了）/ "fail"。"""
         raise NotImplementedError
+
+    def has(self, info_hash: str) -> bool:
+        """客户端里是否已有这个 info_hash；不知道时返回 False。"""
+        return False
 
     def close(self) -> None:
         pass
@@ -163,7 +169,23 @@ class QBittorrentClient(_Client):
             logger.error(f"qBittorrent ({self.name}) 读取种子失败：{err}")
             return []
 
-    def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "") -> bool:
+    def has(self, info_hash: str) -> bool:
+        if not info_hash:
+            return False
+        try:
+            rsp = self._session.get(
+                f"{self.url}/api/v2/torrents/info",
+                params={"hashes": info_hash.lower()},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if rsp.status_code == 200:
+                return bool(rsp.json())
+        except Exception:
+            pass
+        return False
+
+    def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
+            hash_hint: str = "") -> str:
         data = {
             "savepath": save_path,
             "skip_checking": "true" if skip_check else "false",
@@ -171,7 +193,9 @@ class QBittorrentClient(_Client):
             "autoTMM": "false",
         }
         if label:
-            data["category"] = label
+            # qB 的「分类」和「标签」是两件事：分类会改保存路径规则，标签只是可筛的记号，
+            # 辅种打的记号用标签，免得把用户的分类体系搅乱。
+            data["tags"] = label
         try:
             rsp = self._session.post(
                 f"{self.url}/api/v2/torrents/add",
@@ -179,12 +203,19 @@ class QBittorrentClient(_Client):
                 data=data,
                 timeout=REQUEST_TIMEOUT,
             )
-            if rsp.status_code == 200 and "Ok" in (rsp.text or "Ok"):
-                return True
-            logger.warn(f"qBittorrent ({self.name}) 添加种子失败：{rsp.status_code} {rsp.text[:120]}")
+            body = (rsp.text or "").strip()
+            if rsp.status_code == 200 and body.startswith("Ok"):
+                return "ok"
+            # qB 对重复种子和坏种子都回 "Fails."：只有确认客户端里已经有它，才算重复。
+            if body.startswith("Fails"):
+                if hash_hint and self.has(hash_hint):
+                    return "dup"
+                logger.warn(f"qBittorrent ({self.name}) 拒绝种子（重复或无效）：{hash_hint[:12] or '未知 hash'}")
+                return "fail"
+            logger.warn(f"qBittorrent ({self.name}) 添加种子失败：{rsp.status_code} {body[:120]}")
         except Exception as err:
             logger.error(f"qBittorrent ({self.name}) 添加种子异常：{err}")
-        return False
+        return "fail"
 
 
 class TransmissionClient(_Client):
@@ -235,7 +266,16 @@ class TransmissionClient(_Client):
             })
         return out
 
-    def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "") -> bool:
+    def has(self, info_hash: str) -> bool:
+        if not info_hash:
+            return False
+        rsp = self._rpc({"method": "torrent-get", "arguments": {"ids": [info_hash.lower()], "fields": ["hashString"]}})
+        if not rsp:
+            return False
+        return bool(((rsp.get("arguments") or {}).get("torrents")) or [])
+
+    def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
+            hash_hint: str = "") -> str:
         # Transmission 没有「跳过校验」参数：torrent-add 后由客户端自己校验，
         # 所以这里的 skip_check 只是语义占位，实际等价于总是校验。
         args = {
@@ -247,16 +287,18 @@ class TransmissionClient(_Client):
             args["labels"] = [label]
         rsp = self._rpc({"method": "torrent-add", "arguments": args})
         if rsp and (rsp.get("result") == "success"):
-            return True
+            return "ok"
+        if rsp and rsp.get("result") == "duplicate torrent":
+            return "dup"
         logger.warn(f"Transmission ({self.name}) 添加种子失败：{rsp}")
-        return False
+        return "fail"
 
 
 class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.8"
+    plugin_version = "0.5.0"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -281,6 +323,9 @@ class ColaCrossSeed(_PluginBase):
     _sites_lines = ""
     _iyuu_json = ""
     _iyuu_token = ""
+    _add_label = ""
+    _fallback_skip_check = True
+    _retry_failed = True
     _event = Event()
     _csrf = ""
     # host -> 可用的 pieces-hash 路径（憨憨是 /nexusapi/pieces-hash，其余多为 /api/pieces-hash）；"" 表示不支持
@@ -307,6 +352,9 @@ class ColaCrossSeed(_PluginBase):
             self._sites_lines = str(config.get("sites_lines") or "")
             self._iyuu_json = str(config.get("iyuu_json") or "")
             self._iyuu_token = str(config.get("iyuu_token") or "")
+            self._add_label = str(config.get("add_label") or "").strip()
+            self._fallback_skip_check = bool(config.get("fallback_skip_check", True))
+            self._retry_failed = bool(config.get("retry_failed", True))
             try:
                 self._max_per_hour = max(1, min(200, int(config.get("max_per_hour", 20) or 20)))
             except Exception:
@@ -342,6 +390,9 @@ class ColaCrossSeed(_PluginBase):
             "sites_lines": self._sites_lines,
             "iyuu_json": self._iyuu_json,
             "iyuu_token": self._iyuu_token,
+            "add_label": self._add_label,
+            "fallback_skip_check": self._fallback_skip_check,
+            "retry_failed": self._retry_failed,
         })
 
     # ---------------- 站点登录 / 匹配 / 下载 ----------------
@@ -682,6 +733,97 @@ class ColaCrossSeed(_PluginBase):
 
     # ---------------- 节奏与去重 ----------------
 
+    # 失败队列最多留这么多条；每条存 torrent 原文的 base64（典型 20–200KB），不存站点凭据。
+    PENDING_LIMIT = 40
+
+    def _pending(self) -> List[Dict[str, Any]]:
+        try:
+            items = self.get_data("pending") or []
+            return [x for x in items if isinstance(x, dict) and x.get("data")]
+        except Exception:
+            return []
+
+    def _save_pending(self, items: List[Dict[str, Any]]) -> None:
+        self.save_data("pending", items[-self.PENDING_LIMIT:])
+
+    def _queue_failure(self, client_name: str, key: str, torrent: bytes, save_path: str, label: str) -> None:
+        if not self._retry_failed:
+            return
+        items = self._pending()
+        if any(x.get("key") == key for x in items):
+            return
+        items.append({"key": key, "client": client_name,
+                      "data": base64.b64encode(torrent).decode(),
+                      "save_path": save_path, "label": label})
+        self._save_pending(items)
+
+    def _place(self, client: _Client, data: bytes, torrent: Dict[str, Any], key: str,
+               stats: Dict[str, int], bucket: str, hash_hint: str = "") -> None:
+        """把一颗种子放进客户端：成功 / 重复 / 失败降级 / 进失败队列，都在这里决定。
+
+        交叉做种最常见的失败是「文件不完全一致」（多一个 nfo、少一条音轨）：校验态下客户端会
+        校验失败并把种子停住，所以失败时按「跳过校验」再试一次（可关）。真的失败就进队列，
+        下一轮先重试它们，而不是等下一次全量扫描再撞一遍。
+        """
+        save_path = torrent.get("save_path", "")
+        label = self._add_label or torrent.get("category", "")
+        result = client.add(data, save_path, self._skip_check, label, hash_hint)
+        if result == "ok":
+            stats[bucket] += 1
+            self._record_add()
+            self._remember(key)
+            return
+        if result == "dup":
+            stats["duplicate"] = stats.get("duplicate", 0) + 1
+            self._remember(key)
+            # 重复说明客户端里本来就有这颗种子，之前记过的失败可以撤掉
+            self._save_pending([x for x in self._pending() if x.get("key") != key])
+            return
+        if not self._skip_check and self._fallback_skip_check:
+            retry = client.add(data, save_path, True, label, hash_hint)
+            if retry == "ok":
+                logger.info(f"校验未通过，已按「跳过校验」重试成功：{key}")
+                stats[bucket] += 1
+                stats["retried"] = stats.get("retried", 0) + 1
+                self._record_add()
+                self._remember(key)
+                return
+            if retry == "dup":
+                stats["duplicate"] = stats.get("duplicate", 0) + 1
+                self._remember(key)
+                return
+        stats["failed"] += 1
+        self._queue_failure(client.name, key, data, save_path, label)
+
+    def _retry_pending(self, clients: Dict[str, _Client], done: set, stats: Dict[str, int]) -> None:
+        """先重试上一轮失败的种子（最多 max_per_hour 个，占当轮预算）。"""
+        pending = self._pending()
+        if not pending or not clients:
+            return
+        left = []
+        for item in pending:
+            if self._event.is_set() or self._budget_left() <= 0:
+                left.append(item)
+                continue
+            client = clients.get(item.get("client") or "")
+            if client is None:
+                continue  # 下载器已被删掉，这条失败记录没有意义
+            key = item.get("key") or ""
+            if key in done:
+                continue
+            try:
+                data = base64.b64decode(item.get("data") or "")
+            except Exception:
+                continue
+            torrent = {"save_path": item.get("save_path") or "", "category": item.get("label") or ""}
+            before = stats["added"] + stats["filled"]
+            self._place(client, data, torrent, key, stats, "filled")
+            if stats["added"] + stats["filled"] > before:
+                done.add(key)
+            else:
+                left.append(item)
+        self._save_pending(left)
+
     def _add_times(self) -> List[float]:
         times = self.get_data("add_times") or []
         cutoff = time.time() - 3600
@@ -968,10 +1110,13 @@ class ColaCrossSeed(_PluginBase):
                     sites = []
         if sites:
             logger.info(f"其他站 {len(sites)} 个：{', '.join(s['name'] for s in sites[:6])}{'...' if len(sites) > 6 else ''}")
-        stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0}
+        stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0,
+                 "duplicate": 0, "retried": 0}
         done = set(self._done())
         # 先把所有客户端扫一遍：tracker 不允许同一账号同一颗种子在多个客户端同时做种，
         # 所以“另一边已经有的可乐种”必须跳过，不能只在本客户端内去重。
+        if self._retry_failed:
+            self._retry_pending({c.name: c for c in clients}, done, stats)
         scanned = []
         all_hashes = set()
         for client in clients:
@@ -1023,13 +1168,8 @@ class ColaCrossSeed(_PluginBase):
                     if not data:
                         stats["failed"] += 1
                         continue
-                    if client.add(data, torrent.get("save_path", ""), self._skip_check, torrent.get("category", "")):
-                        stats["added"] += 1
-                        self._record_add()
-                        done.add(key)
-                        self._remember(key)
-                    else:
-                        stats["failed"] += 1
+                    self._place(client, data, torrent, key, stats, "added", (hit.get("info_hash") or "").lower())
+                    done.add(key)
                 # 方向二：客户端已是可乐种子，去别的站补同 pieces 的种
                 elif self._direction in ("both", "other_only") and self._iyuu_token and sid_map:
                     # IYUU 云端匹配：把客户端 hash 发过去，拿回「站点 + torrent_id」。
@@ -1053,13 +1193,8 @@ class ColaCrossSeed(_PluginBase):
                         if not remote:
                             stats["failed"] += 1
                             continue
-                        if client.add(remote, torrent.get("save_path", ""), self._skip_check, torrent.get("category", "")):
-                            stats["filled"] += 1
-                            self._record_add()
-                            done.add(key)
-                            self._remember(key)
-                        else:
-                            stats["failed"] += 1
+                        self._place(client, remote, torrent, key, stats, "filled")
+                        done.add(key)
                 elif own_hits and sites and self._direction in ("both", "other_only"):
                     hit = own_hits[0]
                     data = self._download_cola(int(hit.get("id")))
@@ -1082,13 +1217,8 @@ class ColaCrossSeed(_PluginBase):
                         if not remote:
                             stats["failed"] += 1
                             continue
-                        if client.add(remote, torrent.get("save_path", ""), self._skip_check, torrent.get("category", "")):
-                            stats["filled"] += 1
-                            self._record_add()
-                            done.add(key)
-                            self._remember(key)
-                        else:
-                            stats["failed"] += 1
+                        self._place(client, remote, torrent, key, stats, "filled")
+                        done.add(key)
         self._finish(stats)
 
     def _finish(self, stats: Dict[str, int]) -> None:
@@ -1099,7 +1229,9 @@ class ColaCrossSeed(_PluginBase):
                 mtype=NotificationType.SiteMessage,
                 title="【可乐PT辅种】任务完成",
                 text=(f"匹配：{stats['matched']}\n可乐补种：{stats['added']}\n其他站补种：{stats['filled']}\n"
-                      f"跳过：{stats['skipped']}\n失败：{stats['failed']}"),
+                      f"重复跳过：{stats.get('duplicate', 0)}\n校验失败后降级成功：{stats.get('retried', 0)}\n"
+                      f"跳过：{stats['skipped']}\n失败：{stats['failed']}"
+                      + (f"\n待下一轮重试：{len(self._pending())} 个" if self._pending() else "")),
             )
 
     def get_state(self) -> bool:
@@ -1136,10 +1268,17 @@ class ColaCrossSeed(_PluginBase):
             ]
         last = self.get_data("last_run") or {}
         report = self.get_data("test_report") or self._test_report or {}
+        pending = self._pending()
         blocks: List[dict] = [
             {"component": "div", "text": f"已登录可乐PT。上次运行：{last.get('at', '未运行')}；"
-                                         f"可乐补种 {last.get('added', 0)}，其他站 {last.get('filled', 0)}，失败 {last.get('failed', 0)}。"}
+                                         f"可乐补种 {last.get('added', 0)}，其他站 {last.get('filled', 0)}，"
+                                         f"重复 {last.get('duplicate', 0)}，失败 {last.get('failed', 0)}；"
+                                         f"待重试 {len(pending)} 个。"}
         ]
+        if pending:
+            names = "\n".join(f"· {x.get('client', '?')} → {x.get('key', '')}" for x in pending[-8:])
+            blocks.append({"component": "div", "text": f"下一轮会先重试这些（最多 8 条）：\n{names}",
+                           "props": {"style": "white-space: pre-wrap; line-height: 1.7"}})
         if report:
             lines = [f"检测时间 {report.get('at', '')}", report.get("cola", ""), report.get("iyuu", "")]
             lines += report.get("clients") or []
@@ -1216,6 +1355,15 @@ class ColaCrossSeed(_PluginBase):
                             {"component": "VSwitch", "props": {"model": "skip_check", "label": "跳过校验（默认校验）"}}]},
                     ]},
                     {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VTextField", "props": {"model": "add_label", "label": "辅种标签（留空则沿用原种分类）",
+                             "placeholder": "cross-seed"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VSwitch", "props": {"model": "fallback_skip_check", "label": "校验失败时降级为跳过校验重试"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VSwitch", "props": {"model": "retry_failed", "label": "失败的种子下一轮先重试"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                             {"component": "VTextField", "props": {"model": "cron", "label": "执行周期（cron）", "placeholder": "0 */1 * * *"}}]},
                     ]},
@@ -1249,6 +1397,7 @@ class ColaCrossSeed(_PluginBase):
             "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
             "skip_check": False, "max_per_hour": 20, "direction": "both",
             "use_mp_clients": True, "clients_json": "", "clients_lines": "", "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "",
+            "add_label": "", "fallback_skip_check": True, "retry_failed": True,
         }
 
 
@@ -1285,9 +1434,15 @@ class _MPClient(_Client):
             logger.error(f"MP 下载器 {self.name} 读取失败：{err}")
         return out
 
-    def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "") -> bool:
+    def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
+            hash_hint: str = "") -> str:
         try:
-            return bool(self._add(content=torrent, download_dir=save_path))
+            res = self._add(content=torrent, download_dir=save_path)
         except Exception as err:
             logger.error(f"MP 下载器 {self.name} 添加失败：{err}")
-            return False
+            return "fail"
+        # MP 的下载器模块对重复种子一般回 False 或者抛异常，拿不到更细的原因；
+        # 有 hash 时再问一次客户端，能区分「已经在」和「真失败」。
+        if not res and hash_hint and self.has(hash_hint):
+            return "dup"
+        return "ok" if res else "fail"
