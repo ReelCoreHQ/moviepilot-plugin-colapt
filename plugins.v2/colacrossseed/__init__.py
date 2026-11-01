@@ -365,7 +365,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.9.3"
+    plugin_version = "0.9.4"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1203,13 +1203,13 @@ class ColaCrossSeed(_PluginBase):
         if str(body.get("code")) != "0" or not body.get("data"):
             logger.warn(f"M-Team 换取下载地址返回：{body.get('message')}")
             return b""
-        try:
-            torrent = requests.get(str(body["data"]), timeout=REQUEST_TIMEOUT, allow_redirects=True,
-                                   headers={"User-Agent": "Mozilla/5.0"})
-            if torrent.status_code == 200 and _valid_torrent(torrent.content):
-                return torrent.content
-        except Exception as err:
-            logger.warn(f"M-Team 下载种子失败：{err}")
+        # 签名下载地址同样要浏览器 UA，且走同一条 requests→curl 通道
+        torrent = _site_request("GET", str(body["data"]), timeout=REQUEST_TIMEOUT,
+                                headers={"User-Agent": UA, "Accept": "application/x-bittorrent, */*"},
+                                proxy=site.get("proxy") or "")
+        if torrent.status_code == 200 and _valid_torrent(torrent.content):
+            return torrent.content
+        logger.warn(f"M-Team 下载种子失败：HTTP {torrent.status_code} {len(torrent.content)} 字节")
         return b""
 
     def _download_site_torrent(self, site: Dict[str, str], torrent_id: str) -> bytes:
