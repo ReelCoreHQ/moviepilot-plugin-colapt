@@ -65,7 +65,34 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 - `POST /api/v1/plugin/ColaCrossSeed/run` 手动跑一次（仍守每小时上限）；
 - `POST /api/v1/plugin/ColaCrossSeed/test` 检测可乐、下载器、其他站连通性。
 
-## 其他站怎么写
+## 每个站点单独配置
+
+「其他站」一行一个站点，字段按名字写，不写的位置留空即可：
+
+| 字段 | 作用 |
+|---|---|
+| `passkey` | 站点密钥（必填），下载和 pieces-hash 认证都用它 |
+| `sid` | IYUU 的站点编号，**走 IYUU 匹配必须有**（IYUU 导出的 JSON 里 `"sid": 数字`） |
+| `rsskey` | 站点 RSS 密钥，没有 pieces-hash 的站靠它做精确匹配 |
+| `uid` | 站点用户 id（少数站下载链接要用） |
+| `channel` | 只允许这个站用哪条通道：`pieces` / `rss` / `iyuu` / `auto`（默认） |
+| `enabled` | 写 `enabled=0` 临时停掉这个站，不用删行 |
+
+```
+观众,https://audiences.me,passkey=<32位>,rsskey=<32位>,channel=rss
+麒麟,https://www.hdkyl.in,passkey=<32位>,channel=pieces
+朋友,https://pt.keepfrds.com,passkey=<32位>,sid=12
+老站,https://old.example.com,passkey=<32位>,enabled=0
+```
+
+「站点来源」开关：
+
+- **行文本 + IYUU 导入**（默认）：手写的行优先，同一个域名下没写的 `passkey/sid/rsskey` 会从 IYUU 导入里补齐；
+- **只用手写的行**：完全忽略 IYUU 导入，适合只维护少数几个站的用户。
+
+插件页会列出每个站点、它能用哪几条通道（IYUU / RSS / pieces-hash）以及上次补种数。
+
+## 旧写法（仍然兼容）
 
 ```
 # 只有 passkey：走 pieces-hash / RSS（如果还配了 rsskey）
