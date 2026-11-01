@@ -1,0 +1,3 @@
+# 放在站点根目录的 .htaccess 里（Apache + mod_rewrite）
+RewriteEngine On
+RewriteRule ^api/pieces-hash/?$ pieces-hash.php [L,QSA]

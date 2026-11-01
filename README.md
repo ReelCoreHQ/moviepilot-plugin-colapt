@@ -65,6 +65,11 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 - `POST /api/v1/plugin/ColaCrossSeed/run` 手动跑一次（仍守每小时上限）；
 - `POST /api/v1/plugin/ColaCrossSeed/test` 检测可乐、下载器、其他站连通性。
 
+## 站点侧接口（可选，效果最好）
+
+想让某个站支持**全站精确匹配**，可以给它加一个 pieces-hash 接口：
+见 [integrations/pieces-hash](./integrations/pieces-hash/README.md)（含 SQL、接口代码、回填脚本、web 服务器配置和自检脚本）。
+
 ## 三条匹配通道
 
 | 通道 | 依赖 | 适用 |

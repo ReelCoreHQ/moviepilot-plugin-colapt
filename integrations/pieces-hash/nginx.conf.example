@@ -1,0 +1,11 @@
+# 把 /api/pieces-hash 指到站点根目录的 pieces-hash.php。
+# 放在 server { ... } 里，或者放进你现有的 location 块之前。
+location = /api/pieces-hash {
+    # 只允许 POST（接口自己也会拒，但这里先挡一层）
+    limit_except POST { deny all; }
+
+    include        fastcgi_params;
+    fastcgi_param  SCRIPT_FILENAME $document_root/pieces-hash.php;
+    fastcgi_param  SCRIPT_NAME     /api/pieces-hash;
+    fastcgi_pass   unix:/run/php/php8.2-fpm.sock;   # 改成你的 php-fpm socket
+}
