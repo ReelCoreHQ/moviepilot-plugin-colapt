@@ -61,13 +61,17 @@ class _HttpResult:
         return json.loads(self.text)
 
 
-def _curl(method: str, url: str, headers=None, params=None, json_body=None, data=None, timeout: int = 20) -> _HttpResult:
+def _curl(method: str, url: str, headers=None, params=None, json_body=None, data=None,
+          timeout: int = 20, proxy: str = "") -> _HttpResult:
     """用系统 curl 发请求。
 
     为什么不用 requests：部分 NAS/容器镜像里的 python+OpenSSL 组合会被 Cloudflare 拦（握手超时），
     而 curl 同一台机器可以正常访问；插件里对可乐PT 的请求因此走 curl，其它站点仍用 requests。
     """
     cmd = ["curl", "-sS", "--max-time", str(timeout), "-X", method]
+    if proxy:
+        # socks5h 让 DNS 也在代理侧解析（被墙站的域名在本地解析不到时靠它）
+        cmd += ["--proxy", proxy]
     if params:
         sep = "&" if "?" in url else "?"
         url = url + sep + urlencode(params)
@@ -120,6 +124,9 @@ def _site_request(method: str, url: str, **kw) -> _HttpResult:
     所以站点侧请求统一走这一层，谁通算谁的。
     """
     timeout = kw.pop("timeout", REQUEST_TIMEOUT)
+    proxy = kw.pop("proxy", "") or ""
+    if proxy:
+        kw["proxies"] = {"http": proxy, "https": proxy}
     host = url.split("://", 1)[-1].split("/")[0].split(":")[0].lower()
     if not _CURL_ONLY_HOSTS.get(host):
         try:
@@ -347,7 +354,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.8.2"
+    plugin_version = "0.9.0"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -574,7 +581,8 @@ class ColaCrossSeed(_PluginBase):
                 # Accept: application/json 是必须的：麒麟(hdkyl) 这类 Laravel 站在没有它时
                 # 会把未认证/异常请求 302 回首页，插件拿到的是一张 HTML 页而不是 JSON。
                 rsp = _site_request("POST", url, json={"passkey": site.get("passkey", ""), "pieces_hash": [pieces_hash]},
-                                    headers={"Accept": "application/json", "User-Agent": UA})
+                                    headers={"Accept": "application/json", "User-Agent": UA},
+                                    proxy=site.get("proxy") or "")
             except Exception as err:
                 last = str(err)
                 continue
@@ -607,7 +615,8 @@ class ColaCrossSeed(_PluginBase):
         url = f"{(site.get('url') or '').rstrip('/')}/download.php"
         try:
             rsp = _site_request("GET", url, params={"id": torrent_id, "passkey": site.get("passkey", "")},
-                                headers={"Accept": "application/x-bittorrent, */*", "User-Agent": UA})
+                                headers={"Accept": "application/x-bittorrent, */*", "User-Agent": UA},
+                                proxy=site.get("proxy") or "")
             if rsp.status_code == 200 and _valid_torrent(rsp.content):
                 return rsp.content
         except Exception as err:
@@ -719,6 +728,7 @@ class ColaCrossSeed(_PluginBase):
             if channel not in ("auto", "pieces", "rss", "iyuu"):
                 channel = "auto"
             enabled = (keyed.get("enabled", "1").strip().lower() not in ("0", "false", "no", "off"))
+            proxy = (keyed.get("proxy") or "").strip()
             url = self._normalise_url(url, "https")
             if not url or not passkey:
                 logger.warn(f"站点配置行缺少域名或 passkey：{line}")
@@ -739,6 +749,7 @@ class ColaCrossSeed(_PluginBase):
                 "x_api_key": keyed.get("x_api_key", ""),
                 "channel": channel,
                 "enabled": enabled,
+                "proxy": proxy,
             })
         return out
 
@@ -1217,6 +1228,7 @@ class ColaCrossSeed(_PluginBase):
                     json={"passkey": site["passkey"], "pieces_hash": ["0" * 40]},
                     timeout=8,
                     headers={"Accept": "application/json", "User-Agent": UA},
+                    proxy=site.get("proxy") or "",
                 )
             except Exception as err:
                 last = f"连不上（{type(err).__name__}）：检查这台机器能不能访问 {host}"
