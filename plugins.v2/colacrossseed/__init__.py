@@ -367,7 +367,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.1"
+    plugin_version = "0.10.2"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1258,17 +1258,11 @@ class ColaCrossSeed(_PluginBase):
         return b""
 
     def _download_site_torrent(self, site: Dict[str, str], torrent_id: str) -> bytes:
+        """IYUU / pieces-hash 两条路都从这里取种：统一按模板 + Cookie + requests→curl 回落。"""
         host = (site.get("url") or "").split("://", 1)[-1].split("/")[0].lower()
         if "m-team" in host:
             return self._download_mteam(site, torrent_id)
-        url = self._site_torrent_url(site, torrent_id)
-        try:
-            rsp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
-            if rsp.status_code == 200 and _valid_torrent(rsp.content):
-                return rsp.content
-        except Exception as err:
-            logger.warn(f"站点 {site.get('name')} 下载种子失败：{err}")
-        return b""
+        return self._site_download(site, torrent_id)
 
     # ---------------- 连通性检测（保存后自动跑，结果显示在插件页） ----------------
 
