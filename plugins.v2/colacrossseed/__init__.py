@@ -626,38 +626,83 @@ class ColaCrossSeed(_PluginBase):
         return out
 
     def _line_sites(self) -> List[Dict[str, str]]:
-        """每行一个站点：`域名,passkey`、`名称,域名,passkey`，或 `名称,域名,passkey,rsskey`。
+        """每行一个站点。两种写法都支持，可以混用：
 
-        第 4 段是这个站的 RSS 密钥。有它的站点可以走 RSS 匹配通道（见 _rss_index）：
-        NexusPHP 的 torrentrss.php 每条 item 带 guid=info_hash、enclosure=下载链接和精确大小，
-        比 pieces-hash 更硬，也没有「站点不支持 /api/pieces-hash」的问题。
+        位置写法：`域名,passkey` / `名称,域名,passkey` / `名称,域名,passkey,rsskey`
+        键值写法：`名称,https://域名,passkey=xxx,sid=123,rsskey=yyy,uid=456`
+
+        键值写法的意义：**走 IYUU 匹配必须有 sid**。IYUU 云端只按 sid 回结果，插件要能用
+        「sid → 站点」找到下载地址；sid 来自 IYUU 导出的站点 JSON（`"sid": 数字`）。
+        没有 sid 的站只能走 pieces-hash / RSS 两条通道。
+
+        rsskey 是站点 RSS 密钥，给没有 pieces-hash 接口的站用（见 _rss_index）。
+        识别方式是「像域名的那个 token 是 URL」，剩下两个 32 位十六进制按顺序是 passkey、rsskey，
+        所以写 `观众,https://audiences.me,passkey=…,sid=…` 这种键值行也不会把名字当成域名。
         """
         out: List[Dict[str, str]] = []
+        url_re = re.compile(r"^(https?://)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/.*)?$")
+        hex32 = re.compile(r"^[0-9a-fA-F]{32}$")
         for line in (self._sites_lines or "").splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             parts = self._split_line(line)
-            rsskey = ""
-            if len(parts) == 2:
-                name, url, passkey = "", parts[0], parts[1]
-            elif len(parts) >= 3:
-                name, url, passkey = parts[0], parts[1], parts[2]
-                if len(parts) >= 4:
-                    rsskey = parts[3]
-            else:
-                logger.warn(f"站点配置行格式不对（域名,passkey）：{line}")
+            if len(parts) < 1:
                 continue
+            keyed: Dict[str, str] = {}
+            positional: List[str] = []
+            for token in parts:
+                if "=" in token:
+                    key, _, value = token.partition("=")
+                    keyed[key.strip().lower()] = value.strip()
+                else:
+                    positional.append(token)
+            url, name = "", ""
+            for i, token in enumerate(positional):
+                if url_re.match(token):
+                    url = token
+                    name = positional[i - 1] if i > 0 else ""
+                    rest = positional[i + 1:]
+                    break
+            else:
+                # 没有像域名的 token：按老规矩把第一个当域名，交给 _normalise_url 兜底
+                url = positional[0] if positional else ""
+                name = ""
+                rest = positional[1:]
+            passkey = keyed.get("passkey", "")
+            rsskey = keyed.get("rsskey", "") or keyed.get("rss", "")
+            for token in rest:
+                if not hex32.match(token):
+                    continue
+                if not passkey:
+                    passkey = token
+                elif not rsskey:
+                    rsskey = token
+            sid = 0
+            for raw_sid in (keyed.get("sid"), keyed.get("iyuu_sid")):
+                if raw_sid and str(raw_sid).strip().isdigit():
+                    sid = int(str(raw_sid).strip())
+                    break
+            uid = int(keyed["uid"]) if keyed.get("uid", "").strip().isdigit() else 0
             url = self._normalise_url(url, "https")
             if not url or not passkey:
+                logger.warn(f"站点配置行缺少域名或 passkey：{line}")
                 continue
             host = url.split("://", 1)[-1].split("/")[0].lower()
             if host in SITE_SKIP:
                 continue
             if host in SITE_REMAP:
                 url = SITE_REMAP[host]
-            out.append({"name": name or url.split("://", 1)[-1].split("/")[0], "url": url.rstrip("/") + "/",
-                        "passkey": passkey, "rsskey": rsskey, "sid": 0, "download_page": "", "x_api_key": ""})
+            out.append({
+                "name": name or url.split("://", 1)[-1].split("/")[0],
+                "url": url.rstrip("/") + "/",
+                "passkey": passkey,
+                "rsskey": rsskey,
+                "sid": sid,
+                "uid": uid,
+                "download_page": keyed.get("download_page", ""),
+                "x_api_key": keyed.get("x_api_key", ""),
+            })
         return out
 
     def _iyuu_sites(self) -> List[Dict[str, str]]:
@@ -1214,6 +1259,7 @@ class ColaCrossSeed(_PluginBase):
             logger.info(f"其他站 {len(sites)} 个：{', '.join(s['name'] for s in sites[:6])}{'...' if len(sites) > 6 else ''}")
         stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0,
                  "duplicate": 0, "retried": 0}
+        unknown_sids: set = set()
         done = set(self._done())
         # 先把所有客户端扫一遍：tracker 不允许同一账号同一颗种子在多个客户端同时做种，
         # 所以“另一边已经有的可乐种”必须跳过，不能只在本客户端内去重。
@@ -1309,9 +1355,15 @@ class ColaCrossSeed(_PluginBase):
                     if entries:
                         logger.info(f"IYUU 待处理 hash={torrent['hash'][:8]} 条目 {len(entries)}")
                     for entry in entries:
-                        site = sid_map.get(int(entry.get("sid") or 0))
+                        sid = int(entry.get("sid") or 0)
+                        site = sid_map.get(sid)
                         torrent_id = str(entry.get("torrent_id") or "")
-                        if not site or not torrent_id:
+                        if not site:
+                            # IYUU 知道这个站，但插件里没有同 sid 的站点配置 → 下不到种。
+                            # 把 sid 打出来，用户照着在站点行补 `sid=NN` 就能用。
+                            unknown_sids.add(sid)
+                            continue
+                        if not torrent_id:
                             continue
                         key = f"{client.name}:{site.get('name') or site.get('url')}:{torrent_id}"
                         if key in done:
@@ -1351,6 +1403,10 @@ class ColaCrossSeed(_PluginBase):
                             continue
                         self._place(client, remote, torrent, key, stats, "filled")
                         done.add(key)
+        if unknown_sids:
+            logger.warn("IYUU 返回了插件里没有配置的站点 sid："
+                        + ", ".join(str(x) for x in sorted(unknown_sids))
+                        + " → 在「其他站」里给对应站点补上 sid=数字 就能走 IYUU 下载")
         self._finish(stats)
 
     def _finish(self, stats: Dict[str, int]) -> None:
