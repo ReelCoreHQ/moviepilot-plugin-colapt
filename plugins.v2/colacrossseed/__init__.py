@@ -367,7 +367,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.9.5"
+    plugin_version = "0.9.6"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -743,6 +743,7 @@ class ColaCrossSeed(_PluginBase):
             enabled = (keyed.get("enabled", "1").strip().lower() not in ("0", "false", "no", "off"))
             proxy = (keyed.get("proxy") or "").strip()
             cookie = (keyed.get("cookie") or "").strip()
+            rss_url = (keyed.get("rss_url") or "").strip()
             url = self._normalise_url(url, "https")
             if not url or not passkey:
                 logger.warn(f"站点配置行缺少域名或 passkey：{line}")
@@ -765,6 +766,7 @@ class ColaCrossSeed(_PluginBase):
                 "enabled": enabled,
                 "proxy": proxy,
                 "cookie": cookie,
+                "rss_url": rss_url,
             })
         return out
 
@@ -1125,15 +1127,21 @@ class ColaCrossSeed(_PluginBase):
         if entry.get("at") and time.time() - int(entry["at"]) < self.RSS_TTL and entry.get("items") is not None:
             return {h: v for h, v in entry["items"].items()} if isinstance(entry.get("items"), dict) else {}
         url = f"{site.get('url') or 'https://' + host}/torrentrss.php"
-        # 参数名各站不同：观众用 rsskey、天空/hdsky 用 passkey，两种都试，谁给 XML 用谁
-        params_list = [
-            {"rsskey": rsskey, "linktype": "dl", "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
-            {"passkey": site.get("passkey") or rsskey, "linktype": "dl",
-             "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
-        ]
+        personal = str(site.get("rss_url") or "").strip()
+        if personal:
+            # 站点给的个人 RSS 链接（带签名/有效期）。家园、听听歌这类只认这个，通用参数一律过期。
+            params_list = [None]
+            url = personal
+        else:
+            # 参数名各站不同：观众用 rsskey、天空/hdsky 用 passkey，两种都试，谁给 XML 用谁
+            params_list = [
+                {"rsskey": rsskey, "linktype": "dl", "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
+                {"passkey": site.get("passkey") or rsskey, "linktype": "dl",
+                 "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
+            ]
         root = None
         for params in params_list:
-            rsp = _site_request("GET", url, params=params, headers=_site_headers(site),
+            rsp = _site_request("GET", url, params=params or {}, headers=_site_headers(site),
                                 timeout=40, proxy=site.get("proxy") or "")
             if rsp.status_code != 200:
                 continue
