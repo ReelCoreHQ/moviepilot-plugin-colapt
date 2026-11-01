@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 | 两步验证码 | 账号开了 2FA 时填（可选） |
 | 使用 MoviePilot 已配置下载器 | 勾选后使用 MP 里的 qB/TR |
 | 下载器 | 每行一个：`地址,用户名,密码`；Transmission 写 `tr,地址,用户名,密码`（qB 可写 `qb,地址,用户名,密码`） |
-| 其他站 | 每行一个：`域名,passkey`，也可写 `名称,域名,passkey` |
+| 其他站 | 每行一个：`域名,passkey`，也可写 `名称,域名,passkey`，或 `名称,域名,passkey,rsskey` |
 | 直接导入 IYUU 站点配置 | 把 IYUU 导出的站点 JSON 整个粘贴进来，自动取「启用且有 passkey」的站点 |
 | IYUU Token | 填了就用 IYUU 云端做辅种匹配（覆盖没有 pieces-hash 的站） |
 | 辅种方向 | 双向 / 只补可乐 / 只补其他站 |
@@ -64,6 +64,17 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 - 插件页显示：上次运行统计（匹配 / 可乐补种 / 其他站补种 / 重复 / 降级成功 / 失败）、待重试清单、连通性检测结果；
 - `POST /api/v1/plugin/ColaCrossSeed/run` 手动跑一次（仍守每小时上限）；
 - `POST /api/v1/plugin/ColaCrossSeed/test` 检测可乐、下载器、其他站连通性。
+
+## 三条匹配通道
+
+| 通道 | 依赖 | 适用 |
+|---|---|---|
+| 可乐 `/api/v1/plugin/match` | 可乐PT 账号 | 客户端里的种子在可乐有没有（主通道） |
+| 站点 `/api/pieces-hash` | 站点开放 pieces-hash 接口 | 有该接口的 NexusPHP 站 |
+| **站点 RSS（`rsskey`）** | 站点 RSS 密钥 | 没有 pieces-hash 的站（如 观众 audiences.me）。NexusPHP 的 `torrentrss.php` 每条 item 带 `guid=info_hash` 和 `enclosure` 直链，按 info_hash 精确匹配，不靠标题猜 |
+| IYUU 云端 | IYUU token | 收录在 IYUU 的站，按 info_hash 全站匹配 |
+
+RSS 通道的覆盖范围是「RSS 里能看到的种子」（一般是最近发布的），刚好是辅种最该抢的那批；插件按 10 分钟缓存一次（站点侧限流是 2 分钟一次）。
 
 ## 注意
 

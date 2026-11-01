@@ -20,6 +20,7 @@ import subprocess
 import time
 from urllib.parse import urlencode, urljoin
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
@@ -298,7 +299,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.5.1"
+    plugin_version = "0.6.0"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -599,17 +600,25 @@ class ColaCrossSeed(_PluginBase):
         return out
 
     def _line_sites(self) -> List[Dict[str, str]]:
-        """每行一个站点：`域名,passkey`，或 `名称,域名,passkey`。"""
+        """每行一个站点：`域名,passkey`、`名称,域名,passkey`，或 `名称,域名,passkey,rsskey`。
+
+        第 4 段是这个站的 RSS 密钥。有它的站点可以走 RSS 匹配通道（见 _rss_index）：
+        NexusPHP 的 torrentrss.php 每条 item 带 guid=info_hash、enclosure=下载链接和精确大小，
+        比 pieces-hash 更硬，也没有「站点不支持 /api/pieces-hash」的问题。
+        """
         out: List[Dict[str, str]] = []
         for line in (self._sites_lines or "").splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             parts = self._split_line(line)
+            rsskey = ""
             if len(parts) == 2:
                 name, url, passkey = "", parts[0], parts[1]
             elif len(parts) >= 3:
                 name, url, passkey = parts[0], parts[1], parts[2]
+                if len(parts) >= 4:
+                    rsskey = parts[3]
             else:
                 logger.warn(f"站点配置行格式不对（域名,passkey）：{line}")
                 continue
@@ -622,7 +631,7 @@ class ColaCrossSeed(_PluginBase):
             if host in SITE_REMAP:
                 url = SITE_REMAP[host]
             out.append({"name": name or url.split("://", 1)[-1].split("/")[0], "url": url.rstrip("/") + "/",
-                        "passkey": passkey, "sid": 0, "download_page": "", "x_api_key": ""})
+                        "passkey": passkey, "rsskey": rsskey, "sid": 0, "download_page": "", "x_api_key": ""})
         return out
 
     def _iyuu_sites(self) -> List[Dict[str, str]]:
@@ -671,6 +680,7 @@ class ColaCrossSeed(_PluginBase):
                 "name": item.get("nickname") or item.get("site") or url,
                 "url": url.rstrip("/") + "/",
                 "passkey": passkey,
+                "rsskey": str((options or {}).get("rsskey") or ""),
                 "sid": int(item.get("sid") or 0),
                 "download_page": item.get("download_page") or "",
                 "x_api_key": str((options or {}).get("x_api_key") or ""),
@@ -932,6 +942,72 @@ class ColaCrossSeed(_PluginBase):
             time.sleep(1.5)
         return out
 
+    RSS_TTL = 600        # 站点侧限流是「最少 2 分钟一次」，这里按 10 分钟缓存，避免被拉黑
+    RSS_ROWS = 100
+
+    def _rss_index(self, site: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+        """把一个站的 RSS 读成 info_hash -> {url,title,size} 的索引（带缓存）。
+
+        NexusPHP 的 torrentrss.php 每条 item 带着三样硬信息：
+          · guid（40 位）= info_hash
+          · enclosure url = download.php?id=..&downhash=<rsskey>（不需要 passkey 也能下）
+          · enclosure length = 精确字节数
+        所以「RSS 能看到的种子」可以按 info_hash 精确匹配，比 pieces-hash 更硬，
+        也不需要站点支持 /api/pieces-hash。
+        """
+        rsskey = str(site.get("rsskey") or "")
+        if not rsskey:
+            return {}
+        host = site.get("url", "").split("://", 1)[-1].split("/")[0].lower()
+        cache = self.get_data("rss_cache") or {}
+        entry = cache.get(host) or {}
+        if entry.get("at") and time.time() - int(entry["at"]) < self.RSS_TTL and entry.get("items") is not None:
+            return {h: v for h, v in entry["items"].items()} if isinstance(entry.get("items"), dict) else {}
+        url = f"{site.get('url') or 'https://' + host}/torrentrss.php"
+        try:
+            rsp = requests.get(url, params={"rsskey": rsskey, "linktype": "dl",
+                                            "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
+                               headers={"User-Agent": "MoviePilot-ColaCrossSeed/0.6"}, timeout=REQUEST_TIMEOUT)
+            if rsp.status_code != 200 or "<rss" not in (rsp.text or "")[:400]:
+                text = (rsp.text or "").strip()
+                if "RSS" in text:
+                    logger.warn(f"{host} 的 RSS 暂时不可用：{text[:80]}")
+                return {}
+            root = ET.fromstring(rsp.content.decode("utf-8", "ignore"))
+        except Exception as err:
+            logger.warn(f"{host} 读取 RSS 失败：{err}")
+            return {}
+        items: Dict[str, Dict[str, Any]] = {}
+        for item in root.findall(".//item"):
+            guid = (item.findtext("guid") or "").strip().lower()
+            if len(guid) != 40 or any(c not in "0123456789abcdef" for c in guid):
+                continue  # guid 不是 info_hash 的站，这条通道用不了
+            enc = item.find("enclosure")
+            dl_url = (enc.get("url") if enc is not None else "") or ""
+            size = 0
+            try:
+                size = int(enc.get("length") or 0) if enc is not None else 0
+            except Exception:
+                size = 0
+            items[guid] = {"url": dl_url, "title": (item.findtext("title") or "").strip(), "size": size}
+        cache[host] = {"at": int(time.time()), "items": items}
+        self.save_data("rss_cache", cache)
+        logger.info(f"{host} RSS 索引 {len(items)} 条")
+        return items
+
+    def _download_url(self, url: str) -> bytes:
+        """按 RSS 里给的完整下载地址取 .torrent（downhash 已在 URL 里）。"""
+        if not url:
+            return b""
+        try:
+            rsp = requests.get(url, headers={"User-Agent": "MoviePilot-ColaCrossSeed/0.6"}, timeout=REQUEST_TIMEOUT)
+            if rsp.status_code == 200 and _valid_torrent(rsp.content):
+                return rsp.content
+            logger.warn(f"按 RSS 下载种子失败：{rsp.status_code}")
+        except Exception as err:
+            logger.warn(f"按 RSS 下载种子异常：{err}")
+        return b""
+
     def _site_torrent_url(self, site: Dict[str, str], torrent_id: str) -> str:
         template = (site.get("download_page") or "").strip() or "download.php?id={}&passkey={passkey}"
         path = template.replace("{}", str(torrent_id)).replace("{id}", str(torrent_id)).replace("{passkey}", site.get("passkey", ""))
@@ -1135,6 +1211,14 @@ class ColaCrossSeed(_PluginBase):
                 if sid_sha1:
                     iyuu_hits = self._iyuu_reseed(hashes_all, sid_sha1)
                     logger.info(f"IYUU 云端查询 {len(hashes_all)} 个 hash，命中 {len(iyuu_hits)} 个可辅种")
+        # RSS 通道：对配置了 rsskey 的站，RSS 里能看到多少就按 info_hash 精确匹配多少。
+        # 这条路不依赖 pieces-hash，也不依赖 IYUU 是否收录（观众这类站就走它）。
+        rss_sites = [x for x in sites if x.get("rsskey")] if self._direction in ("both", "other_only") else []
+        rss_idx: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for site in rss_sites:
+            idx = self._rss_index(site)
+            if idx:
+                rss_idx[site.get("url") or site.get("name") or ""] = idx
         for client, torrents in scanned:
             if self._event.is_set():
                 break
@@ -1147,6 +1231,28 @@ class ColaCrossSeed(_PluginBase):
             for torrent in torrents:
                 if self._event.is_set():
                     break
+                # RSS 通道优先：hash 精确命中就直接拉，不用等 pieces-hash/IYUU
+                rss_done = False
+                for site_url, idx in rss_idx.items():
+                    hit = idx.get(torrent["hash"])
+                    if not hit:
+                        continue
+                    key = f"{client.name}:rss:{site_url}:{torrent['hash']}"
+                    if key in done:
+                        stats["skipped"] += 1
+                        rss_done = True
+                        continue
+                    if self._budget_left() <= 0:
+                        break
+                    data = self._download_url(hit.get("url") or "")
+                    if not data:
+                        stats["failed"] += 1
+                        continue
+                    self._place(client, data, torrent, key, stats, "filled")
+                    done.add(key)
+                    rss_done = True
+                if rss_done:
+                    continue
                 hits = by_hash.get(torrent["hash"]) or []
                 cola_hits = [h for h in hits if h.get("via") == "source_info_hash"]
                 own_hits = [h for h in hits if h.get("via") == "info_hash"]
@@ -1376,8 +1482,8 @@ class ColaCrossSeed(_PluginBase):
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VTextarea", "props": {"model": "sites_lines", "rows": 4,
-                             "label": "其他站（每行一个：域名,passkey；可写 名称,域名,passkey）",
-                             "placeholder": "https://pt.example.com,abcdef123456\n朋友,https://pt.keepfrds.com,abcdef123456"}}]},
+                             "label": "其他站（每行一个：域名,passkey；可写 名称,域名,passkey[,rsskey]；带 rsskey 的站走 RSS 精确匹配）",
+                             "placeholder": "https://pt.example.com,abcdef123456\n观众,https://audiences.me,PASSKEY,RSSKEY"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
