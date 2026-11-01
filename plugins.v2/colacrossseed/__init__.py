@@ -44,6 +44,7 @@ SITE_SKIP = {
     "ptsbao.club",       # 烧包：站点已关闭
     "www.ptsbao.club",
 }
+MANDATORY_TAG = "可乐辅种"   # 加进客户端的种子一律带这个标签，方便筛选/清理
 COLA_MATCH_BATCH = 500
 # colapt.com 在部分国内网络会被解析到连不通的 Cloudflare 段；这些是实测可用的备用段。
 COLA_FALLBACK_IPS = ("104.21.66.130", "172.67.132.88", "104.26.10.0")
@@ -261,10 +262,10 @@ class QBittorrentClient(_Client):
             "paused": "false",
             "autoTMM": "false",
         }
-        if label:
-            # qB 的「分类」和「标签」是两件事：分类会改保存路径规则，标签只是可筛的记号，
-            # 辅种打的记号用标签，免得把用户的分类体系搅乱。
-            data["tags"] = label
+        # 强制标签：辅种一律带 MANDATORY_TAG，方便在 qB 里一眼筛出来/批量清理；
+        # 用户自己填的 add_label 作为第二个标签附上（不填就只带强制标签）。
+        tags = [MANDATORY_TAG] + ([label] if label and label != MANDATORY_TAG else [])
+        data["tags"] = ",".join(tags)
         try:
             rsp = self._session.post(
                 f"{self.url}/api/v2/torrents/add",
@@ -352,8 +353,7 @@ class TransmissionClient(_Client):
             "paused": False,
             "download-dir": save_path,
         }
-        if label:
-            args["labels"] = [label]
+        args["labels"] = [MANDATORY_TAG] + ([label] if label and label != MANDATORY_TAG else [])
         rsp = self._rpc({"method": "torrent-add", "arguments": args})
         if rsp and (rsp.get("result") == "success"):
             return "ok"
@@ -367,7 +367,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.9.7"
+    plugin_version = "0.10.0"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -383,7 +383,9 @@ class ColaCrossSeed(_PluginBase):
     _captcha_code = ""
     _session_token = ""
     _skip_check = False
-    _max_per_hour = 20
+    _max_per_hour = 0        # 0 = 不限（老板 2026-11-01：不要全局上限）
+    _max_per_site = 20       # 单个站点每轮最多补多少
+    _site_counter: Dict[str, int] = {}
     _direction = "both"
     _use_mp_clients = True
     _clients_json = ""
@@ -427,9 +429,11 @@ class ColaCrossSeed(_PluginBase):
             self._fallback_skip_check = bool(config.get("fallback_skip_check", True))
             self._retry_failed = bool(config.get("retry_failed", True))
             try:
-                self._max_per_hour = max(1, min(200, int(config.get("max_per_hour", 20) or 20)))
+                self._max_per_hour = max(0, min(2000, int(config.get("max_per_hour", 0) or 0)))
+                self._max_per_site = max(1, min(200, int(config.get("max_per_site", 20) or 20)))
             except Exception:
-                self._max_per_hour = 20
+                self._max_per_hour = 0
+                self._max_per_site = 20
         # 保存配置时如果填了验证码，立刻换一次 token（一次性，成功/失败都会清掉验证码字段）。
         if self._captcha_code and self._username and self._password and not self._session_token:
             self._login(self._captcha_code)
@@ -453,6 +457,7 @@ class ColaCrossSeed(_PluginBase):
             "session_token": self._session_token,
             "skip_check": self._skip_check,
             "max_per_hour": self._max_per_hour,
+            "max_per_site": self._max_per_site,
             "direction": self._direction,
             "use_mp_clients": self._use_mp_clients,
             "clients_json": self._clients_json,
@@ -931,7 +936,7 @@ class ColaCrossSeed(_PluginBase):
         self._save_pending(items)
 
     def _place(self, client: _Client, data: bytes, torrent: Dict[str, Any], key: str,
-               stats: Dict[str, int], bucket: str, hash_hint: str = "") -> None:
+               stats: Dict[str, int], bucket: str, hash_hint: str = "", site_key: str = "") -> None:
         """把一颗种子放进客户端：成功 / 重复 / 失败降级 / 进失败队列，都在这里决定。
 
         交叉做种最常见的失败是「文件不完全一致」（多一个 nfo、少一条音轨）：校验态下客户端会
@@ -940,11 +945,16 @@ class ColaCrossSeed(_PluginBase):
         """
         save_path = torrent.get("save_path", "")
         label = self._add_label or torrent.get("category", "")
+        if site_key and self._site_budget_left(site_key) <= 0:
+            stats["skipped"] = stats.get("skipped", 0) + 1
+            return  # 这个站这一轮已经补满 max_per_site 颗
         result = client.add(data, save_path, self._skip_check, label, hash_hint)
         if result == "ok":
             stats[bucket] += 1
             self._record_add()
             self._remember(key)
+            if site_key:
+                self._site_counter[site_key] = self._site_counter.get(site_key, 0) + 1
             return
         if result == "dup":
             stats["duplicate"] = stats.get("duplicate", 0) + 1
@@ -960,6 +970,8 @@ class ColaCrossSeed(_PluginBase):
                 stats["retried"] = stats.get("retried", 0) + 1
                 self._record_add()
                 self._remember(key)
+                if site_key:
+                    self._site_counter[site_key] = self._site_counter.get(site_key, 0) + 1
                 return
             if retry == "dup":
                 stats["duplicate"] = stats.get("duplicate", 0) + 1
@@ -1003,7 +1015,13 @@ class ColaCrossSeed(_PluginBase):
         return [t for t in times if isinstance(t, (int, float)) and t > cutoff]
 
     def _budget_left(self) -> int:
+        """整轮预算。max_per_hour=0 表示不限，返回一个很大的数（调用点只判断 <= 0）。"""
+        if self._max_per_hour <= 0:
+            return 1 << 30
         return max(0, self._max_per_hour - len(self._add_times()))
+
+    def _site_budget_left(self, site_key: str) -> int:
+        return max(0, self._max_per_site - self._site_counter.get(site_key, 0))
 
     def _record_add(self) -> None:
         """只有真正加进客户端的种子才占配额；扫描、匹配、失败都不占。"""
@@ -1382,6 +1400,7 @@ class ColaCrossSeed(_PluginBase):
                  "duplicate": 0, "retried": 0}
         unknown_sids: set = set()
         by_site: Dict[str, Dict[str, int]] = {}
+        self._site_counter = {}   # 每轮重置：单站上限按轮算
         done = set(self._done())
         # 先把所有客户端扫一遍：tracker 不允许同一账号同一颗种子在多个客户端同时做种，
         # 所以“另一边已经有的可乐种”必须跳过，不能只在本客户端内去重。
@@ -1444,7 +1463,7 @@ class ColaCrossSeed(_PluginBase):
                     if not data:
                         stats["failed"] += 1
                         continue
-                    self._place(client, data, torrent, key, stats, "filled")
+                    self._place(client, data, torrent, key, stats, "filled", site_key=site_url)
                     done.add(key)
                     rss_done = True
                     by_site.setdefault(site_url, {"added": 0, "failed": 0})["added"] += 1
@@ -1504,7 +1523,7 @@ class ColaCrossSeed(_PluginBase):
                         if not remote:
                             stats["failed"] += 1
                             continue
-                        self._place(client, remote, torrent, key, stats, "filled")
+                        self._place(client, remote, torrent, key, stats, "filled", site_key=site.get("name") or site.get("url") or "?")
                         done.add(key)
                         by_site.setdefault(site.get("name") or site.get("url") or "?", {"added": 0, "failed": 0})["added"] += 1
                 elif own_hits and sites and self._direction in ("both", "other_only"):
@@ -1529,7 +1548,7 @@ class ColaCrossSeed(_PluginBase):
                         if not remote:
                             stats["failed"] += 1
                             continue
-                        self._place(client, remote, torrent, key, stats, "filled")
+                        self._place(client, remote, torrent, key, stats, "filled", site_key=site.get("name") or site.get("url") or "?")
                         done.add(key)
                         by_site.setdefault(site.get("name") or site.get("url") or "?", {"added": 0, "failed": 0})["added"] += 1
         if by_site:
@@ -1687,7 +1706,8 @@ class ColaCrossSeed(_PluginBase):
                                 {"title": "双向", "value": "both"}, {"title": "只补可乐", "value": "cola_only"},
                                 {"title": "只补其他站", "value": "other_only"}]}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "max_per_hour", "label": "每小时最多添加", "type": "number"}}]},
+                            {"component": "VTextField", "props": {"model": "max_per_hour", "label": "每小时上限（0 = 不限）", "type": "number", "hint": "填 0 表示不限制总量"}},
+                            {"component": "VTextField", "props": {"model": "max_per_site", "label": "单个站点最多补种数", "type": "number", "hint": "每个站每轮最多补多少颗，默认 20"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VSwitch", "props": {"model": "skip_check", "label": "跳过校验（默认校验）"}}]},
                     ]},
@@ -1738,7 +1758,7 @@ class ColaCrossSeed(_PluginBase):
         ], {
             "enabled": False, "notify": True, "cron": "0 */1 * * *",
             "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
-            "skip_check": False, "max_per_hour": 20, "direction": "both",
+            "skip_check": False, "max_per_hour": 0, "max_per_site": 20, "direction": "both",
             "use_mp_clients": True, "clients_json": "", "clients_lines": "", "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "", "sites_mode": "merge",
             "add_label": "", "fallback_skip_check": True, "retry_failed": True,
         }
