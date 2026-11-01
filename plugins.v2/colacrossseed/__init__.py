@@ -321,7 +321,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.7.1"
+    plugin_version = "0.8.0"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -346,6 +346,7 @@ class ColaCrossSeed(_PluginBase):
     _sites_lines = ""
     _iyuu_json = ""
     _iyuu_token = ""
+    _sites_mode = "merge"
     _add_label = ""
     _fallback_skip_check = True
     _retry_failed = True
@@ -375,6 +376,7 @@ class ColaCrossSeed(_PluginBase):
             self._sites_lines = str(config.get("sites_lines") or "")
             self._iyuu_json = str(config.get("iyuu_json") or "")
             self._iyuu_token = str(config.get("iyuu_token") or "")
+            self._sites_mode = str(config.get("sites_mode") or "merge")
             self._add_label = str(config.get("add_label") or "").strip()
             self._fallback_skip_check = bool(config.get("fallback_skip_check", True))
             self._retry_failed = bool(config.get("retry_failed", True))
@@ -413,6 +415,7 @@ class ColaCrossSeed(_PluginBase):
             "sites_lines": self._sites_lines,
             "iyuu_json": self._iyuu_json,
             "iyuu_token": self._iyuu_token,
+            "sites_mode": self._sites_mode,
             "add_label": self._add_label,
             "fallback_skip_check": self._fallback_skip_check,
             "retry_failed": self._retry_failed,
@@ -688,6 +691,10 @@ class ColaCrossSeed(_PluginBase):
                     sid = int(str(raw_sid).strip())
                     break
             uid = int(keyed["uid"]) if keyed.get("uid", "").strip().isdigit() else 0
+            channel = (keyed.get("channel") or "auto").strip().lower()
+            if channel not in ("auto", "pieces", "rss", "iyuu"):
+                channel = "auto"
+            enabled = (keyed.get("enabled", "1").strip().lower() not in ("0", "false", "no", "off"))
             url = self._normalise_url(url, "https")
             if not url or not passkey:
                 logger.warn(f"站点配置行缺少域名或 passkey：{line}")
@@ -706,6 +713,8 @@ class ColaCrossSeed(_PluginBase):
                 "uid": uid,
                 "download_page": keyed.get("download_page", ""),
                 "x_api_key": keyed.get("x_api_key", ""),
+                "channel": channel,
+                "enabled": enabled,
             })
         return out
 
@@ -757,20 +766,45 @@ class ColaCrossSeed(_PluginBase):
                 "passkey": passkey,
                 "rsskey": str((options or {}).get("rsskey") or ""),
                 "sid": int(item.get("sid") or 0),
+                "channel": "auto",
+                "enabled": True,
                 "download_page": item.get("download_page") or "",
                 "x_api_key": str((options or {}).get("x_api_key") or ""),
             })
         return out
 
     def _other_sites(self) -> List[Dict[str, str]]:
-        """手动行文本 + IYUU 导入，按域名去重。"""
-        sites: List[Dict[str, str]] = []
-        seen = set()
-        for site in self._line_sites() + self._iyuu_sites():
+        """行文本为准，IYUU 导入补充（sites_mode=manual 时完全不看导入）。
+
+        每个站点在自己的那一行里单独配置：域名、passkey、sid、rsskey、channel、enabled。
+        IYUU 导入只用来补齐「你没写但 IYUU 认识」的站；同一个域名以行文本为准。
+        """
+        line_sites = self._line_sites()
+        iyuu_sites = [] if (self._sites_mode or "merge") == "manual" else self._iyuu_sites()
+        # 行文本优先；同一个域名下，行里没写的 passkey / sid / rsskey 从 IYUU 导入里补齐 ——
+        # 这样「观众只写 passkey + rsskey」也能顺带拿到 IYUU 的 sid，两套通道同时可用。
+        by_host: Dict[str, Dict[str, str]] = {}
+        order: List[str] = []
+        for site in line_sites + iyuu_sites:
             host = site["url"].split("://", 1)[-1].split("/")[0].lower()
-            if not host or host in seen:
+            if not host:
                 continue
-            seen.add(host)
+            existing = by_host.get(host)
+            if existing is None:
+                by_host[host] = dict(site)
+                order.append(host)
+                continue
+            for field in ("passkey", "sid", "rsskey", "uid", "download_page", "x_api_key"):
+                if not existing.get(field) and site.get(field):
+                    existing[field] = site[field]
+        sites: List[Dict[str, str]] = []
+        for host in order:
+            site = by_host[host]
+            if site.get("enabled") is False:
+                continue
+            if not site.get("passkey"):
+                logger.warn(f"站点 {host} 没有 passkey，已跳过")
+                continue
             sites.append(site)
         return sites
 
@@ -1266,6 +1300,7 @@ class ColaCrossSeed(_PluginBase):
         stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0,
                  "duplicate": 0, "retried": 0}
         unknown_sids: set = set()
+        by_site: Dict[str, Dict[str, int]] = {}
         done = set(self._done())
         # 先把所有客户端扫一遍：tracker 不允许同一账号同一颗种子在多个客户端同时做种，
         # 所以“另一边已经有的可乐种”必须跳过，不能只在本客户端内去重。
@@ -1291,7 +1326,9 @@ class ColaCrossSeed(_PluginBase):
                     logger.info(f"IYUU 云端查询 {len(hashes_all)} 个 hash，命中 {len(iyuu_hits)} 个可辅种")
         # RSS 通道：对配置了 rsskey 的站，RSS 里能看到多少就按 info_hash 精确匹配多少。
         # 这条路不依赖 pieces-hash，也不依赖 IYUU 是否收录（观众这类站就走它）。
-        rss_sites = [x for x in sites if x.get("rsskey")] if self._direction in ("both", "other_only") else []
+        rss_sites = ([x for x in sites if x.get("rsskey")
+                      and (x.get("channel") or "auto") in ("auto", "rss")]
+                     if self._direction in ("both", "other_only") else [])
         rss_idx: Dict[str, Dict[str, Dict[str, Any]]] = {}
         for site in rss_sites:
             idx = self._rss_index(site)
@@ -1329,6 +1366,7 @@ class ColaCrossSeed(_PluginBase):
                     self._place(client, data, torrent, key, stats, "filled")
                     done.add(key)
                     rss_done = True
+                    by_site.setdefault(site_url, {"added": 0, "failed": 0})["added"] += 1
                 if rss_done:
                     continue
                 hits = by_hash.get(torrent["hash"]) or []
@@ -1363,6 +1401,8 @@ class ColaCrossSeed(_PluginBase):
                     for entry in entries:
                         sid = int(entry.get("sid") or 0)
                         site = sid_map.get(sid)
+                        if site is not None and (site.get("channel") or "auto") not in ("auto", "iyuu"):
+                            continue  # 这个站点在这一行里被指定只用别的通道
                         torrent_id = str(entry.get("torrent_id") or "")
                         if not site:
                             # IYUU 知道这个站，但插件里没有同 sid 的站点配置 → 下不到种。
@@ -1385,6 +1425,7 @@ class ColaCrossSeed(_PluginBase):
                             continue
                         self._place(client, remote, torrent, key, stats, "filled")
                         done.add(key)
+                        by_site.setdefault(site.get("name") or site.get("url") or "?", {"added": 0, "failed": 0})["added"] += 1
                 elif own_hits and sites and self._direction in ("both", "other_only"):
                     hit = own_hits[0]
                     data = self._download_cola(int(hit.get("id")))
@@ -1409,6 +1450,9 @@ class ColaCrossSeed(_PluginBase):
                             continue
                         self._place(client, remote, torrent, key, stats, "filled")
                         done.add(key)
+                        by_site.setdefault(site.get("name") or site.get("url") or "?", {"added": 0, "failed": 0})["added"] += 1
+        if by_site:
+            stats["by_site"] = by_site
         if unknown_sids:
             logger.warn("IYUU 返回了插件里没有配置的站点 sid："
                         + ", ".join(str(x) for x in sorted(unknown_sids))
@@ -1469,6 +1513,24 @@ class ColaCrossSeed(_PluginBase):
                                          f"重复 {last.get('duplicate', 0)}，失败 {last.get('failed', 0)}；"
                                          f"待重试 {len(pending)} 个。"}
         ]
+        sites = self._other_sites()
+        if sites:
+            per = (last.get("by_site") or {}) if isinstance(last, dict) else {}
+            rows = []
+            for site in sites[:40]:
+                name = site.get("name") or site.get("url")
+                chans = []
+                if site.get("sid"):
+                    chans.append("IYUU")
+                if site.get("rsskey"):
+                    chans.append("RSS")
+                chans.append("pieces-hash")
+                forced = site.get("channel") or "auto"
+                hit = per.get(name) or per.get(site.get("url")) or {}
+                rows.append(f"· {name}（{'/'.join(chans)}，{forced}）"
+                            + (f" → 上次补种 {hit.get('added', 0)}" if hit else ""))
+            blocks.append({"component": "div", "text": f"站点清单（{len(sites)} 个）：\n" + "\n".join(rows),
+                           "props": {"style": "white-space: pre-wrap; line-height: 1.7"}})
         if pending:
             names = "\n".join(f"· {x.get('client', '?')} → {x.get('key', '')}" for x in pending[-8:])
             blocks.append({"component": "div", "text": f"下一轮会先重试这些（最多 8 条）：\n{names}",
@@ -1568,6 +1630,12 @@ class ColaCrossSeed(_PluginBase):
                              "placeholder": "192.168.1.100:8080,admin,密码\ntr,192.168.1.101:9091,admin,密码"}}]},
                     ]},
                     {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VSelect", "props": {"model": "sites_mode", "label": "站点来源", "items": [
+                                {"title": "行文本 + IYUU 导入（默认）", "value": "merge"},
+                                {"title": "只用手写的行（不看 IYUU 导入）", "value": "manual"}]}}]},
+                    ]},
+                    {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VTextarea", "props": {"model": "sites_lines", "rows": 4,
                              "label": "其他站（每行一个：域名,passkey；可写 名称,域名,passkey[,rsskey]；带 rsskey 的站走 RSS 精确匹配）",
@@ -1590,7 +1658,7 @@ class ColaCrossSeed(_PluginBase):
             "enabled": False, "notify": True, "cron": "0 */1 * * *",
             "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
             "skip_check": False, "max_per_hour": 20, "direction": "both",
-            "use_mp_clients": True, "clients_json": "", "clients_lines": "", "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "",
+            "use_mp_clients": True, "clients_json": "", "clients_lines": "", "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "", "sites_mode": "merge",
             "add_label": "", "fallback_skip_check": True, "retry_failed": True,
         }
 
