@@ -177,6 +177,74 @@ def _decode_torrent_pieces(data: bytes) -> str:
         return ""
 
 
+def _bencode_skip(buf: bytes, pos: int) -> int:
+    """跳过 bencode 的一个值，返回它结束后的位置（找原始 info 字典用）。"""
+    ch = buf[pos:pos + 1]
+    if ch == b"i":
+        return buf.index(b"e", pos) + 1
+    if ch in (b"l", b"d"):
+        pos += 1
+        while buf[pos:pos + 1] != b"e":
+            if ch == b"d":
+                pos = _bencode_skip(buf, pos)   # 键
+            pos = _bencode_skip(buf, pos)       # 值
+        return pos + 1
+    colon = buf.index(b":", pos)
+    return colon + 1 + int(buf[pos:colon])
+
+
+def _torrent_info_hash(data: bytes) -> str:
+    """算 .torrent 的 info_hash：必须对 info 字典的**原始字节切片**取 SHA1。
+
+    重新 bencode 一遍会因字典顺序变化得到不同的哈希，所以这里只定位、不重建。
+    用途：qB 回 "Fails." 时区分「客户端里已经有这颗」和「种子本身无效」。
+    """
+    try:
+        if data[:1] != b"d":
+            return ""
+        pos = 1
+        while data[pos:pos + 1] != b"e":
+            kstart = pos
+            pos = _bencode_skip(data, pos)
+            key = data[kstart:pos]
+            vstart = pos
+            pos = _bencode_skip(data, pos)
+            if key == b"4:info":
+                return hashlib.sha1(data[vstart:pos]).hexdigest()
+    except Exception:
+        return ""
+    return ""
+
+
+def _torrent_announces(data: bytes) -> List[str]:
+    """取 .torrent 里的 HTTP(S) announce 地址（加 tracker 用；udp 的没意义）。"""
+    try:
+        torrent = bdecode(data)
+    except Exception:
+        return []
+    if not isinstance(torrent, dict):
+        return []
+
+    def text(value: Any) -> str:
+        return value.decode("utf-8", "ignore") if isinstance(value, (bytes, bytearray)) else str(value)
+
+    urls: List[str] = []
+    tiers = torrent.get("announce-list") or torrent.get(b"announce-list") or []
+    if isinstance(tiers, (list, tuple)):
+        for tier in tiers:
+            for url in (tier if isinstance(tier, (list, tuple)) else [tier]):
+                urls.append(text(url))
+    single = torrent.get("announce") or torrent.get(b"announce") or ""
+    if single:
+        urls.insert(0, text(single))
+    out: List[str] = []
+    for url in urls:
+        url = (url or "").strip()
+        if url.startswith("http") and url not in out:
+            out.append(url)
+    return out
+
+
 class _Client:
     """下载器的最小接口：列出已完成种子、添加种子。"""
 
@@ -192,6 +260,10 @@ class _Client:
 
     def has(self, info_hash: str) -> bool:
         """客户端里是否已有这个 info_hash；不知道时返回 False。"""
+        return False
+
+    def add_trackers(self, info_hash: str, urls: List[str]) -> bool:
+        """给客户端里**已有**的种子补 announce（同 info_hash 的跨站辅种只能这么干）。"""
         return False
 
     def tagged_missing(self, tag: str) -> List[str]:
@@ -260,6 +332,27 @@ class QBittorrentClient(_Client):
                 return bool(rsp.json())
         except Exception:
             pass
+        return False
+
+    def add_trackers(self, info_hash: str, urls: List[str]) -> bool:
+        """同一 info_hash 已经在本机做种时，唯一能「再辅一个站」的办法是补 tracker。
+
+        qB 不允许两颗种子共用一个 info_hash，所以跨站同种复制只能给已有种子加 announce；
+        加完它就会去新站汇报，站方看到 passkey 有效 + 文件完整，直接记做种。
+        """
+        if not info_hash or not urls:
+            return False
+        try:
+            rsp = self._session.post(
+                f"{self.url}/api/v2/torrents/addTrackers",
+                data={"hash": info_hash.lower(), "urls": "\n".join(urls)},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if rsp.status_code == 200:
+                return True
+            logger.warn(f"qBittorrent ({self.name}) 补 tracker 返回 {rsp.status_code}")
+        except Exception as err:
+            logger.error(f"qBittorrent ({self.name}) 补 tracker 异常：{err}")
         return False
 
     def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
@@ -400,7 +493,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.6"
+    plugin_version = "0.10.7"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -673,18 +766,25 @@ class ColaCrossSeed(_PluginBase):
           · 春天 springsunday / 观众 / 大多数 NexusPHP : download.php?id={}&passkey={passkey}
         模板来自 IYUU 的站点导出（download_page 字段）；再加上站点自己的 Cookie，这三家都能拿到种子。
         """
-        url = self._site_torrent_url(site, str(torrent_id))
-        try:
-            rsp = _site_request("GET", url, headers=_site_headers(site, accept="application/x-bittorrent, */*"),
-                                proxy=site.get("proxy") or "")
-            if rsp.status_code == 200 and _valid_torrent(rsp.content):
-                return rsp.content
-            if rsp.status_code == 302 and "login" in (rsp.content[:200].decode("utf-8", "ignore") or "").lower():
-                logger.warn(f"站点 {site.get('name')} 需要登录态（cookie 失效或没配）")
-            else:
-                logger.warn(f"站点 {site.get('name')} 下载失败：HTTP {rsp.status_code} {len(rsp.content)} 字节")
-        except Exception as err:
-            logger.warn(f"站点 {site.get('name')} 下载种子失败：{err}")
+        candidates = [self._rss_url_for(site, str(torrent_id)), self._site_torrent_url(site, str(torrent_id))]
+        if site.get("cookie"):
+            # 有登录态时 download.php?id=N 往往直接给种（家园就是这样），模板反而会把参数拼错
+            candidates.append(urljoin(site["url"], f"download.php?id={torrent_id}"))
+        url = ""
+        for candidate in candidates:
+            if not candidate or candidate == url:
+                continue
+            url = candidate
+            try:
+                rsp = _site_request("GET", url, headers=_site_headers(site, accept="application/x-bittorrent, */*"),
+                                    proxy=site.get("proxy") or "")
+                if rsp.status_code == 200 and _valid_torrent(rsp.content):
+                    return rsp.content
+            except Exception as err:
+                logger.warn(f"站点 {site.get('name')} 下载种子失败：{err}")
+                continue
+            logger.warn(f"站点 {site.get('name')} 下载失败：HTTP {rsp.status_code} {len(rsp.content)} 字节（{url[-60:]}）")
+            continue
         return b""
 
     # ---------------- 配置解析（给不写代码的人用行文本） ----------------
@@ -994,6 +1094,11 @@ class ColaCrossSeed(_PluginBase):
         if site_key and self._site_budget_left(site_key) <= 0:
             stats["skipped"] = stats.get("skipped", 0) + 1
             return  # 这个站这一轮已经补满 max_per_site 颗
+        if hash_hint and client.has(hash_hint):
+            # 客户端里已经有这颗：qB 一定会回 Fails.，别浪费一次上传，直接记重复
+            stats["duplicate"] = stats.get("duplicate", 0) + 1
+            self._remember(key)
+            return
         result = client.add(data, save_path, self._skip_check, label, hash_hint)
         if result == "ok":
             stats[bucket] += 1
@@ -1165,8 +1270,8 @@ class ColaCrossSeed(_PluginBase):
                 if body.get("code") in (0, "0", None):
                     break
                 if "频率" in msg or body.get("code") == 429:
-                    logger.info("IYUU 云端限流，等待 30 秒后重试")
-                    time.sleep(30)
+                    logger.info("IYUU 云端限流，等待 60 秒后重试")
+                    time.sleep(60)
                     continue
                 logger.warn(f"IYUU 辅种查询返回：{msg}")
                 break
@@ -1176,102 +1281,206 @@ class ColaCrossSeed(_PluginBase):
                 torrents = (item or {}).get("torrent") or []
                 if torrents:
                     out[str(client_hash).lower()] = torrents
-            time.sleep(1.5)
+            time.sleep(6)   # 每批之间留间隔：IYUU 对连续查询限流很敏感
         return out
 
     RSS_TTL = 600        # 站点侧限流是「最少 2 分钟一次」，这里按 10 分钟缓存，避免被拉黑
     RSS_ROWS = 100
 
-    def _rss_index(self, site: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
-        """把一个站的 RSS 读成 info_hash -> {url,title,size} 的索引（带缓存）。
+    def _rss_usable(self, site: Dict[str, str]) -> bool:
+        """这个站能不能读 RSS：有任何一个密钥就行，channel 不再当前置条件。
+
+        RSS 命中的是「同一 info_hash」，qB 不允许同 hash 双开，所以它不走加种，
+        走「给已有的那颗种子补这个站的 announce」——这条和 pieces-hash 互不冲突，
+        两条通道可以同时开，不用二选一。
+        """
+        host = (site.get("url") or "").split("://", 1)[-1].split("/")[0].lower()
+        if "m-team" in host:
+            return False
+        if site.get("x_api_key") and not site.get("rsskey"):
+            return False
+        return bool(site.get("rsskey") or site.get("passkey") or site.get("rss_url"))
+
+    @staticmethod
+    def _parse_rss_items(content: bytes) -> Dict[str, Dict[str, Any]]:
+        """把 RSS 解析成 info_hash -> {url,title,size}。
+
+        先用 XML 解析器；解析失败再按 <item> 粗切——有站点在 description 里塞坏 CDATA
+        （时光 unclosed CDATA、蝶粉 unclosed token），标准解析器会整体罢工，但这些 item
+        的 guid/enclosure 其实是好的。
+        """
+        items: Dict[str, Dict[str, Any]] = {}
+
+        def take(guid: str, url: str, length: str, title: str) -> None:
+            guid = (guid or "").strip().lower()
+            if len(guid) != 40 or any(c not in "0123456789abcdef" for c in guid):
+                return  # guid 不是 info_hash 的站，这条通道用不了
+            try:
+                size = int(length or 0)
+            except Exception:
+                size = 0
+            items[guid] = {"url": url or "", "title": (title or "").strip(), "size": size}
+
+        try:
+            root = ET.fromstring(content.decode("utf-8", "ignore"))
+            for item in root.findall(".//item"):
+                enc = item.find("enclosure")
+                take(item.findtext("guid") or "",
+                     enc.get("url") if enc is not None else "",
+                     enc.get("length") if enc is not None else "",
+                     item.findtext("title") or "")
+            return items
+        except Exception:
+            items.clear()
+        text = content.decode("utf-8", "ignore")
+        for block in re.findall(r"<item\b.*?</item>", text, re.S):
+            guid = re.search(r"<guid[^>]*>\s*([0-9a-fA-F]{40})\s*</guid>", block)
+            enc = re.search(r"<enclosure\b[^>]*>", block)
+            url = length = ""
+            if enc:
+                m_url = re.search(r'url\s*=\s*"([^"]*)"', enc.group(0))
+                m_len = re.search(r'length\s*=\s*"(\d+)"', enc.group(0))
+                url = m_url.group(1) if m_url else ""
+                length = m_len.group(1) if m_len else ""
+            title = re.search(r"<title>(.*?)</title>", block, re.S)
+            take(guid.group(1) if guid else "", url, length, title.group(1) if title else "")
+        return items
+
+    def _rss_fetch(self, site: Dict[str, str], timeout: int = 40) -> Tuple[Dict[str, Dict[str, Any]], str]:
+        """真去拉一次 RSS，返回 (info_hash -> {url,title,size}, 用的是哪个密钥/为什么失败)。
 
         NexusPHP 的 torrentrss.php 每条 item 带着三样硬信息：
           · guid（40 位）= info_hash
           · enclosure url = download.php?id=..&downhash=<rsskey>（不需要 passkey 也能下）
           · enclosure length = 精确字节数
-        所以「RSS 能看到的种子」可以按 info_hash 精确匹配，比 pieces-hash 更硬，
-        也不需要站点支持 /api/pieces-hash。
+        参数名各站不同，按 rss_url → rsskey → passkey 的顺序试，谁回 XML 用谁。
         """
         rsskey = str(site.get("rsskey") or "")
-        # 没有 rsskey 不代表不能读 RSS：天空/hdsky、春天 这类站用的是 ?passkey=…，
-        # 只要站点有 passkey 就还是能拿到 XML。
-        if not rsskey and not site.get("passkey"):
-            return {}
+        passkey = str(site.get("passkey") or "")
+        personal = str(site.get("rss_url") or "").strip()
+        if not (rsskey or passkey or personal):
+            return {}, "既没有 rsskey 也没有 passkey"
+        host = site.get("url", "").split("://", 1)[-1].split("/")[0].lower()
+        url = f"{site.get('url') or 'https://' + host}/torrentrss.php"
+        tries: List[Tuple[str, Dict[str, Any], str]] = []
+        if personal:
+            # 站点给的个人 RSS 链接（带签名/有效期）。家园、听听歌这类只认这个，通用参数一律过期。
+            tries.append((personal, {}, "rss_url"))
+        if rsskey:
+            tries.append((
+                url,
+                {"rsskey": rsskey, "linktype": "dl", "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
+                "rsskey",
+            ))
+        if passkey:
+            tries.append((
+                url,
+                {"passkey": passkey, "linktype": "dl", "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
+                "passkey",
+            ))
+        first_bad = ""
+        last = "RSS 没有可用地址"
+        for target, params, label in tries:
+            try:
+                rsp = _site_request("GET", target, params=params, headers=_site_headers(site),
+                                    timeout=timeout, proxy=site.get("proxy") or "")
+            except Exception as err:
+                last = f"RSS 连不上（{type(err).__name__}）"
+                first_bad = first_bad or last
+                continue
+            if rsp.status_code != 200:
+                last = f"RSS 返回 HTTP {rsp.status_code}（{label}）"
+                first_bad = first_bad or last
+                continue
+            text = (rsp.text or "").strip()
+            if "<rss" not in text[:400]:
+                low = text.lower()
+                if "prevent refresh" in low or "try again after" in low:
+                    last = "RSS 被站点限流（刚拉过，稍后自动恢复）"
+                elif "expired" in low:
+                    last = "RSS 链接已过期，要在站内重新生成个人 RSS 填 rss_url="
+                elif "not found" in low or "missing" in low:
+                    last = f"RSS 不认这个参数（{label}）：{text[:40]}"
+                else:
+                    last = f"RSS 返回的不是 XML：{text[:40]}"
+                first_bad = first_bad or last
+                continue
+            items = self._parse_rss_items(rsp.content)
+            if not items:
+                last = "RSS 里没有 40 位 info_hash 的条目"
+                first_bad = first_bad or last
+                continue
+            return items, label
+        # 第一个失败原因通常最接近真相（后面的 passkey 尝试会被站点直接怼回 missing rsskey）
+        return {}, first_bad or last
+
+    def _rss_index(self, site: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+        """带缓存的 RSS 索引（info_hash -> {url,title,size}）：10 分钟内同一站只拉一次。"""
         host = site.get("url", "").split("://", 1)[-1].split("/")[0].lower()
         cache = self.get_data("rss_cache") or {}
         entry = cache.get(host) or {}
         if entry.get("at") and time.time() - int(entry["at"]) < self.RSS_TTL and entry.get("items") is not None:
-            return {h: v for h, v in entry["items"].items()} if isinstance(entry.get("items"), dict) else {}
-        url = f"{site.get('url') or 'https://' + host}/torrentrss.php"
-        personal = str(site.get("rss_url") or "").strip()
-        if personal:
-            # 站点给的个人 RSS 链接（带签名/有效期）。家园、听听歌这类只认这个，通用参数一律过期。
-            params_list = [None]
-            url = personal
-        else:
-            # 参数名各站不同：观众用 rsskey、天空/hdsky 用 passkey，两种都试，谁给 XML 用谁
-            params_list = [
-                {"rsskey": rsskey, "linktype": "dl", "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
-                {"passkey": site.get("passkey") or rsskey, "linktype": "dl",
-                 "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
-            ]
-        root = None
-        for params in params_list:
-            rsp = _site_request("GET", url, params=params or {}, headers=_site_headers(site),
-                                timeout=40, proxy=site.get("proxy") or "")
-            if rsp.status_code != 200:
-                continue
-            text = (rsp.text or "").strip()
-            if "<rss" not in text[:400]:
-                if "RSS" in text:
-                    logger.warn(f"{host} 的 RSS 暂时不可用：{text[:80]}")
-                continue
-            try:
-                root = ET.fromstring(rsp.content.decode("utf-8", "ignore"))
-                break
-            except Exception as err:
-                logger.warn(f"{host} RSS 解析失败：{err}")
-        if root is None:
-            return {}
-        items: Dict[str, Dict[str, Any]] = {}
-        for item in root.findall(".//item"):
-            guid = (item.findtext("guid") or "").strip().lower()
-            if len(guid) != 40 or any(c not in "0123456789abcdef" for c in guid):
-                continue  # guid 不是 info_hash 的站，这条通道用不了
-            enc = item.find("enclosure")
-            dl_url = (enc.get("url") if enc is not None else "") or ""
-            size = 0
-            try:
-                size = int(enc.get("length") or 0) if enc is not None else 0
-            except Exception:
-                size = 0
-            items[guid] = {"url": dl_url, "title": (item.findtext("title") or "").strip(), "size": size}
-        cache[host] = {"at": int(time.time()), "items": items}
+            return dict(entry["items"]) if isinstance(entry.get("items"), dict) else {}
+        items, note = self._rss_fetch(site)
+        cache[host] = {"at": int(time.time()), "items": items, "note": note}
         self.save_data("rss_cache", cache)
-        logger.info(f"{host} RSS 索引 {len(items)} 条")
+        if items:
+            logger.info(f"{host} RSS 索引 {len(items)} 条（{note}）")
+        else:
+            logger.info(f"{host} RSS 不可用：{note}")
         return items
 
-    def _download_url(self, url: str) -> bytes:
-        """按 RSS 里给的完整下载地址取 .torrent（downhash 已在 URL 里）。"""
+    def _download_url(self, url: str, site: Optional[Dict[str, str]] = None) -> bytes:
+        """按 RSS 里给的完整下载地址取 .torrent（downhash / 签名已在 URL 里）。
+
+        走 _site_request 而不是裸 requests：有些站（家园、天空）要带 Cookie，还有一批站
+        只有 curl 能过（NAS 上 requests 走 IPv4 被墙）。
+        """
         if not url:
             return b""
+        site = site or {}
         try:
-            rsp = requests.get(url, headers={"User-Agent": "MoviePilot-ColaCrossSeed/0.6"}, timeout=REQUEST_TIMEOUT)
+            rsp = _site_request("GET", url,
+                                headers=_site_headers(site, accept="application/x-bittorrent, */*"),
+                                timeout=REQUEST_TIMEOUT, proxy=site.get("proxy") or "")
             if rsp.status_code == 200 and _valid_torrent(rsp.content):
                 return rsp.content
-            logger.warn(f"按 RSS 下载种子失败：{rsp.status_code}")
+            logger.warn(f"按 RSS 下载种子失败：HTTP {rsp.status_code} {len(rsp.content)} 字节")
         except Exception as err:
             logger.warn(f"按 RSS 下载种子异常：{err}")
         return b""
 
     def _site_torrent_url(self, site: Dict[str, str], torrent_id: str) -> str:
+        """按站点模板拼下载地址；模板里认 {} {id} {passkey} {rsskey} {uid} {hash}。"""
         template = (site.get("download_page") or "").strip() or "download.php?id={}&passkey={passkey}"
         path = (template.replace("{}", str(torrent_id))
                 .replace("{id}", str(torrent_id))
                 .replace("{passkey}", str(site.get("passkey") or ""))
+                .replace("{rsskey}", str(site.get("rsskey") or ""))
                 .replace("{uid}", str(site.get("uid") or ""))
                 .replace("{hash}", str(site.get("downhash") or "")))
+        if "{" in path:
+            # 模板里还剩没替换掉的占位符（观众 {downHash}、天空 {sign} 这类按种子生成的参数），
+            # 硬拼出来一定是 404/空文件，退回 NexusPHP 通用写法，让站点自己判定。
+            path = f"download.php?id={torrent_id}&passkey={site.get('passkey') or ''}"
         return urljoin(site["url"], path)
+
+    def _rss_url_for(self, site: Dict[str, str], torrent_id: str) -> str:
+        """RSS 缓存里如果有这个种子，直接用它的 enclosure 地址。
+
+        有些站的模板里带 `{downHash}`、`{sign}` 这种**按种子生成**的参数（观众、天空），
+        模板拼不出来；而 RSS 的 enclosure 就是站点自己生成的完整下载地址，最准。
+        """
+        host = (site.get("url") or "").split("://", 1)[-1].split("/")[0].lower()
+        items = ((self.get_data("rss_cache") or {}).get(host) or {}).get("items") or {}
+        if not items or not torrent_id:
+            return ""
+        pattern = re.compile(r"(?:[?&](?:id|tid)=%s(?:&|$))" % re.escape(str(torrent_id)))
+        for hit in items.values():
+            url = str(hit.get("url") or "")
+            if url and pattern.search(url):
+                return url
+        return ""
 
     def _download_mteam(self, site: Dict[str, str], torrent_id: str) -> bytes:
         """M-Team：genDlToken 换签名地址 → 该地址会 302 到 CDN（fr1.halomt.com）→ 才拿到种子。
@@ -1332,57 +1541,119 @@ class ColaCrossSeed(_PluginBase):
             lines.append("❌ 没有可用下载器：检查「下载器」每行格式与地址")
         return lines
 
-    def _test_one_site(self, site: Dict[str, str]) -> Tuple[str, bool, str]:
+    def _probe_pieces(self, site: Dict[str, str]) -> Tuple[bool, str]:
+        """探一次 pieces-hash 接口，返回 (可用?, 说明)。"""
         host = site["url"].split("://", 1)[-1].split("/")[0].lower()
-        if "m-team" in host:
-            if site.get("x_api_key"):
-                return site["name"], True, "M-Team：用 IYUU 匹配 + x-api-key 下载（不走 pieces-hash）"
-            return site["name"], False, "M-Team：缺少 x_api_key（IYUU 导出里应该有）"
-        last = ""
-        for path in ("/api/pieces-hash", "/nexusapi/pieces-hash"):
-            url = site["url"].rstrip("/") + path
+        cached = self._pieces_paths.get(host, None)
+        if cached == "":
+            return False, "没有 pieces-hash 接口"
+        paths = [cached] if cached else ["/api/pieces-hash", "/nexusapi/pieces-hash"]
+        last = "没有 pieces-hash 接口"
+        for path in paths:
             try:
                 rsp = _site_request(
-                    "POST", url,
-                    json={"passkey": site["passkey"], "pieces_hash": ["0" * 40]},
-                    timeout=8,
+                    "POST", site["url"].rstrip("/") + path,
+                    json={"passkey": site.get("passkey") or "", "pieces_hash": ["0" * 40]},
+                    timeout=12,
                     headers=_site_headers(site, accept="application/json"),
                     proxy=site.get("proxy") or "",
                 )
             except Exception as err:
-                last = f"连不上（{type(err).__name__}）：检查这台机器能不能访问 {host}"
-                continue
-            if rsp.status_code in (404, 405):
-                if site.get("rsskey"):
-                    return site["name"], True, "没有 pieces-hash，但有 RSS 密钥 → 走 RSS 精确匹配"
-                last = "站点没有 pieces-hash 接口，也没有填 rsskey（这个站目前没法匹配）"
-                continue
+                return False, f"连不上（{type(err).__name__}）"
             if rsp.status_code in (401, 403):
-                return site["name"], False, f"passkey 不对或被拒绝（HTTP {rsp.status_code}）"
+                return False, f"pieces-hash 拒绝 passkey（HTTP {rsp.status_code}）"
+            if rsp.status_code in (404, 405):
+                last = "没有 pieces-hash 接口"
+                continue
             if rsp.status_code != 200:
-                last = f"HTTP {rsp.status_code}"
+                last = f"pieces-hash 返回 HTTP {rsp.status_code}"
                 continue
             try:
-                body = rsp.json()
+                body = rsp.json() or {}
             except Exception:
-                last = "返回不是 JSON：多半被 302 到登录页（需要 Accept: application/json 或 passkey 不对）"
+                # 家园这类站根本没有这个接口，POST 会被 302 到首页，回来是一张 HTML
+                last = "pieces-hash 返回 HTML（没这个接口）"
                 continue
-            if isinstance(body.get("data"), (dict, list)):
-                self._pieces_paths[host] = path
-                return site["name"], True, f"连接成功（{path}）"
-            last = "接口返回格式不匹配"
-        return site["name"], False, last or "未知错误"
+            if not isinstance(body.get("data"), (dict, list)):
+                last = "pieces-hash 返回格式不对"
+                continue
+            self._pieces_paths[host] = path
+            return True, f"pieces-hash 可用（{path}）"
+        self._pieces_paths[host] = ""
+        return False, last
+
+    def _test_one_site(self, site: Dict[str, str]) -> Tuple[str, str, str]:
+        """一个站到底能用哪条通道：pieces-hash / RSS / IYUU 逐条实测，报实测结果。
+
+        以前这里只认 rsskey 字段，没填就回「这个站目前没法匹配」；实际 2026-11-02 全站复测：
+        26 个站里只有观众有 rsskey，另外 11 个站用 passkey 就能读到 RSS（10~100 条全是 40 位
+        info_hash）。于是能用 RSS 的站被全部报成 ❌。现在按通道实测，并给出条数。
+        """
+        name = site["name"]
+        host = site["url"].split("://", 1)[-1].split("/")[0].lower()
+        if "m-team" in host:
+            if site.get("x_api_key"):
+                return name, "ok", "M-Team：IYUU 匹配 + x-api-key 下载（不走 pieces-hash）"
+            return name, "fail", "M-Team：缺少 x_api_key（IYUU 导出里应该有）"
+        channel = (site.get("channel") or "auto").lower()
+        good: List[str] = []
+        bad: List[str] = []
+        pieces_ok = False
+        if channel in ("auto", "pieces"):
+            pieces_ok, note = self._probe_pieces(site)
+            (good if pieces_ok else bad).append(note)
+        rss_n = 0
+        if channel in ("auto", "rss") and not pieces_ok:
+            rss_n, note = self._probe_rss(site)
+            (good if rss_n else bad).append(note)
+        iyuu_ok = bool(site.get("sid")) and bool(self._iyuu_token)
+        if iyuu_ok:
+            good.insert(0, f"IYUU 匹配（sid={site['sid']}）")
+        elif site.get("sid"):
+            bad.append("没填 IYUU Token，sid 用不上")
+        if channel == "pieces" and pieces_ok:
+            return name, "ok", "；".join(good)
+        if channel == "rss" and rss_n:
+            return name, "ok", "；".join(good)
+        if channel == "iyuu" and iyuu_ok:
+            return name, "ok", "；".join(good)
+        if pieces_ok or rss_n:
+            return name, "ok", "；".join(good)
+        if iyuu_ok:
+            # 只剩 IYUU：通道在，但没有哪颗种子能证明命中，标黄而不是绿
+            return name, "warn", "；".join(good + bad)
+        return name, "fail", "；".join(bad) or "没有可用通道"
+
+    def _rss_note(self, site: Dict[str, str]) -> str:
+        host = (site.get("url") or "").split("://", 1)[-1].split("/")[0].lower()
+        return str(((self.get_data("rss_cache") or {}).get(host) or {}).get("note") or "")
+
+    def _probe_rss(self, site: Dict[str, str]) -> Tuple[int, str]:
+        """检查 RSS 通道，走 10 分钟缓存。
+
+        不能每次点「测试」都去真拉：观众/彩虹岛 这类站明说「请求间隔至少 2 分钟」，
+        连点两次测试就会被限流，反而把好站报成失败。
+        """
+        items = self._rss_index(site)
+        note = self._rss_note(site)
+        if items:
+            return len(items), f"RSS 可匹配 {len(items)} 条（{note}）"
+        return 0, note or "RSS 没有条目"
 
     def _test_sites(self) -> List[str]:
         sites = self._other_sites()
         if not sites:
             return ["ℹ️ 没有配置其他站（可粘贴 IYUU 配置或填「域名,passkey」）"]
         lines: List[str] = []
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            for name, ok, msg in pool.map(self._test_one_site, sites):
-                lines.append(f"{'✅' if ok else '❌'} {name}：{msg}")
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for name, level, msg in pool.map(self._test_one_site, sites):
+                mark = {"ok": "✅", "warn": "⚠️"}.get(level, "❌")
+                lines.append(f"{mark} {name}：{msg}")
         good = sum(1 for line in lines if line.startswith("✅"))
-        lines.insert(0, f"其他站 {len(sites)} 个，成功 {good} 个，失败 {len(sites) - good} 个")
+        warn = sum(1 for line in lines if line.startswith("⚠️"))
+        lines.insert(0, f"其他站 {len(sites)} 个，可匹配 {good} 个"
+                        f"{f'，仅 IYUU 匹配 {warn} 个' if warn else ''}，"
+                        f"不可用 {len(sites) - good - warn} 个")
         return lines
 
     def _test_cola(self) -> str:
@@ -1424,7 +1695,8 @@ class ColaCrossSeed(_PluginBase):
         self._test_report = report
         if persist:
             self.save_data("test_report", report)
-        logger.info(f"连通性检测：{report['cola']}；{report['clients']}；其他站 {report['sites'][0] if report['sites'] else ''}")
+        logger.info(f"连通性检测：{report['cola']}；{report['clients']}；"
+                    f"{report['sites'][0] if report['sites'] else ''}")
         return report
 
     # ---------------- 任务 ----------------
@@ -1459,7 +1731,7 @@ class ColaCrossSeed(_PluginBase):
         if sites:
             logger.info(f"其他站 {len(sites)} 个：{', '.join(s['name'] for s in sites[:6])}{'...' if len(sites) > 6 else ''}")
         stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0,
-                 "duplicate": 0, "retried": 0, "already": 0}
+                 "duplicate": 0, "retried": 0, "already": 0, "trackers": 0}
         unknown_sids: set = set()
         by_site: Dict[str, Dict[str, int]] = {}
         self._site_counter = {}   # 每轮重置：单站上限按轮算
@@ -1489,14 +1761,21 @@ class ColaCrossSeed(_PluginBase):
                     logger.info(f"IYUU 云端查询 {len(hashes_all)} 个 hash，命中 {len(iyuu_hits)} 个可辅种")
         # RSS 通道：对配置了 rsskey 的站，RSS 里能看到多少就按 info_hash 精确匹配多少。
         # 这条路不依赖 pieces-hash，也不依赖 IYUU 是否收录（观众这类站就走它）。
-        rss_sites = ([x for x in sites if x.get("rsskey")
-                      and (x.get("channel") or "auto") in ("auto", "rss")]
+        # 只要站里有 passkey 就够读 RSS：26 个站里只有观众需要 rsskey，其余用 passkey 都能拿到 XML，
+        # 以前这里卡 rsskey，等于把 13 个 channel=rss 的站直接跳过了。
+        rss_sites = ([x for x in sites if self._rss_usable(x)]
                      if self._direction in ("both", "other_only") else [])
         rss_idx: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        for site in rss_sites:
-            idx = self._rss_index(site)
-            if idx:
-                rss_idx[site.get("url") or site.get("name") or ""] = idx
+        rss_by_url: Dict[str, Dict[str, str]] = {}
+        if rss_sites:
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                for site, idx in zip(rss_sites, pool.map(self._rss_index, rss_sites)):
+                    if idx:
+                        key = site.get("url") or site.get("name") or ""
+                        rss_idx[key] = idx
+                        rss_by_url[key] = site
+            logger.info(f"RSS 通道 {len(rss_idx)}/{len(rss_sites)} 个站有索引，"
+                        f"共 {sum(len(v) for v in rss_idx.values())} 条")
         for client, torrents in scanned:
             if self._event.is_set():
                 break
@@ -1509,7 +1788,9 @@ class ColaCrossSeed(_PluginBase):
             for torrent in torrents:
                 if self._event.is_set():
                     break
-                # RSS 通道优先：hash 精确命中就直接拉，不用等 pieces-hash/IYUU
+                # RSS 通道：RSS 的 guid 就是站点侧 info_hash，命中即「这个站有同一颗种子」。
+                # 同一 info_hash qB 不可能再加一颗（会回 Fails.），这时正确动作是给**已有**的
+                # 那颗种子补上这个站的 announce —— 文件一个字节都不用多，站方照样记做种。
                 rss_done = False
                 for site_url, idx in rss_idx.items():
                     hit = idx.get(torrent["hash"])
@@ -1520,13 +1801,28 @@ class ColaCrossSeed(_PluginBase):
                         stats["skipped"] += 1
                         rss_done = True
                         continue
-                    if self._budget_left() <= 0:
+                    if self._budget_left() <= 0 or self._site_budget_left(site_url) <= 0:
                         break
-                    data = self._download_url(hit.get("url") or "")
+                    data = self._download_url(hit.get("url") or "", rss_by_url.get(site_url))
                     if not data:
                         stats["failed"] += 1
                         continue
-                    self._place(client, data, torrent, key, stats, "filled", site_key=site_url)
+                    tracker_hash = _torrent_info_hash(data) or torrent["hash"]
+                    announces = _torrent_announces(data)
+                    if announces and tracker_hash in client_hashes:
+                        if client.add_trackers(tracker_hash, announces):
+                            stats["trackers"] += 1
+                            self._site_counter[site_url] = self._site_counter.get(site_url, 0) + 1
+                            self._remember(key)
+                            done.add(key)
+                            rss_done = True
+                            by_site.setdefault(site_url, {"added": 0, "failed": 0}).setdefault(
+                                "trackers", 0)
+                            by_site[site_url]["trackers"] += 1
+                            logger.info(f"{site_url} 同一 info_hash 已在客户端，已补 tracker：{tracker_hash[:8]}")
+                        continue
+                    self._place(client, data, torrent, key, stats, "filled",
+                                hash_hint=tracker_hash, site_key=site_url)
                     done.add(key)
                     rss_done = True
                     by_site.setdefault(site_url, {"added": 0, "failed": 0})["added"] += 1
@@ -1567,8 +1863,9 @@ class ColaCrossSeed(_PluginBase):
                     for entry in entries:
                         sid = int(entry.get("sid") or 0)
                         site = sid_map.get(sid)
-                        if site is not None and (site.get("channel") or "auto") not in ("auto", "iyuu"):
-                            continue  # 这个站点在这一行里被指定只用别的通道
+                        # 注意：channel 只决定 pieces-hash / RSS 这两条「探测型」通道走不走，
+                        # 不挡 IYUU。IYUU 是云端内容级匹配，只要站里有 sid 就能用；以前这里按
+                        # channel 过滤，13 个 channel=rss 的站等于把唯一能用的通道也关了。
                         torrent_id = str(entry.get("torrent_id") or "")
                         if not site:
                             # IYUU 知道这个站，但插件里没有同 sid 的站点配置 → 下不到种。
@@ -1594,7 +1891,11 @@ class ColaCrossSeed(_PluginBase):
                             stats["failed"] += 1
                             self._site_fail(site_key)
                             continue
-                        self._place(client, remote, torrent, key, stats, "filled", site_key=site.get("name") or site.get("url") or "?")
+                        # 站点返回的种子自己的 info_hash：qB 回 Fails. 时用来判断是「早就有」
+                        # 还是「种子本身坏了」（以前一律打「未知 hash」）
+                        self._place(client, remote, torrent, key, stats, "filled",
+                                    hash_hint=_torrent_info_hash(remote),
+                                    site_key=site.get("name") or site.get("url") or "?")
                         done.add(key)
                         by_site.setdefault(site.get("name") or site.get("url") or "?", {"added": 0, "failed": 0})["added"] += 1
                 elif own_hits and sites and self._direction in ("both", "other_only"):
@@ -1604,6 +1905,8 @@ class ColaCrossSeed(_PluginBase):
                     if not pieces:
                         continue
                     for site in sites:
+                        if (site.get("channel") or "auto").lower() in ("rss", "iyuu"):
+                            continue  # 这两个通道的站本来就没有 pieces-hash 接口
                         remote_id, _ = self._site_lookup(site, pieces)
                         if not remote_id:
                             continue
@@ -1635,13 +1938,16 @@ class ColaCrossSeed(_PluginBase):
         logger.info(f"可乐PT 辅种完成：{stats}")
         if stats.get("already"):
             logger.info(f"其中 {stats['already']} 个在客户端里已经有了（同一 info_hash），直接跳过")
+        if stats.get("trackers"):
+            logger.info(f"另有 {stats['trackers']} 个同 info_hash 的种子补上了新站 announce（不占空间）")
         if self._notify and (stats["added"] or stats["filled"] or stats["failed"]):
             self.post_message(
                 mtype=NotificationType.SiteMessage,
                 title="【可乐PT辅种】任务完成",
                 text=(f"匹配：{stats['matched']}\n可乐补种：{stats['added']}\n其他站补种：{stats['filled']}\n"
-                      f"重复跳过：{stats.get('duplicate', 0)}\n校验失败后降级成功：{stats.get('retried', 0)}\n"
-                      f"跳过：{stats['skipped']}\n失败：{stats['failed']}"
+                      + (f"补 tracker：{stats['trackers']}\n" if stats.get("trackers") else "")
+                      + f"重复跳过：{stats.get('duplicate', 0)}\n校验失败后降级成功：{stats.get('retried', 0)}\n"
+                      + f"跳过：{stats['skipped']}\n失败：{stats['failed']}"
                       + (f"\n客户端已有：{stats['already']}" if stats.get("already") else "")
                       + (f"\n待下一轮重试：{len(self._pending())} 个" if self._pending() else "")),
             )
@@ -1813,7 +2119,7 @@ class ColaCrossSeed(_PluginBase):
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VTextarea", "props": {"model": "sites_lines", "rows": 4,
-                             "label": "其他站（每行一个：域名,passkey；可写 名称,域名,passkey[,rsskey]；带 rsskey 的站走 RSS 精确匹配）",
+                             "label": "其他站（每行一个：域名,passkey；可写 名称,域名,passkey,rsskey=…,sid=…,channel=pieces|rss|iyuu|auto,rss_url=…；channel 只决定探测哪条通道，IYUU 只要填了 sid 就生效）",
                              "placeholder": "https://pt.example.com,abcdef123456\n观众,https://audiences.me,PASSKEY,RSSKEY"}}]},
                     ]},
                     {"component": "VRow", "content": [
