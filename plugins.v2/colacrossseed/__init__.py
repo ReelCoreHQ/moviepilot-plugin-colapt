@@ -23,7 +23,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from threading import Event, Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -493,7 +493,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.7"
+    plugin_version = "0.10.8"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -919,6 +919,7 @@ class ColaCrossSeed(_PluginBase):
                 "proxy": proxy,
                 "cookie": cookie,
                 "rss_url": rss_url,
+                "rss_interval": (keyed.get("rss_interval") or "").strip(),
                 "downhash": downhash,
             })
         return out
@@ -1284,8 +1285,16 @@ class ColaCrossSeed(_PluginBase):
             time.sleep(6)   # 每批之间留间隔：IYUU 对连续查询限流很敏感
         return out
 
-    RSS_TTL = 600        # 站点侧限流是「最少 2 分钟一次」，这里按 10 分钟缓存，避免被拉黑
+    RSS_TTL = 600        # 索引缓存 10 分钟：站点侧普遍要求「≥2 分钟一次」，缓存远大于这个数
     RSS_ROWS = 100
+    # 两次拉 RSS 的最小间隔（秒）。这是**插件强制**的硬下限，不靠调用方自觉：
+    # 观众 audiences.me 明文要求「调整 RSS 请求间隔时间至少 2 分钟」，连点两次测试就会被怼回来。
+    RSS_MIN_INTERVAL = 120
+    # 按站点的下限（跟全局取更大值）：名单里的站一律不许比这更快
+    RSS_INTERVAL_BY_HOST = {
+        "audiences.me": 120,     # 观众：站点明确要求 ≥2 分钟
+        "ptchdbits.co": 120,     # 彩虹岛：同样会回 "Prevent refresh and try again after 60s"
+    }
 
     def _rss_usable(self, site: Dict[str, str]) -> bool:
         """这个站能不能读 RSS：有任何一个密钥就行，channel 不再当前置条件。
@@ -1346,6 +1355,31 @@ class ColaCrossSeed(_PluginBase):
             take(guid.group(1) if guid else "", url, length, title.group(1) if title else "")
         return items
 
+    def _rss_interval(self, site: Dict[str, str]) -> int:
+        """这个站两次拉 RSS 至少要隔多久：站点行里可以用 rss_interval=秒 覆盖，取更大值。"""
+        host = (site.get("url") or "").split("://", 1)[-1].split("/")[0].lower()
+        floor = max(int(self.RSS_MIN_INTERVAL), int(self.RSS_INTERVAL_BY_HOST.get(host, 0) or 0))
+        raw = str(site.get("rss_interval") or "").strip()
+        if raw.isdigit():
+            floor = max(floor, int(raw))
+        return floor
+
+    def _rss_at(self) -> Dict[str, float]:
+        try:
+            data = self.get_data("rss_at") or {}
+            return {str(k): float(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    # RSS 索引是 6 个线程并发拉的，插件数据是读-改-写，必须串行，否则两边互相覆盖/抢锁
+    _rss_lock = Lock()
+
+    def _rss_mark(self, host: str) -> None:
+        with self._rss_lock:
+            data = self._rss_at()
+            data[host] = time.time()
+            self.save_data("rss_at", data)
+
     def _rss_fetch(self, site: Dict[str, str], timeout: int = 40) -> Tuple[Dict[str, Dict[str, Any]], str]:
         """真去拉一次 RSS，返回 (info_hash -> {url,title,size}, 用的是哪个密钥/为什么失败)。
 
@@ -1361,6 +1395,14 @@ class ColaCrossSeed(_PluginBase):
         if not (rsskey or passkey or personal):
             return {}, "既没有 rsskey 也没有 passkey"
         host = site.get("url", "").split("://", 1)[-1].split("/")[0].lower()
+        interval = self._rss_interval(site)
+        last = float(self._rss_at().get(host) or 0)
+        wait = int(interval - (time.time() - last)) if last else 0
+        if last and wait > 0:
+            # 没到最小间隔：绝不发请求，有旧索引就用旧的
+            cached = ((self.get_data("rss_cache") or {}).get(host) or {}).get("items") or {}
+            return (cached if isinstance(cached, dict) else {}), \
+                f"限流保护：{wait} 秒后才允许再拉（该站要求 ≥{interval} 秒一次）"
         url = f"{site.get('url') or 'https://' + host}/torrentrss.php"
         tries: List[Tuple[str, Dict[str, Any], str]] = []
         if personal:
@@ -1380,6 +1422,7 @@ class ColaCrossSeed(_PluginBase):
             ))
         first_bad = ""
         last = "RSS 没有可用地址"
+        self._rss_mark(host)   # 打点放在发请求之前：失败的尝试也算“拉过一次”
         for target, params, label in tries:
             try:
                 rsp = _site_request("GET", target, params=params, headers=_site_headers(site),
@@ -1415,20 +1458,36 @@ class ColaCrossSeed(_PluginBase):
         return {}, first_bad or last
 
     def _rss_index(self, site: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
-        """带缓存的 RSS 索引（info_hash -> {url,title,size}）：10 分钟内同一站只拉一次。"""
+        """带缓存的 RSS 索引（info_hash -> {url,title,size}）：10 分钟内同一站只拉一次。
+
+        拉失败**不覆盖已有索引**：站点偶尔限流一次，不应该把本来好用的通道关掉。
+        """
         host = site.get("url", "").split("://", 1)[-1].split("/")[0].lower()
         cache = self.get_data("rss_cache") or {}
         entry = cache.get(host) or {}
-        if entry.get("at") and time.time() - int(entry["at"]) < self.RSS_TTL and entry.get("items") is not None:
-            return dict(entry["items"]) if isinstance(entry.get("items"), dict) else {}
+        cached = dict(entry.get("items")) if isinstance(entry.get("items"), dict) else {}
+        if cached and entry.get("at") and time.time() - int(entry["at"]) < self.RSS_TTL:
+            return cached
         items, note = self._rss_fetch(site)
-        cache[host] = {"at": int(time.time()), "items": items, "note": note}
-        self.save_data("rss_cache", cache)
-        if items:
+        with self._rss_lock:
+            notes = self.get_data("rss_notes") or {}
+            if not isinstance(notes, dict):
+                notes = {}
+            notes[host] = note
+            self.save_data("rss_notes", notes)
+            if items and not note.startswith("限流保护"):
+                cache = self.get_data("rss_cache") or {}
+                cache[host] = {"at": int(time.time()), "items": items, "note": note}
+                self.save_data("rss_cache", cache)
+        if items and not note.startswith("限流保护"):
             logger.info(f"{host} RSS 索引 {len(items)} 条（{note}）")
-        else:
-            logger.info(f"{host} RSS 不可用：{note}")
-        return items
+            return items
+        if items:
+            # 处在最小间隔内：继续用旧索引，但不刷新时间戳（下次到点还会真拉一次）
+            logger.info(f"{host} RSS {note}，继续用上次的 {len(items)} 条")
+            return items
+        logger.info(f"{host} RSS 不可用：{note}")
+        return cached
 
     def _download_url(self, url: str, site: Optional[Dict[str, str]] = None) -> bytes:
         """按 RSS 里给的完整下载地址取 .torrent（downhash / 签名已在 URL 里）。
@@ -1606,6 +1665,12 @@ class ColaCrossSeed(_PluginBase):
         if channel in ("auto", "rss") and not pieces_ok:
             rss_n, note = self._probe_rss(site)
             (good if rss_n else bad).append(note)
+        if not pieces_ok and not rss_n and channel != "pieces":
+            # RSS 这会儿不可用（限流/没密钥）时再看一眼 pieces-hash：
+            # 很多站「channel 写的是 rss」其实也有 pieces-hash，别让它显示成没通道
+            pieces_ok, note = self._probe_pieces(site)
+            if pieces_ok:
+                good.append(note)
         iyuu_ok = bool(site.get("sid")) and bool(self._iyuu_token)
         if iyuu_ok:
             good.insert(0, f"IYUU 匹配（sid={site['sid']}）")
@@ -1626,6 +1691,9 @@ class ColaCrossSeed(_PluginBase):
 
     def _rss_note(self, site: Dict[str, str]) -> str:
         host = (site.get("url") or "").split("://", 1)[-1].split("/")[0].lower()
+        note = (self.get_data("rss_notes") or {}).get(host)
+        if note:
+            return str(note)
         return str(((self.get_data("rss_cache") or {}).get(host) or {}).get("note") or "")
 
     def _probe_rss(self, site: Dict[str, str]) -> Tuple[int, str]:
@@ -2119,7 +2187,7 @@ class ColaCrossSeed(_PluginBase):
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VTextarea", "props": {"model": "sites_lines", "rows": 4,
-                             "label": "其他站（每行一个：域名,passkey；可写 名称,域名,passkey,rsskey=…,sid=…,channel=pieces|rss|iyuu|auto,rss_url=…；channel 只决定探测哪条通道，IYUU 只要填了 sid 就生效）",
+                             "label": "其他站（每行一个：域名,passkey；可写 名称,域名,passkey,rsskey=…,sid=…,channel=pieces|rss|iyuu|auto,rss_url=…,rss_interval=秒；channel 只决定探测哪条通道，IYUU 只要填了 sid 就生效；RSS 两次拉取之间的强制下限默认 120 秒，观众/彩虹岛 固定 ≥120 秒）",
                              "placeholder": "https://pt.example.com,abcdef123456\n观众,https://audiences.me,PASSKEY,RSSKEY"}}]},
                     ]},
                     {"component": "VRow", "content": [
