@@ -8,6 +8,7 @@
   · 连通性检测的通道判定与汇总口径
 """
 
+import hashlib
 import json
 import os
 import re
@@ -247,6 +248,25 @@ class SourceVariantTest(unittest.TestCase):
 
     def test_garbage_returns_nothing(self):
         self.assertEqual(mod._torrent_info_hash_variants(b"<html>"), [])
+
+
+class ContentKeyTest(unittest.TestCase):
+    """文件清单指纹：与站点 internal/contentkey 同一规范（否则两侧永远对不上）。"""
+
+    def test_export_key_single_file(self):
+        data = support.make_torrent(name="demo.mkv")
+        expected = hashlib.sha1(b"demo.mkv\x001024\n").hexdigest()
+        self.assertEqual(mod.ColaCrossSeed._export_content_key(data), expected)
+
+    def test_client_key_strips_torrent_dir(self):
+        entries = [{"name": "Demo.Pack/dir/a.mkv", "size": 10},
+                   {"name": "Demo.Pack/b.nfo", "size": 2}]
+        expected = hashlib.sha1(b"b.nfo\x002\ndir/a.mkv\x0010\n").hexdigest()
+        self.assertEqual(mod.ColaCrossSeed._client_content_key("Demo.Pack", entries), expected)
+
+    def test_empty_is_unknown(self):
+        self.assertEqual(mod._content_key([]), "")
+        self.assertEqual(mod.ColaCrossSeed._export_content_key(b"<html>"), "")
 
 
 class PlaceTest(unittest.TestCase):

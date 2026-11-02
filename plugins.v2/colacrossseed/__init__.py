@@ -306,6 +306,20 @@ def _torrent_info_hash_variants(data: bytes) -> List[str]:
     return out
 
 
+def _content_key(files: List[Tuple[str, int]]) -> str:
+    """文件清单指纹：相对路径 + 字节数，按路径排序后取 SHA1（与站点侧同一规范）。
+
+    用途：跨站辅种按 info_hash 反查会漏 —— 每个站发布时都会把 info.source 盖成自己的章，
+    同一份文件在各站的 info_hash 必然不同。文件清单指纹只看「路径 + 字节数」，
+    跟谁重新打包无关，所以能跨站对上（先按内容键找候选，下载后再逐字节核对文件清单）。
+    """
+    items = sorted((str(path), int(size)) for path, size in files if path)
+    if not items:
+        return ""
+    raw = "".join(f"{path}\x00{size}\n" for path, size in items)
+    return hashlib.sha1(raw.encode("utf-8", "surrogateescape")).hexdigest()
+
+
 class _Client:
     """下载器的最小接口：列出已完成种子、添加种子。"""
 
@@ -330,6 +344,10 @@ class _Client:
     def export(self, info_hash: str) -> bytes:
         """导出客户端里的 .torrent 原始字节；不支持时返回空。"""
         return b""
+
+    def files(self, info_hash: str) -> List[Dict[str, Any]]:
+        """客户端里这颗种子的文件清单（相对保存路径）；不支持时返回空。"""
+        return []
 
     def tagged_missing(self, tag: str) -> List[str]:
         """返回带该标签、但文件缺失（missingFiles）的种子 hash，用于自愈清理。"""
@@ -414,8 +432,22 @@ class QBittorrentClient(_Client):
             logger.warn(f"qBittorrent ({self.name}) 导出种子异常：{err}")
         return b""
 
+    def files(self, info_hash: str) -> List[Dict[str, Any]]:
+        """qB 的文件清单：name 是相对保存路径（多文件种子带顶层目录名）。"""
+        if not info_hash:
+            return []
+        try:
+            rsp = self._session.get(f"{self.url}/api/v2/torrents/files",
+                                    params={"hash": info_hash.lower()},
+                                    timeout=REQUEST_TIMEOUT)
+            if rsp.status_code == 200:
+                return rsp.json() or []
+        except Exception as err:
+            logger.warn(f"qBittorrent ({self.name}) 读取文件清单失败：{err}")
+        return []
+
     def add_trackers(self, info_hash: str, urls: List[str]) -> bool:
-        """同一 info_hash 已经在本机做种时，唯一能「再辅一个站」的办法是补 tracker。
+        """同一 info_hash 已经在本机做种时，唯一能「再补一个站」的办法是补 tracker。
 
         qB 不允许两颗种子共用一个 info_hash，所以跨站同种复制只能给已有种子加 announce；
         加完它就会去新站汇报，站方看到 passkey 有效 + 文件完整，直接记做种。
@@ -573,7 +605,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.9"
+    plugin_version = "0.10.10"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -745,7 +777,79 @@ class ColaCrossSeed(_PluginBase):
 
     SOURCE_VARIANT_LIMIT = 400   # 一轮最多为多少个未命中的种子导出 .torrent 做归一化补查
 
-    def _match_with_source_variants(self, client: "_Client", hashes: List[str],
+    def _match_content(self, keys: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """按「文件清单指纹」反查站点。老站点还没有这个参数，回 400 就静默跳过。"""
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for start in range(0, len(keys), 100):
+            chunk = sorted(keys[start:start + 100])
+            rsp = self._cola("GET", "/api/v1/plugin/match", params={"keys": ",".join(chunk)})
+            if rsp is None:
+                continue
+            if rsp.status_code == 400:
+                logger.info("站点暂不支持按内容键反查（接口版本较旧），跳过这条通道")
+                return {}
+            if rsp.status_code != 200:
+                logger.info(f"内容键反查返回 HTTP {rsp.status_code}")
+                continue
+            try:
+                body = rsp.json() or {}
+            except Exception:
+                continue
+            for row in body.get("content") or []:
+                key = (row.get("client_key") or "").strip().lower()
+                if key:
+                    out.setdefault(key, []).append(row)
+        return out
+
+    @staticmethod
+    def _export_content_key(data: bytes) -> str:
+        """从 .torrent 算内容键：多文件用 info.files 的相对路径，单文件用 info.name。"""
+        try:
+            torrent = bdecode(data)
+        except Exception:
+            return ""
+        if not isinstance(torrent, dict):
+            return ""
+        info = torrent.get(b"info") if isinstance(torrent.get(b"info"), dict) else torrent.get("info")
+        if not isinstance(info, dict):
+            return ""
+
+        def text(value: Any) -> str:
+            return value.decode("utf-8", "surrogateescape") if isinstance(value, (bytes, bytearray)) else str(value)
+
+        name = text(info.get(b"name") or info.get("name") or "")
+        entries = info.get(b"files") or info.get("files")
+        files: List[Tuple[str, int]] = []
+        if isinstance(entries, list) and entries:
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                parts = item.get(b"path") or item.get("path") or []
+                if not isinstance(parts, list):
+                    continue
+                path = "/".join(text(p) for p in parts)
+                size = item.get(b"length") or item.get("length") or 0
+                files.append((path, int(size)))
+        elif name:
+            size = info.get(b"length") or info.get("length") or 0
+            files.append((name, int(size)))
+        return _content_key(files)
+
+    @staticmethod
+    def _client_content_key(name: str, entries: List[Dict[str, Any]]) -> str:
+        """从 qB 文件清单算同一个键：qB 的 name 带顶层目录，去掉它才是相对路径。"""
+        files: List[Tuple[str, int]] = []
+        for item in entries or []:
+            path = str(item.get("name") or "")
+            if not path:
+                continue
+            if name and path.startswith(name + "/"):
+                path = path[len(name) + 1:]
+            files.append((path, int(item.get("size") or 0)))
+        return _content_key(files)
+
+    def _match_with_source_variants(self, client: "_Client", torrents: List[Dict[str, Any]],
+                                    hashes: List[str],
                                     by_hash: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
         """哈希反查没中的，再按「换掉 info.source 后」的哈希补查一遍。
 
@@ -758,33 +862,59 @@ class ColaCrossSeed(_PluginBase):
         missing = [h for h in hashes if h not in by_hash]
         if not missing:
             return by_hash
+        by_hash_size = {h: int(t.get("size") or 0) for h in hashes
+                        for t in [next((x for x in torrents if x.get("hash") == h), {})]}
         alias: Dict[str, str] = {}
+        keys: Dict[str, str] = {}
         for info_hash in missing[:self.SOURCE_VARIANT_LIMIT]:
             data = client.export(info_hash)
-            if not data:
-                break  # 这个下载器不支持导出（如 Transmission），整轮放弃补查
-            for variant in _torrent_info_hash_variants(data):
-                if variant == info_hash or variant in by_hash or variant in alias:
-                    continue
-                alias[variant] = info_hash
-        if not alias:
-            return by_hash
-        extra, _ = self._match(sorted(alias))
+            if data:
+                for variant in _torrent_info_hash_variants(data):
+                    if variant != info_hash and variant not in by_hash and variant not in alias:
+                        alias[variant] = info_hash
+                key = self._export_content_key(data)
+            else:
+                # 这个下载器导不出 .torrent（Transmission / 老 qB）：退回文件清单接口，
+                # 只算内容键 —— 文件清单指纹不依赖原始种子字节，照样能跨站对上。
+                name = next((x.get("name") or "" for x in torrents if x.get("hash") == info_hash), "")
+                key = self._client_content_key(name, client.files(info_hash))
+            if key and key not in keys:
+                keys[key] = info_hash
         found = 0
-        for variant, rows in extra.items():
-            owner = alias.get(variant)
-            if not owner:
-                continue
-            for row in rows:
-                hit = dict(row)
-                hit["client_hash"] = owner
-                # 客户端手里是「同一份文件的另一份种子」，可乐这边才是缺的一侧
-                hit["via"] = "source_info_hash"
-                hit["matched_by"] = "source_normalized"
-                by_hash.setdefault(owner, []).append(hit)
-                found += 1
-        if found:
-            logger.info(f"info.source 归一化后补中 {found} 个（改 source 再按 info_hash 反查）")
+        if alias:
+            extra, _ = self._match(sorted(alias))
+            for variant, rows in extra.items():
+                owner = alias.get(variant)
+                if not owner:
+                    continue
+                for row in rows:
+                    hit = dict(row)
+                    hit["client_hash"] = owner
+                    # 客户端手里是「同一份文件的另一份种子」，可乐这边才是缺的一侧
+                    hit["via"] = "source_info_hash"
+                    hit["matched_by"] = "source_normalized"
+                    by_hash.setdefault(owner, []).append(hit)
+                    found += 1
+            if found:
+                logger.info(f"info.source 归一化后补中 {found} 个（改 source 再按 info_hash 反查）")
+        if keys:
+            hit_count = 0
+            for key, rows in self._match_content(sorted(keys)).items():
+                owner = keys.get(key)
+                if not owner:
+                    continue
+                for row in rows:
+                    size = int(row.get("size_bytes") or 0)
+                    if by_hash_size.get(owner) and size and size != by_hash_size[owner]:
+                        continue  # 字节数不同不可能是同一份文件
+                    hit = dict(row)
+                    hit["client_hash"] = owner
+                    hit["via"] = "source_info_hash"
+                    hit["matched_by"] = "content_key"
+                    by_hash.setdefault(owner, []).append(hit)
+                    hit_count += 1
+            if hit_count:
+                logger.info(f"内容键（文件清单指纹）补中 {hit_count} 个")
         return by_hash
 
     def _csrf_token(self) -> str:
@@ -1977,7 +2107,7 @@ class ColaCrossSeed(_PluginBase):
             if err:
                 logger.error(err)
                 by_hash = {}
-            by_hash = self._match_with_source_variants(client, hashes, by_hash)
+            by_hash = self._match_with_source_variants(client, torrents, hashes, by_hash)
             for torrent in torrents:
                 if self._event.is_set():
                     break
