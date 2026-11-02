@@ -229,6 +229,26 @@ class TorrentHelperTest(unittest.TestCase):
         self.assertEqual(mod._torrent_announces(b"<html>nope</html>"), [])
 
 
+class SourceVariantTest(unittest.TestCase):
+    """同一份文件在别站与可乐只有 info.source 不同（2026-11-02 凡人修仙传 实例）。"""
+
+    def test_variant_equals_cola_hash(self):
+        data = support.make_torrent(source="[kp.m-team.cc] M-Team - TP")
+        variants = mod._torrent_info_hash_variants(data)
+        expected = support.info_hash_of(
+            support.make_torrent(source=mod.COLA_SOURCE_TAG))
+        self.assertIn(expected, variants)
+        self.assertNotEqual(expected, mod._torrent_info_hash(data))
+
+    def test_variant_strips_source(self):
+        data = support.make_torrent(source="[kp.m-team.cc] M-Team - TP")
+        stripped = support.info_hash_of(support.make_torrent(source=""))
+        self.assertIn(stripped, mod._torrent_info_hash_variants(data))
+
+    def test_garbage_returns_nothing(self):
+        self.assertEqual(mod._torrent_info_hash_variants(b"<html>"), [])
+
+
 class PlaceTest(unittest.TestCase):
     def test_duplicate_short_circuits(self):
         plugin = support.make_plugin(mod)

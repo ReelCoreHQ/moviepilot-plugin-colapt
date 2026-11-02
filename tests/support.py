@@ -202,14 +202,18 @@ def make_plugin(module, store=None, **attrs):
 
 
 def make_torrent(announce: str = "http://tracker.example/announce",
-                 announce_list=None, name: str = "demo.mkv") -> bytes:
+                 announce_list=None, name: str = "demo.mkv",
+                 source: str = "") -> bytes:
     """拼一颗结构合法的最小 .torrent（键顺序固定，便于断言 info_hash）。"""
     info = {
         b"length": 1024,
         b"name": name.encode(),
         b"piece length": 16384,
         b"pieces": b"\x00" * 20,
+        b"private": 1,
     }
+    if source:
+        info[b"source"] = source.encode()
     blob = b"d" + b"8:announce" + _mini_bencode(announce)
     if announce_list:
         blob += b"13:announce-list" + _mini_bencode(announce_list)
