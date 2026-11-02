@@ -35,6 +35,9 @@ from app.plugins import _PluginBase
 from app.schemas import NotificationType
 
 COLA_BASE = "https://www.colapt.com"
+# 可乐PT 发布种子时会给 info.source 盖的章。同一份文件在别站有别的 source，
+# info_hash 因此不同，匹配时必须归一化（见 _torrent_info_hash_variants）。
+COLA_SOURCE_TAG = f"[{COLA_BASE}] ColaPT"
 # 已关闭 / 已换域名的站点：IYUU 导出里常见旧地址，这里做一次纠正（2026-10-25 核对）。
 SITE_REMAP = {
     "www.hddolby.com": "https://www.uhddolby.com",
@@ -245,6 +248,64 @@ def _torrent_announces(data: bytes) -> List[str]:
     return out
 
 
+def _bencode_value(value: Any) -> bytes:
+    """规范 bencode 编码（字典按字节序排序），用来算「改写 info 后」的 info_hash。"""
+    if isinstance(value, bool):
+        raise TypeError("bencode 没有 bool")
+    if isinstance(value, int):
+        return b"i%de" % value
+    if isinstance(value, str):
+        value = value.encode()
+    if isinstance(value, (bytes, bytearray)):
+        return b"%d:%s" % (len(value), bytes(value))
+    if isinstance(value, (list, tuple)):
+        return b"l" + b"".join(_bencode_value(v) for v in value) + b"e"
+    if isinstance(value, dict):
+        items = []
+        for key, val in value.items():
+            key = key.encode() if isinstance(key, str) else key
+            items.append((key, val))
+        items.sort(key=lambda kv: kv[0])
+        return b"d" + b"".join(_bencode_value(k) + _bencode_value(v) for k, v in items) + b"e"
+    raise TypeError(f"不支持的 bencode 类型：{type(value).__name__}")
+
+
+def _torrent_info_hash_variants(data: bytes) -> List[str]:
+    """同一份文件在不同站发布时，info 里往往只差 `source` 一个字段。
+
+    可乐PT 发布时会把 info.source 盖成 `[https://www.colapt.com] ColaPT`；同一颗种子在
+    M-Team 是 `[kp.m-team.cc] M-Team - TP` —— 于是两边的 info_hash 必然不同，而
+    /api/v1/plugin/match 只按 info_hash / source_info_hash 反查，结果就是「内容一模一样
+    却匹配不到」。这里把 source 换成可乐的章 / 直接去掉，各算一遍 info_hash，再让站点反查。
+    """
+    try:
+        torrent = bdecode(data)
+    except Exception:
+        return []
+    if not isinstance(torrent, dict):
+        return []
+    info = torrent.get(b"info")
+    if not isinstance(info, dict):
+        info = torrent.get("info")
+    if not isinstance(info, dict):
+        return []
+    out: List[str] = []
+    for source in (COLA_SOURCE_TAG, None):
+        clone = dict(info)
+        clone.pop("source", None)
+        if source is None:
+            clone.pop(b"source", None)
+        else:
+            clone[b"source"] = source.encode()
+        try:
+            digest = hashlib.sha1(_bencode_value(clone)).hexdigest()
+        except Exception:
+            continue
+        if digest not in out:
+            out.append(digest)
+    return out
+
+
 class _Client:
     """下载器的最小接口：列出已完成种子、添加种子。"""
 
@@ -265,6 +326,10 @@ class _Client:
     def add_trackers(self, info_hash: str, urls: List[str]) -> bool:
         """给客户端里**已有**的种子补 announce（同 info_hash 的跨站辅种只能这么干）。"""
         return False
+
+    def export(self, info_hash: str) -> bytes:
+        """导出客户端里的 .torrent 原始字节；不支持时返回空。"""
+        return b""
 
     def tagged_missing(self, tag: str) -> List[str]:
         """返回带该标签、但文件缺失（missingFiles）的种子 hash，用于自愈清理。"""
@@ -333,6 +398,21 @@ class QBittorrentClient(_Client):
         except Exception:
             pass
         return False
+
+    def export(self, info_hash: str) -> bytes:
+        """导出 .torrent 原始字节（qB 4.5+）。用来算「换掉 source 后」的 info_hash。"""
+        if not info_hash:
+            return b""
+        try:
+            rsp = self._session.get(f"{self.url}/api/v2/torrents/export",
+                                    params={"hash": info_hash.lower()},
+                                    timeout=REQUEST_TIMEOUT)
+            if rsp.status_code == 200 and _valid_torrent(rsp.content):
+                return rsp.content
+            logger.info(f"qBittorrent ({self.name}) 导出种子失败：HTTP {rsp.status_code}")
+        except Exception as err:
+            logger.warn(f"qBittorrent ({self.name}) 导出种子异常：{err}")
+        return b""
 
     def add_trackers(self, info_hash: str, urls: List[str]) -> bool:
         """同一 info_hash 已经在本机做种时，唯一能「再辅一个站」的办法是补 tracker。
@@ -493,7 +573,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.8"
+    plugin_version = "0.10.9"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -662,6 +742,50 @@ class ColaCrossSeed(_PluginBase):
             for item in (rsp.json() or {}).get("matched") or []:
                 by_hash.setdefault(item.get("client_hash", ""), []).append(item)
         return by_hash, ""
+
+    SOURCE_VARIANT_LIMIT = 400   # 一轮最多为多少个未命中的种子导出 .torrent 做归一化补查
+
+    def _match_with_source_variants(self, client: "_Client", hashes: List[str],
+                                    by_hash: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
+        """哈希反查没中的，再按「换掉 info.source 后」的哈希补查一遍。
+
+        为什么需要这一步（2026-11-02 实例）：同一颗 `凡人修仙传 S01E198 2160p-UBWEB`，
+        客户端是从 M-Team 下的（info.source = `[kp.m-team.cc] M-Team - TP`），可乐站上那份
+        只是把 source 盖成了自己的章 —— files/name/pieces/private 全部逐字段相同，
+        但 info_hash 一个是 9270936b…、一个是 63d0bcd2…，站点按哈希反查自然匹配不到。
+        归一化后算出来的哈希与可乐的 info_hash 完全相等，命中就是真命中（文件逐字节一致）。
+        """
+        missing = [h for h in hashes if h not in by_hash]
+        if not missing:
+            return by_hash
+        alias: Dict[str, str] = {}
+        for info_hash in missing[:self.SOURCE_VARIANT_LIMIT]:
+            data = client.export(info_hash)
+            if not data:
+                break  # 这个下载器不支持导出（如 Transmission），整轮放弃补查
+            for variant in _torrent_info_hash_variants(data):
+                if variant == info_hash or variant in by_hash or variant in alias:
+                    continue
+                alias[variant] = info_hash
+        if not alias:
+            return by_hash
+        extra, _ = self._match(sorted(alias))
+        found = 0
+        for variant, rows in extra.items():
+            owner = alias.get(variant)
+            if not owner:
+                continue
+            for row in rows:
+                hit = dict(row)
+                hit["client_hash"] = owner
+                # 客户端手里是「同一份文件的另一份种子」，可乐这边才是缺的一侧
+                hit["via"] = "source_info_hash"
+                hit["matched_by"] = "source_normalized"
+                by_hash.setdefault(owner, []).append(hit)
+                found += 1
+        if found:
+            logger.info(f"info.source 归一化后补中 {found} 个（改 source 再按 info_hash 反查）")
+        return by_hash
 
     def _csrf_token(self) -> str:
         """会话登录后拿 CSRF（POST /authorizations 要带）。"""
@@ -1853,6 +1977,7 @@ class ColaCrossSeed(_PluginBase):
             if err:
                 logger.error(err)
                 by_hash = {}
+            by_hash = self._match_with_source_variants(client, hashes, by_hash)
             for torrent in torrents:
                 if self._event.is_set():
                     break
