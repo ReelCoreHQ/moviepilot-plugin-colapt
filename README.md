@@ -126,7 +126,9 @@ https://pt.example.com,abcdef1234567890abcdef1234567890
 | **站点 RSS（`rsskey`）** | 站点 RSS 密钥 | 没有 pieces-hash 的站（如 观众 audiences.me）。NexusPHP 的 `torrentrss.php` 每条 item 带 `guid=info_hash` 和 `enclosure` 直链，按 info_hash 精确匹配，不靠标题猜 |
 | IYUU 云端 | IYUU token | 收录在 IYUU 的站，按 info_hash 全站匹配 |
 
-RSS 通道的覆盖范围是「RSS 里能看到的种子」（一般是最近发布的），刚好是辅种最该抢的那批；插件按 10 分钟缓存一次（站点侧限流是 2 分钟一次）。
+RSS 通道的覆盖范围是「RSS 里能看到的种子」（一般是最近发布的），刚好是辅种最该抢的那批。插件按 10 分钟缓存一次；并且**强制**两次拉取至少隔 120 秒（观众 audiences.me、彩虹岛 ptchdbits.co 站点明确要求 ≥2 分钟），间隔按站持久化打点，重启、手动点「测试」都守得住；站点行可用 `rss_interval=秒` 调大，不能调小。
+
+RSS 命中的是**同一 info_hash**，qB 不允许同 hash 双开，所以这条通道不加种，而是给客户端里已有的那颗种子补上该站的 announce —— 文件一个字节都不用多，站方照样记做种。
 
 ## 注意
 
@@ -139,6 +141,18 @@ RSS 通道的覆盖范围是「RSS 里能看到的种子」（一般是最近发
 
 仓库里**不含任何凭据**；账号、passkey、IYUU token、下载器密码全部只存在你自己的 MoviePilot 里。
 详见 [SECURITY.md](./SECURITY.md)。
+
+## 开发与发布流程
+
+`main` 开了分支保护：**功能测试全绿 + 必须走 PR** 才能合入，直接 push 会被拒。
+
+```bash
+# 27 个离线功能测试：不联网、不依赖 MoviePilot 运行时（app.* / bencode 缺失时自动打桩）
+python -m unittest discover -s tests -v
+```
+
+CI 见 `.github/workflows/ci.yml`，job 名 `functional-tests`（就是分支保护要求的那项 check）：
+语法与清单自检 → 功能测试。发版流程：改代码 → 推分支 → 开 PR → 等 `functional-tests` 绿 → 合并到 `main`。
 
 ## 许可证
 

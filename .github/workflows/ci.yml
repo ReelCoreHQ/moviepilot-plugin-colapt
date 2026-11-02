@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # 这个名字就是分支保护里要求的 status check（main 必须先过它才能合并）
+    name: functional-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: 安装依赖
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: 插件与清单自检
+        run: |
+          python -m compileall -q plugins.v2/colacrossseed/__init__.py
+          python - <<'PY'
+          import json, pathlib, re
+          entry = json.loads(pathlib.Path("package.v2.json").read_text("utf-8"))["ColaCrossSeed"]
+          assert entry.get("v2") is True, "package.v2.json 必须声明 v2"
+          assert re.match(r"^\d+\.\d+\.\d+$", entry["version"]), entry["version"]
+          assert list(entry["history"])[0] == f"v{entry['version']}", "history 最新一条必须是当前版本"
+          print("manifest ok:", entry["version"])
+          PY
+
+      - name: 功能测试
+        run: python -m unittest discover -s tests -v
