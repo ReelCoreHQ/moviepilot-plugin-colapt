@@ -605,7 +605,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.11"
+    plugin_version = "0.10.12"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -728,15 +728,27 @@ class ColaCrossSeed(_PluginBase):
         if self._otp_code:
             payload["code"] = self._otp_code
         try:
-            rsp = requests.post(f"{COLA_BASE}/api/v1/plugin/sessions", json=payload, timeout=REQUEST_TIMEOUT)
-            if rsp.status_code == 201:
-                self._session_token = (rsp.json() or {}).get("session_token") or ""
-                self.save_data("captcha_id", "")
-                logger.info("可乐PT 登录成功")
-                return bool(self._session_token)
-            logger.warn(f"可乐PT 登录失败：{rsp.status_code} {rsp.text[:160]}")
+            # 走 _curl 而不是 requests：有些机器（含群晖/部分 NAS）Python 的 TLS 握手过不去，
+            # 但系统 curl 正常，登录就不会莫名其妙失败。
+            rsp = _curl("POST", f"{COLA_BASE}/api/v1/plugin/sessions", json_body=payload,
+                        timeout=REQUEST_TIMEOUT)
         except Exception as err:
             logger.error(f"可乐PT 登录异常：{err}")
+            return False
+        if rsp.status_code == 201:
+            self._session_token = (rsp.json() or {}).get("session_token") or ""
+            self.save_data("captcha_id", "")
+            self.save_data("captcha_cache", {})
+            logger.info("可乐PT 登录成功")
+            return bool(self._session_token)
+        body = rsp.text or ""
+        if rsp.status_code == 403 and "captcha" in body:
+            # 验证码错/过期：把缓存清掉，下次打开插件页会换一张新的
+            self.save_data("captcha_cache", {})
+            self.save_data("captcha_error", "验证码不对或已过期，重新打开插件页会换一张")
+            logger.warn("可乐PT 登录失败：验证码不对或已过期，已清掉旧验证码")
+        else:
+            logger.warn(f"可乐PT 登录失败：{rsp.status_code} {body[:160]}")
         return False
 
     def _cola(self, method: str, path: str, **kwargs) -> Optional[_HttpResult]:
@@ -1270,27 +1282,57 @@ class ColaCrossSeed(_PluginBase):
 
     # ---------------- 下载器 ----------------
 
+    def _mp_clients(self) -> List[_Client]:
+        """枚举 MoviePilot「设置 → 下载器」里的**每一个**实例。
+
+        以前只取 `Qbittorrent()` / `Transmission()` 这两个默认实例，多下载器用户
+        只会看到其中一台（issue #7）。MP v3 暴露了 DownloaderHelper，按名字列出
+        所有已启用实例，一台一个适配器。
+        """
+        out: List[_Client] = []
+        try:
+            from app.application.downloader import DownloaderHelper
+            services = DownloaderHelper().get_services() or {}
+        except Exception as err:
+            logger.info(f"MoviePilot 多下载器接口不可用（{type(err).__name__}: {err}），退回单实例模式")
+            return []
+        for name, info in services.items():
+            instance = getattr(info, "instance", None)
+            if instance is None:
+                continue
+            if not (hasattr(instance, "get_completed_torrents") and hasattr(instance, "add_torrent")):
+                continue
+            label = f"MP-{name}"
+            out.append(_MPClient(label, instance.get_completed_torrents, instance.add_torrent))
+            logger.info(f"MoviePilot 下载器已接入：{label}（{getattr(info, 'type', '?')}）")
+        return out
+
     def _clients(self) -> List[_Client]:
         out: List[_Client] = []
         if self._use_mp_clients:
-            try:
-                from app.modules.qbittorrent import Qbittorrent
-                qb = Qbittorrent()
-                if qb.is_inactive():
-                    logger.info("MoviePilot 的 qBittorrent 未启用")
-                else:
-                    out.append(_MPClient("MP-QB", qb.get_completed_torrents, qb.add_torrent))
-            except Exception as err:
-                logger.warn(f"读取 MoviePilot qBittorrent 失败：{err}")
-            try:
-                from app.modules.transmission import Transmission
-                tr = Transmission()
-                if tr.is_inactive():
-                    logger.info("MoviePilot 的 Transmission 未启用")
-                else:
-                    out.append(_MPClient("MP-TR", tr.get_completed_torrents, tr.add_torrent))
-            except Exception as err:
-                logger.warn(f"读取 MoviePilot Transmission 失败：{err}")
+            mp_clients = self._mp_clients()
+            if mp_clients:
+                out.extend(mp_clients)
+            else:
+                # 老版本 MP 或组合根未就绪：退回「默认那个 qB/TR」的老写法
+                try:
+                    from app.modules.qbittorrent import Qbittorrent
+                    qb = Qbittorrent()
+                    if qb.is_inactive():
+                        logger.info("MoviePilot 的 qBittorrent 未启用")
+                    else:
+                        out.append(_MPClient("MP-QB", qb.get_completed_torrents, qb.add_torrent))
+                except Exception as err:
+                    logger.warn(f"读取 MoviePilot qBittorrent 失败：{err}")
+                try:
+                    from app.modules.transmission import Transmission
+                    tr = Transmission()
+                    if tr.is_inactive():
+                        logger.info("MoviePilot 的 Transmission 未启用")
+                    else:
+                        out.append(_MPClient("MP-TR", tr.get_completed_torrents, tr.add_torrent))
+                except Exception as err:
+                    logger.warn(f"读取 MoviePilot Transmission 失败：{err}")
         line_clients = self._line_clients()
         if line_clients:
             out.extend(line_clients)
@@ -2333,7 +2375,12 @@ class ColaCrossSeed(_PluginBase):
         if not self._session_token:
             captcha_id, image = self._fetch_captcha()
             if not image:
-                return [{"component": "div", "text": "获取可乐PT 验证码失败，请检查站点可达后重试。"}]
+                reason = str(self.get_data("captcha_error") or "未知原因")
+                return [
+                    {"component": "div", "text": f"获取可乐PT 验证码失败：{reason}"},
+                    {"component": "div", "text": "确认这台机器能打开 https://www.colapt.com（浏览器里试一下），"
+                                                 "再重新打开插件页重试；若一直失败，把上面这行原因贴到 GitHub issue。"},
+                ]
             return [
                 {"component": "div", "text": f"可乐PT 登录：验证码 id {captcha_id}（4 位数字），填到插件设置「验证码」后保存。"},
                 {"component": "VImg", "props": {"src": image, "max-width": 220, "class": "mt-3"}},
@@ -2379,17 +2426,35 @@ class ColaCrossSeed(_PluginBase):
             blocks.append({"component": "div", "text": "保存一次配置会自动做连通性检测，结果显示在这里。"})
         return blocks
 
-    def _fetch_captcha(self) -> Tuple[str, str]:
+    # 站点验证码 10 分钟内有效；插件缓存 5 分钟 —— 否则每次打开/刷新插件页都会换一张，
+    # 用户看到的那张立刻作废（「第一次看不清，再刷就不出来了」就是这个）。
+    CAPTCHA_TTL = 300
+
+    def _fetch_captcha(self, force: bool = False) -> Tuple[str, str]:
+        cached = self.get_data("captcha_cache") or {}
+        if (not force and cached.get("id") and cached.get("image")
+                and 0 <= time.time() - int(cached.get("at") or 0) < self.CAPTCHA_TTL):
+            return str(cached["id"]), str(cached["image"])
+        captcha_id, image, reason = "", "", ""
         try:
-            rsp = requests.get(f"{COLA_BASE}/api/v1/plugin/captcha", timeout=REQUEST_TIMEOUT)
+            rsp = _curl("GET", f"{COLA_BASE}/api/v1/plugin/captcha", timeout=REQUEST_TIMEOUT)
             if rsp.status_code == 200:
                 body = rsp.json() or {}
-                captcha_id = body.get("captcha_id") or ""
-                self.save_data("captcha_id", captcha_id)
-                return captcha_id, body.get("image") or ""
+                captcha_id = str(body.get("captcha_id") or "")
+                image = str(body.get("image") or "")
+            else:
+                reason = f"站点返回 HTTP {rsp.status_code}"
         except Exception as err:
-            logger.warn(f"获取可乐PT 验证码失败：{err}")
-        return "", ""
+            reason = f"{type(err).__name__}: {err}"
+        if not image:
+            reason = reason or "站点没有返回验证码图片"
+            self.save_data("captcha_error", reason)
+            logger.warn(f"获取可乐PT 验证码失败：{reason}")
+            return "", ""
+        self.save_data("captcha_error", "")
+        self.save_data("captcha_id", captcha_id)
+        self.save_data("captcha_cache", {"id": captcha_id, "image": image, "at": int(time.time())})
+        return captcha_id, image
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
