@@ -289,6 +289,69 @@ class DedupeMemoryTest(unittest.TestCase):
         self.assertEqual(plugin._dead_hashes()[-1], "ff" * 20)
 
 
+class CaptchaTest(unittest.TestCase):
+    """验证码要缓存：每刷新一次就换一张，用户看到的那张立刻作废（issue #8）。"""
+
+    def _fake_curl(self, payload, status=200):
+        import json as _json
+        captured = []
+
+        def fake(method, url, **kwargs):
+            captured.append(url)
+            text = _json.dumps(payload, ensure_ascii=False)
+            return mod._HttpResult(status, text.encode(), text)
+
+        return fake, captured
+
+    def test_cached_between_calls(self):
+        plugin = support.make_plugin(mod)
+        fake, calls = self._fake_curl({"captcha_id": "cid1", "image": "data:image/png;base64,AA"})
+        original, mod._curl = mod._curl, fake
+        try:
+            first = plugin._fetch_captcha()
+            second = plugin._fetch_captcha()
+        finally:
+            mod._curl = original
+        self.assertEqual(first, ("cid1", "data:image/png;base64,AA"))
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 1, "第二次应命中缓存，不该再请求站点")
+
+    def test_force_bypasses_cache(self):
+        plugin = support.make_plugin(mod)
+        fake, calls = self._fake_curl({"captcha_id": "cid2", "image": "data:image/png;base64,BB"})
+        original, mod._curl = mod._curl, fake
+        try:
+            plugin._fetch_captcha()
+            plugin._fetch_captcha(force=True)
+        finally:
+            mod._curl = original
+        self.assertEqual(len(calls), 2)
+
+    def test_failure_records_reason(self):
+        plugin = support.make_plugin(mod)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("tls handshake failed")
+
+        original, mod._curl = mod._curl, boom
+        try:
+            cid, image = plugin._fetch_captcha()
+        finally:
+            mod._curl = original
+        self.assertEqual((cid, image), ("", ""))
+        self.assertIn("tls handshake failed", plugin.get_data("captcha_error"))
+
+    def test_http_error_records_status(self):
+        plugin = support.make_plugin(mod)
+        fake, _ = self._fake_curl({}, status=502)
+        original, mod._curl = mod._curl, fake
+        try:
+            self.assertEqual(plugin._fetch_captcha(), ("", ""))
+        finally:
+            mod._curl = original
+        self.assertIn("502", plugin.get_data("captcha_error"))
+
+
 class PlaceTest(unittest.TestCase):
     def test_duplicate_short_circuits(self):
         plugin = support.make_plugin(mod)
