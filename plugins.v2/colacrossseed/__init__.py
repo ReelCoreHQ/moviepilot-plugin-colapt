@@ -605,7 +605,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.10"
+    plugin_version = "0.10.11"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1454,6 +1454,27 @@ class ColaCrossSeed(_PluginBase):
             done.append(key)
         self.save_data("done", done[-10000:])
 
+    def _forget(self, key: str) -> None:
+        """撤销一条去重记忆：客户端里已经没有这颗种子时，必须允许再补一次。"""
+        done = [k for k in self._done() if k != key]
+        self.save_data("done", done)
+
+    def _dead_hashes(self) -> List[str]:
+        """文件确实缺失、被自愈清掉的 hash：这些不再重试，避免每小时加了又删。"""
+        try:
+            items = self.get_data("dead_hashes") or []
+            return [str(h).lower() for h in items if h]
+        except Exception:
+            return []
+
+    def _mark_dead(self, hashes: List[str]) -> None:
+        dead = self._dead_hashes()
+        for info_hash in hashes:
+            info_hash = str(info_hash or "").lower()
+            if info_hash and info_hash not in dead:
+                dead.append(info_hash)
+        self.save_data("dead_hashes", dead[-2000:])
+
     # ---------------- IYUU 云端辅种（有 token 时优先用，覆盖面比 pieces-hash 大得多） ----------------
 
     IYUU_API = "http://2025.iyuu.cn"
@@ -2041,6 +2062,7 @@ class ColaCrossSeed(_PluginBase):
             missing = client.tagged_missing(MANDATORY_TAG)
             if missing:
                 client.delete(missing)
+                self._mark_dead(missing)
                 logger.warn(f"{client.name}：清理 {len(missing)} 个文件缺失的辅种种（只删种子，不删文件）")
         sites = []
         if self._direction in ("both", "other_only"):
@@ -2059,6 +2081,7 @@ class ColaCrossSeed(_PluginBase):
         self._site_counter = {}   # 每轮重置：单站上限按轮算
         self._site_fails = {}     # 每轮重置：站点失败计数（熔断用）
         done = set(self._done())
+        dead = set(self._dead_hashes())   # 文件确实缺失、已被自愈清掉的，不再重试
         # 先把所有客户端扫一遍：tracker 不允许同一账号同一颗种子在多个客户端同时做种，
         # 所以“另一边已经有的可乐种”必须跳过，不能只在本客户端内去重。
         if self._retry_failed:
@@ -2165,8 +2188,16 @@ class ColaCrossSeed(_PluginBase):
                     hit = cola_hits[0]
                     key = f"{client.name}:cola:{hit.get('id')}"
                     if key in done:
-                        stats["skipped"] += 1
-                        continue
+                        info_hash = (hit.get("info_hash") or "").lower()
+                        if info_hash and info_hash not in client_hashes and info_hash not in dead:
+                            # 记过、但客户端里已经没有这颗（用户删了 / 之前被清掉）：
+                            # 「记过」不能当成永久结论，否则这颗种子永远补不回来。
+                            logger.info(f"{client.name}：{info_hash[:8]} 记过但客户端里已没有，撤销记忆重新补种")
+                            self._forget(key)
+                            done.discard(key)
+                        else:
+                            stats["skipped"] += 1
+                            continue
                     if self._budget_left() <= 0:
                         logger.info("已达到每小时辅种上限（只统计成功添加的种子），结束本次")
                         self._finish(stats)

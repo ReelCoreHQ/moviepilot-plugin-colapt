@@ -269,6 +269,26 @@ class ContentKeyTest(unittest.TestCase):
         self.assertEqual(mod.ColaCrossSeed._export_content_key(b"<html>"), "")
 
 
+class DedupeMemoryTest(unittest.TestCase):
+    """「记过」不能当成永久结论：客户端里没有的必须能补回来。"""
+
+    def test_forget_removes_key(self):
+        plugin = support.make_plugin(mod, store={"done": ["a", "b", "c"]})
+        plugin._forget("b")
+        self.assertEqual(plugin._done(), ["a", "c"])
+
+    def test_dead_hashes_round_trip(self):
+        plugin = support.make_plugin(mod)
+        plugin._mark_dead(["AA" * 20, "bb" * 20, "aa" * 20])
+        self.assertEqual(plugin._dead_hashes(), ["aa" * 20, "bb" * 20])
+
+    def test_dead_hashes_capped(self):
+        plugin = support.make_plugin(mod, store={"dead_hashes": ["%040x" % i for i in range(2000)]})
+        plugin._mark_dead(["ff" * 20])
+        self.assertEqual(len(plugin._dead_hashes()), 2000)
+        self.assertEqual(plugin._dead_hashes()[-1], "ff" * 20)
+
+
 class PlaceTest(unittest.TestCase):
     def test_duplicate_short_circuits(self):
         plugin = support.make_plugin(mod)
