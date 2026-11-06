@@ -413,6 +413,8 @@ class QBittorrentClient(_Client):
                     "save_path": item.get("save_path") or item.get("content_path") or "",
                     "category": item.get("category") or "",
                     "size": item.get("size") or item.get("total_size") or 0,
+                    # 标签要带上：辅种时可能要「继承原种子标签」（issue #11）
+                    "tags": item.get("tags") or "",
                 })
             return out
         except Exception as err:
@@ -648,7 +650,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.15"
+    plugin_version = "0.10.16"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -679,6 +681,8 @@ class ColaCrossSeed(_PluginBase):
     _iyuu_token = ""
     _sites_mode = "merge"
     _add_label = ""
+    _inherit_tags = True      # 辅种时继承原种子已有的标签（站点标签、已整理、订阅…）
+    _extra_tags = ""          # 额外附加的标签，逗号分隔
     _fallback_skip_check = True
     _retry_failed = True
     _event = Event()
@@ -709,6 +713,8 @@ class ColaCrossSeed(_PluginBase):
             self._iyuu_token = str(config.get("iyuu_token") or "")
             self._sites_mode = str(config.get("sites_mode") or "merge")
             self._add_label = str(config.get("add_label") or "").strip()
+            self._inherit_tags = bool(config.get("inherit_tags", True))
+            self._extra_tags = str(config.get("extra_tags") or "").strip()
             self._fallback_skip_check = bool(config.get("fallback_skip_check", True))
             self._retry_failed = bool(config.get("retry_failed", True))
             try:
@@ -751,6 +757,8 @@ class ColaCrossSeed(_PluginBase):
             "iyuu_token": self._iyuu_token,
             "sites_mode": self._sites_mode,
             "add_label": self._add_label,
+            "inherit_tags": self._inherit_tags,
+            "extra_tags": self._extra_tags,
             "fallback_skip_check": self._fallback_skip_check,
             "retry_failed": self._retry_failed,
         })
@@ -1430,7 +1438,17 @@ class ColaCrossSeed(_PluginBase):
         下一轮先重试它们，而不是等下一次全量扫描再撞一遍。
         """
         save_path = torrent.get("save_path", "")
-        label = self._add_label or torrent.get("category", "")
+        # 标签：合并「原种子已有标签（可关）」+「用户额外指定」+ 原来那个分类/自定义标签，
+        # qB 的 tags 字段接受逗号分隔的多个值。
+        tags: List[str] = []
+        if self._inherit_tags:
+            tags += [t.strip() for t in str(torrent.get("tags") or "").split(",")
+                     if t.strip() and t.strip() != MANDATORY_TAG]
+        tags += [t.strip() for t in str(self._extra_tags or "").split(",") if t.strip()]
+        base_label = self._add_label or torrent.get("category", "")
+        if base_label and base_label != MANDATORY_TAG:
+            tags.append(base_label)
+        label = ",".join(dict.fromkeys(tags))
         if site_key and self._site_budget_left(site_key) <= 0:
             stats["skipped"] = stats.get("skipped", 0) + 1
             return  # 这个站这一轮已经补满 max_per_site 颗
@@ -2611,6 +2629,14 @@ class ColaCrossSeed(_PluginBase):
                             {"component": "VTextField", "props": {"model": "add_label", "label": "辅种标签（留空则沿用原种分类）",
                              "placeholder": "cross-seed"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VTextField", "props": {"model": "extra_tags",
+                             "label": "额外标签（逗号分隔，例如站点名）", "placeholder": "可乐PT,辅种"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VSwitch", "props": {"model": "inherit_tags",
+                             "label": "继承原种子的标签（站点标签、已整理等）"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VSwitch", "props": {"model": "fallback_skip_check", "label": "校验失败时降级为跳过校验重试"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VSwitch", "props": {"model": "retry_failed", "label": "失败的种子下一轮先重试"}}]},
@@ -2655,7 +2681,8 @@ class ColaCrossSeed(_PluginBase):
             "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
             "skip_check": False, "max_per_hour": 0, "max_per_site": 20, "direction": "both",
             "use_mp_clients": True, "clients_json": "", "clients_lines": "", "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "", "sites_mode": "merge",
-            "add_label": "", "fallback_skip_check": True, "retry_failed": True,
+            "add_label": "", "extra_tags": "", "inherit_tags": True,
+            "fallback_skip_check": True, "retry_failed": True,
         }
 
 
