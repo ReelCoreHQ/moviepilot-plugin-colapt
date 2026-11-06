@@ -455,6 +455,68 @@ class MPClientTest(unittest.TestCase):
         self.assertEqual(got[0]["tags"], "a,b")
 
 
+class PreferredClientTest(unittest.TestCase):
+    """同一颗种子在 qB 和 TR 都有时，应该补到「正在做种」的那台。"""
+
+    def _client(self, name, torrents):
+        client = support.FakeClient()
+        client.name = name
+        client.list_completed = lambda: list(torrents)
+        return client
+
+    def test_prefers_seeding_client(self):
+        plugin = support.make_plugin(mod)
+        h = "ab" * 20
+        qb = self._client("qB", [{"hash": h, "state": "pausedDL"}])
+        tr = self._client("TR", [{"hash": h, "state": "uploading"}])
+        preferred = plugin._preferred_clients([(qb, qb.list_completed()), (tr, tr.list_completed())])
+        self.assertEqual(preferred[h], "TR")
+
+    def test_falls_back_to_first_when_nobody_seeds(self):
+        plugin = support.make_plugin(mod)
+        h = "cd" * 20
+        qb = self._client("qB", [{"hash": h, "state": "pausedDL"}])
+        tr = self._client("TR", [{"hash": h, "state": "stopped"}])
+        preferred = plugin._preferred_clients([(qb, qb.list_completed()), (tr, tr.list_completed())])
+        self.assertEqual(preferred[h], "qB")
+
+    def test_unique_hash_keeps_owner(self):
+        plugin = support.make_plugin(mod)
+        qb = self._client("qB", [{"hash": "11" * 20, "state": "pausedDL"}])
+        tr = self._client("TR", [{"hash": "22" * 20, "state": "uploading"}])
+        preferred = plugin._preferred_clients([(qb, qb.list_completed()), (tr, tr.list_completed())])
+        self.assertEqual(preferred["11" * 20], "qB")
+        self.assertEqual(preferred["22" * 20], "TR")
+
+    def test_seeding_state_recognised(self):
+        for state in ("uploading", "stalledUP", "forcedUP", "seeding"):
+            self.assertTrue(mod.ColaCrossSeed._is_seeding(state), state)
+        for state in ("pausedDL", "downloading", "stopped", ""):
+            self.assertFalse(mod.ColaCrossSeed._is_seeding(state), state)
+
+
+class TargetClientTest(unittest.TestCase):
+    """手动指定目标下载器时，应覆盖「谁在做种」的自动判断。"""
+
+    def test_override_to_tr(self):
+        plugin = support.make_plugin(mod, _target_client="TR")
+        h = "ab" * 20
+        qb = support.FakeClient(); qb.name = "qB"
+        tr = support.FakeClient(); tr.name = "TR"
+        scanned = [(qb, [{"hash": h, "state": "uploading"}]),
+                   (tr, [{"hash": h, "state": "pausedDL"}])]
+        self.assertEqual(plugin._preferred_clients(scanned)[h], "TR")
+
+    def test_override_ignored_when_client_lacks_hash(self):
+        plugin = support.make_plugin(mod, _target_client="TR")
+        h = "cd" * 20
+        qb = support.FakeClient(); qb.name = "qB"
+        tr = support.FakeClient(); tr.name = "TR"
+        scanned = [(qb, [{"hash": h, "state": "uploading"}]),
+                   (tr, [{"hash": "ee" * 20, "state": "uploading"}])]
+        self.assertEqual(plugin._preferred_clients(scanned)[h], "qB")
+
+
 class PlaceTest(unittest.TestCase):
     def test_duplicate_short_circuits(self):
         plugin = support.make_plugin(mod)

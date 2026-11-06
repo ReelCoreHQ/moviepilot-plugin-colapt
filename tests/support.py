@@ -198,6 +198,7 @@ def make_plugin(module, store=None, **attrs):
     plugin._add_label = ""
     plugin._inherit_tags = True
     plugin._extra_tags = ""
+    plugin._target_client = ""
     for key, value in attrs.items():
         setattr(plugin, key, value)
     return plugin
