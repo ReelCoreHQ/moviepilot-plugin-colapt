@@ -352,6 +352,37 @@ class CaptchaTest(unittest.TestCase):
         self.assertIn("502", plugin.get_data("captcha_error"))
 
 
+class TagMemoryTest(unittest.TestCase):
+    """自愈删种子会把用户/MP 打的标签一起抹掉，重新补种时得原样加回去（issue #11）。"""
+
+    def test_remembers_and_returns(self):
+        plugin = support.make_plugin(mod)
+        plugin._remember_tags({"AA" * 20: "可乐辅种, 已整理,订阅"})
+        tags = plugin._take_tags("aa" * 20)
+        self.assertIn("已整理", tags)
+        self.assertIn("订阅", tags)
+        self.assertNotIn(mod.MANDATORY_TAG, tags, "自己的标签不该被记忆")
+        self.assertEqual(plugin._take_tags("aa" * 20), "", "取走即删")
+
+    def test_merges_across_rounds(self):
+        plugin = support.make_plugin(mod)
+        plugin._remember_tags({"bb" * 20: "已整理"})
+        plugin._remember_tags({"bb" * 20: "订阅,已整理"})
+        tags = plugin._take_tags("bb" * 20)
+        self.assertEqual(tags, "已整理,订阅")
+
+    def test_only_own_tag_is_ignored(self):
+        plugin = support.make_plugin(mod)
+        plugin._remember_tags({"cc" * 20: mod.MANDATORY_TAG})
+        self.assertEqual(plugin._take_tags("cc" * 20), "")
+
+    def test_capped(self):
+        plugin = support.make_plugin(mod, store={"tag_memory": {("%040x" % i): "t" for i in range(800)}})
+        plugin._remember_tags({"ff" * 20: "新标签"})
+        self.assertEqual(len(plugin._tag_memory()), plugin.TAG_MEMORY_LIMIT)
+        self.assertEqual(plugin._take_tags("ff" * 20), "新标签")
+
+
 class PlaceTest(unittest.TestCase):
     def test_duplicate_short_circuits(self):
         plugin = support.make_plugin(mod)
