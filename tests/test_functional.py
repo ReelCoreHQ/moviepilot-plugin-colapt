@@ -383,6 +383,38 @@ class TagMemoryTest(unittest.TestCase):
         self.assertEqual(plugin._take_tags("ff" * 20), "新标签")
 
 
+class TagComposeTest(unittest.TestCase):
+    """辅种时标签怎么拼：强制标签 + 原种子标签（可关）+ 额外标签（issue #11）。"""
+
+    def _place_label(self, **attrs):
+        plugin = support.make_plugin(mod, **attrs)
+        client = support.FakeClient(add_result="ok")
+        stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0,
+                 "duplicate": 0, "retried": 0, "already": 0, "trackers": 0}
+        torrent = {"save_path": "/d", "category": "", "tags": "可乐PT, 已整理,订阅"}
+        plugin._place(client, b"t", torrent, "k", stats, "filled")
+        return client.added[0]["label"] if client.added else ""
+
+    def test_inherits_source_tags(self):
+        label = self._place_label(_inherit_tags=True, _extra_tags="")
+        self.assertIn("可乐PT", label)
+        self.assertIn("已整理", label)
+        self.assertIn("订阅", label)
+
+    def test_can_disable_inherit(self):
+        label = self._place_label(_inherit_tags=False, _extra_tags="")
+        self.assertEqual(label, "")
+
+    def test_extra_tags(self):
+        label = self._place_label(_inherit_tags=False, _extra_tags="可乐PT, 辅种")
+        self.assertEqual(label, "可乐PT,辅种")
+
+    def test_merges_without_duplicates(self):
+        label = self._place_label(_inherit_tags=True, _extra_tags="可乐PT,已整理")
+        parts = label.split(",")
+        self.assertEqual(len(parts), len(set(parts)), f"标签重复了：{label}")
+
+
 class PlaceTest(unittest.TestCase):
     def test_duplicate_short_circuits(self):
         plugin = support.make_plugin(mod)

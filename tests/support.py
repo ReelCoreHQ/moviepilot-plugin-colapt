@@ -196,6 +196,8 @@ def make_plugin(module, store=None, **attrs):
     plugin._fallback_skip_check = True
     plugin._retry_failed = True
     plugin._add_label = ""
+    plugin._inherit_tags = True
+    plugin._extra_tags = ""
     for key, value in attrs.items():
         setattr(plugin, key, value)
     return plugin
