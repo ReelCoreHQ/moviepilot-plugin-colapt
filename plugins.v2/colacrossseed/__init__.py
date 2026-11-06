@@ -650,7 +650,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.16"
+    plugin_version = "0.10.17"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -2503,7 +2503,8 @@ class ColaCrossSeed(_PluginBase):
         report = self.get_data("test_report") or self._test_report or {}
         pending = self._pending()
         blocks: List[dict] = [
-            {"component": "div", "text": f"已登录可乐PT。上次运行：{last.get('at', '未运行')}；"
+            # 版本写到页面上：用户在 issue 里反馈时，第一眼就能看到自己装的是哪一版
+            {"component": "div", "text": f"插件版本 v{self.plugin_version}；已登录可乐PT。上次运行：{last.get('at', '未运行')}；"
                                          f"可乐补种 {last.get('added', 0)}，其他站 {last.get('filled', 0)}，"
                                          f"重复 {last.get('duplicate', 0)}，失败 {last.get('failed', 0)}；"
                                          f"待重试 {len(pending)} 个。"}
