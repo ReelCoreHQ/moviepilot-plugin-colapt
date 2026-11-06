@@ -33,6 +33,16 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType
 
+# 段错误时把当时的线程栈打进日志（MoviePilot 直接被 SIGSEGV 杀掉时，只有内核那一行
+# "segfault at 1 ... libpython3.14.so" 是没法定位的）。enable() 只是注册信号处理器，
+# 不改变任何业务行为。
+try:
+    import faulthandler
+
+    faulthandler.enable()
+except Exception:  # 老解释器/受限环境忽略
+    pass
+
 COLA_BASE = "https://www.colapt.com"
 # 可乐PT 发布种子时会给 info.source 盖的章。同一份文件在别站有别的 source，
 # info_hash 因此不同，匹配时必须归一化（见 _torrent_info_hash_variants）。
@@ -604,7 +614,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.13"
+    plugin_version = "0.10.14"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
