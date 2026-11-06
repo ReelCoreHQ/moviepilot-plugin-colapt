@@ -415,6 +415,8 @@ class QBittorrentClient(_Client):
                     "size": item.get("size") or item.get("total_size") or 0,
                     # 标签要带上：辅种时可能要「继承原种子标签」（issue #11）
                     "tags": item.get("tags") or "",
+                    # 状态：同一颗种子出现在多个下载器时，优先在「正在做种」的那个里辅
+                    "state": item.get("state") or "",
                 })
             return out
         except Exception as err:
@@ -602,7 +604,8 @@ class TransmissionClient(_Client):
     def list_completed(self) -> List[Dict[str, Any]]:
         rsp = self._rpc({
             "method": "torrent-get",
-            "arguments": {"fields": ["hashString", "name", "downloadDir", "labels", "percentDone", "totalSize"]},
+            "arguments": {"fields": ["hashString", "name", "downloadDir", "labels",
+                                     "percentDone", "totalSize", "status"]},
         })
         if not rsp:
             return []
@@ -610,12 +613,16 @@ class TransmissionClient(_Client):
         for item in (rsp.get("arguments") or {}).get("torrents") or []:
             if item.get("percentDone") != 1:
                 continue
+            status = item.get("status")
             out.append({
                 "hash": (item.get("hashString") or "").lower(),
                 "name": item.get("name") or "",
                 "save_path": item.get("downloadDir") or "",
                 "category": ",".join(item.get("labels") or []),
                 "size": item.get("totalSize") or 0,
+                "tags": ",".join(item.get("labels") or []),
+                # Transmission: status 6 = seeding（见 rpc-spec）
+                "state": "uploading" if status == 6 else str(status or ""),
             })
         return out
 
@@ -650,7 +657,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.18"
+    plugin_version = "0.10.19"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -681,6 +688,7 @@ class ColaCrossSeed(_PluginBase):
     _iyuu_token = ""
     _sites_mode = "merge"
     _add_label = ""
+    _target_client = ""       # 辅种加到哪个下载器：留空=自动（优先正在做种的那台）
     _inherit_tags = True      # 辅种时继承原种子已有的标签（站点标签、已整理、订阅…）
     _extra_tags = ""          # 额外附加的标签，逗号分隔
     _fallback_skip_check = True
@@ -713,6 +721,7 @@ class ColaCrossSeed(_PluginBase):
             self._iyuu_token = str(config.get("iyuu_token") or "")
             self._sites_mode = str(config.get("sites_mode") or "merge")
             self._add_label = str(config.get("add_label") or "").strip()
+            self._target_client = str(config.get("target_client") or "").strip()
             self._inherit_tags = bool(config.get("inherit_tags", True))
             self._extra_tags = str(config.get("extra_tags") or "").strip()
             self._fallback_skip_check = bool(config.get("fallback_skip_check", True))
@@ -757,6 +766,7 @@ class ColaCrossSeed(_PluginBase):
             "iyuu_token": self._iyuu_token,
             "sites_mode": self._sites_mode,
             "add_label": self._add_label,
+            "target_client": self._target_client,
             "inherit_tags": self._inherit_tags,
             "extra_tags": self._extra_tags,
             "fallback_skip_check": self._fallback_skip_check,
@@ -1332,6 +1342,51 @@ class ColaCrossSeed(_PluginBase):
         return sites
 
     # ---------------- 下载器 ----------------
+
+    @staticmethod
+    def _is_seeding(state: str) -> bool:
+        """这个状态算不算「正在做种」。qB 用 uploading/stalledUP/forcedUP…，TR 这里统一映射成 uploading。"""
+        text = str(state or "").strip().lower()
+        if not text:
+            return False
+        return text in ("uploading", "stalledup", "forcedup", "queuedup") or "seed" in text
+
+    def _preferred_clients(self, scanned: List[Tuple["_Client", List[Dict[str, Any]]]]) -> Dict[str, str]:
+        """同一颗种子出现在多个下载器里时，决定「归谁管」。
+
+        典型场景（用户报的 bug）：qB 负责下载、Transmission 负责保种，两边都有同一颗；
+        以前按扫描顺序只认第一个下载器，于是补种全落到 qB 上。现在优先选**正在做种**的那个，
+        都没在做种才看扫描顺序。
+        """
+        first: Dict[str, str] = {}
+        seeding: Dict[str, List[str]] = {}
+        for client, torrents in scanned:
+            for torrent in torrents:
+                info_hash = torrent.get("hash")
+                if not info_hash:
+                    continue
+                first.setdefault(info_hash, client.name)
+                if self._is_seeding(torrent.get("state")):
+                    names = seeding.setdefault(info_hash, [])
+                    if client.name not in names:
+                        names.append(client.name)
+        preferred: Dict[str, str] = {}
+        for info_hash, name in first.items():
+            candidates = seeding.get(info_hash) or []
+            preferred[info_hash] = candidates[0] if candidates else name
+        # 用户显式指定了目标下载器时，覆盖自动判断（只对它确实有的种子生效）
+        wanted = (self._target_client or "").strip()
+        if wanted:
+            holders: Dict[str, List[str]] = {}
+            for client, torrents in scanned:
+                for torrent in torrents:
+                    info_hash = torrent.get("hash")
+                    if info_hash:
+                        holders.setdefault(info_hash, []).append(client.name)
+            for info_hash, names in holders.items():
+                if wanted in names:
+                    preferred[info_hash] = wanted
+        return preferred
 
     def _mp_clients(self) -> List[_Client]:
         """枚举 MoviePilot「设置 → 下载器」里的**每一个**实例。
@@ -2246,6 +2301,10 @@ class ColaCrossSeed(_PluginBase):
             if torrents:
                 scanned.append((client, torrents))
                 all_hashes.update(t["hash"] for t in torrents if t.get("hash"))
+        # 同一颗种子在多个下载器里都有时，只在「正在做种」的那个里补种（见 _preferred_clients）。
+        preferred = self._preferred_clients(scanned)
+        if len(scanned) > 1:
+            logger.info(f"下载器 {len(scanned)} 个；同一颗种子跨客户端的归属已按「谁在做种」决定")
         # IYUU 云端匹配（有 token 时）：把客户端 hash 发过去，拿回「站点 + torrent_id」。
         sid_map: Dict[int, Dict[str, str]] = {}
         iyuu_hits: Dict[str, List[Dict[str, Any]]] = {}
@@ -2290,6 +2349,10 @@ class ColaCrossSeed(_PluginBase):
             for torrent in torrents:
                 if self._event.is_set():
                     break
+                owner = preferred.get(torrent["hash"])
+                if owner and owner != client.name:
+                    # 这颗归另一个下载器（通常是正在保种的那台），别在这里重复加
+                    continue
                 # RSS 通道：RSS 的 guid 就是站点侧 info_hash，命中即「这个站有同一颗种子」。
                 # 同一 info_hash qB 不可能再加一颗（会回 Fails.），这时正确动作是给**已有**的
                 # 那颗种子补上这个站的 announce —— 文件一个字节都不用多，站方照样记做种。
@@ -2635,6 +2698,10 @@ class ColaCrossSeed(_PluginBase):
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VSwitch", "props": {"model": "inherit_tags",
                              "label": "继承原种子的标签（站点标签、已整理等）"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VTextField", "props": {"model": "target_client",
+                             "label": "辅种加到哪个下载器（留空=自动，填 MP 里下载器的名字）",
+                             "placeholder": "留空：优先正在做种的那台"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
@@ -2682,7 +2749,7 @@ class ColaCrossSeed(_PluginBase):
             "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
             "skip_check": False, "max_per_hour": 0, "max_per_site": 20, "direction": "both",
             "use_mp_clients": True, "clients_json": "", "clients_lines": "", "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "", "sites_mode": "merge",
-            "add_label": "", "extra_tags": "", "inherit_tags": True,
+            "add_label": "", "extra_tags": "", "inherit_tags": True, "target_client": "",
             "fallback_skip_check": True, "retry_failed": True,
         }
 
@@ -2714,13 +2781,14 @@ class _MPClient(_Client):
                     category = getattr(torrent, "category", "") or ""
                     size = getattr(torrent, "size", 0) or 0
                     tags = getattr(torrent, "tags", "") or getattr(torrent, "tag", "") or ""
+                state = torrent.get("state", "") if isinstance(torrent, dict) else getattr(torrent, "state", "")
                 if not hash_str:
                     continue
                 if isinstance(tags, (list, tuple)):
                     tags = ",".join(str(t) for t in tags)
                 out.append({"hash": str(hash_str).lower(), "name": name,
                             "save_path": save_path, "category": category, "size": size,
-                            "tags": str(tags or "")})
+                            "tags": str(tags or ""), "state": str(state or "")})
         except Exception as err:
             logger.error(f"MP 下载器 {self.name} 读取失败：{err}")
         return out
