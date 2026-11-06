@@ -5,7 +5,7 @@
 
 > 这不是 IYUU / ReseedPuppy 的替代品：它只服务可乐PT 用户，配置更少，跑在 MoviePilot 里。
 
-> 使用说明（截图 + 常见问题）：<https://www.colapt.com/wiki/moviepilot-crossseed>
+> 使用说明（截图 + 常见问题 + 匹配原理）：<https://www.colapt.com/wiki/moviepilot-crossseed>
 
 ## 安装
 
@@ -121,7 +121,9 @@ https://pt.example.com,abcdef1234567890abcdef1234567890
 
 | 通道 | 依赖 | 适用 |
 |---|---|---|
-| 可乐 `/api/v1/plugin/match` | 可乐PT 账号 | 客户端里的种子在可乐有没有（主通道） |
+| 可乐 `/api/v1/plugin/match` | 可乐PT 账号 | 客户端里的种子在可乐有没有（主通道，按 `info_hash` / `source_info_hash`） |
+| `info.source` 归一化 | 同上（qB 4.5+ 能导出 `.torrent`） | 可乐发布时会把 `info.source` 盖成自己的章，同一份文件在不同站 info_hash 必然不同；把 source 换掉再算哈希去反查 |
+| **文件清单指纹 `content_key`** | 站点接口 | 「相对路径 + 字节数」的 SHA1，与谁重新打包无关；不需要导出种子，Transmission / 老 qB 也能用 |
 | 站点 `/api/pieces-hash` | 站点开放 pieces-hash 接口 | 有该接口的 NexusPHP 站 |
 | **站点 RSS（`rsskey`）** | 站点 RSS 密钥 | 没有 pieces-hash 的站（如 观众 audiences.me）。NexusPHP 的 `torrentrss.php` 每条 item 带 `guid=info_hash` 和 `enclosure` 直链，按 info_hash 精确匹配，不靠标题猜 |
 | IYUU 云端 | IYUU token | 收录在 IYUU 的站，按 info_hash 全站匹配 |
@@ -147,7 +149,7 @@ RSS 命中的是**同一 info_hash**，qB 不允许同 hash 双开，所以这�
 `main` 开了分支保护：**功能测试全绿 + 必须走 PR** 才能合入，直接 push 会被拒。
 
 ```bash
-# 27 个离线功能测试：不联网、不依赖 MoviePilot 运行时（app.* / bencode 缺失时自动打桩）
+# 44 个离线功能测试：不联网、不依赖 MoviePilot 运行时（app.* / bencode 缺失时自动打桩）
 python -m unittest discover -s tests -v
 ```
 
