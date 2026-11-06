@@ -252,3 +252,25 @@ def _skip(buf: bytes, pos: int) -> int:
         return pos + 1
     colon = buf.index(b":", pos)
     return colon + 1 + int(buf[pos:colon])
+
+
+class FakeMPModule:
+    """假扮 MoviePilot 的下载器模块：记录 add_torrent 收到了什么参数。"""
+
+    def __init__(self, torrents=None, accept=True, strict=False):
+        self.torrents = list(torrents or [])
+        self.accept = accept
+        self.strict = strict
+        self.calls = []
+
+    def list(self):
+        return list(self.torrents)
+
+    def add(self, **kwargs):
+        # strict 模拟老版本 MP 的 add_torrent：只认 content/download_dir，
+        # 多传参数就抛 TypeError（插件的降级分支应该能兜住）。
+        if self.strict and set(kwargs) - {"content", "download_dir"}:
+            self.calls.append({"rejected": sorted(kwargs)})
+            raise TypeError("unexpected keyword arguments")
+        self.calls.append(kwargs)
+        return (self.accept, ["id"] if self.accept else [])

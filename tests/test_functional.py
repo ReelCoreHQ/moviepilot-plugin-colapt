@@ -415,6 +415,46 @@ class TagComposeTest(unittest.TestCase):
         self.assertEqual(len(parts), len(set(parts)), f"标签重复了：{label}")
 
 
+class MPClientTest(unittest.TestCase):
+    """MP 的下载器模块：跳过校验与标签必须真的传下去（用户报「跳过校验没生效、没标签」）。"""
+
+    def _client(self, module, name="MP-测试"):
+        return mod._MPClient(name, module.list, module.add)
+
+    def test_passes_skip_checking_and_tag(self):
+        module = support.FakeMPModule()
+        client = self._client(module)
+        result = client.add(b"torrent", "/downloads", True, "可乐辅种,可乐PT")
+        self.assertEqual(result, "ok")
+        call = module.calls[0]
+        self.assertIs(call["skip_checking"], True)
+        self.assertEqual(call["tag"], "可乐辅种,可乐PT")
+        self.assertEqual(call["download_dir"], "/downloads")
+
+    def test_skip_check_false_is_explicit(self):
+        module = support.FakeMPModule()
+        self._client(module).add(b"t", "/d", False)
+        self.assertIs(module.calls[0]["skip_checking"], False)
+        self.assertNotIn("tag", module.calls[0])
+
+    def test_old_mp_without_kwargs_falls_back(self):
+        module = support.FakeMPModule(strict=True)
+        client = self._client(module)
+        self.assertEqual(client.add(b"t", "/d", True, "x"), "ok")
+        self.assertIn("rejected", module.calls[0], "严格模式应先拒掉新参数")
+        self.assertEqual(module.calls[-1], {"content": b"t", "download_dir": "/d"})
+
+    def test_duplicate_detected_via_scan(self):
+        module = support.FakeMPModule(torrents=[{"hash": "AB" * 20, "name": "x"}], accept=False)
+        client = self._client(module)
+        self.assertEqual(client.add(b"t", "/d", True, hash_hint="ab" * 20), "dup")
+
+    def test_list_includes_tags(self):
+        module = support.FakeMPModule(torrents=[{"hash": "cd" * 20, "name": "x", "tags": "a,b"}])
+        got = self._client(module).list_completed()
+        self.assertEqual(got[0]["tags"], "a,b")
+
+
 class PlaceTest(unittest.TestCase):
     def test_duplicate_short_circuits(self):
         plugin = support.make_plugin(mod)
