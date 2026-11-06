@@ -22,7 +22,6 @@ from urllib.parse import urlencode, urljoin
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -605,7 +604,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.12"
+    plugin_version = "0.10.13"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -2030,10 +2029,12 @@ class ColaCrossSeed(_PluginBase):
         if not sites:
             return ["ℹ️ 没有配置其他站（可粘贴 IYUU 配置或填「域名,passkey」）"]
         lines: List[str] = []
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            for name, level, msg in pool.map(self._test_one_site, sites):
-                mark = {"ok": "✅", "warn": "⚠️"}.get(level, "❌")
-                lines.append(f"{mark} {name}：{msg}")
+        # 以前用线程池并发探测；现在一律顺序跑 —— 见 auto_seed 里 RSS 索引那段的说明：
+        # 在解释器层面，多线程里做网络/第三方 C 扩展会放大崩溃面，宁可慢一点。
+        for site in sites:
+            name, level, msg = self._test_one_site(site)
+            mark = {"ok": "✅", "warn": "⚠️"}.get(level, "❌")
+            lines.append(f"{mark} {name}：{msg}")
         good = sum(1 for line in lines if line.startswith("✅"))
         warn = sum(1 for line in lines if line.startswith("⚠️"))
         lines.insert(0, f"其他站 {len(sites)} 个，可匹配 {good} 个"
@@ -2155,12 +2156,15 @@ class ColaCrossSeed(_PluginBase):
         rss_idx: Dict[str, Dict[str, Dict[str, Any]]] = {}
         rss_by_url: Dict[str, Dict[str, str]] = {}
         if rss_sites:
-            with ThreadPoolExecutor(max_workers=6) as pool:
-                for site, idx in zip(rss_sites, pool.map(self._rss_index, rss_sites)):
-                    if idx:
-                        key = site.get("url") or site.get("name") or ""
-                        rss_idx[key] = idx
-                        rss_by_url[key] = site
+            # 顺序拉，不开线程池。历史上这里并发拉 + 并发写插件数据，在 CPython 3.14 上
+            # 会偶发整解释器段错误（MoviePilot 直接 SIGSEGV 重启，见 2026-11 的崩溃排查）。
+            # 26 个站顺序拉约 30–60 秒，比整个任务动辄十几分钟便宜得多。
+            for site in rss_sites:
+                idx = self._rss_index(site)
+                if idx:
+                    key = site.get("url") or site.get("name") or ""
+                    rss_idx[key] = idx
+                    rss_by_url[key] = site
             logger.info(f"RSS 通道 {len(rss_idx)}/{len(rss_sites)} 个站有索引，"
                         f"共 {sum(len(v) for v in rss_idx.values())} 条")
         for client, torrents in scanned:
