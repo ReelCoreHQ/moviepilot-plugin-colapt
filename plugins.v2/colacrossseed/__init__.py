@@ -650,7 +650,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.17"
+    plugin_version = "0.10.18"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -2706,29 +2706,63 @@ class _MPClient(_Client):
                     save_path = torrent.get("save_path") or torrent.get("download_dir") or ""
                     category = torrent.get("category") or ""
                     size = torrent.get("size") or torrent.get("total_size") or 0
+                    tags = torrent.get("tags") or torrent.get("tag") or ""
                 else:
                     hash_str = getattr(torrent, "hash", None) or getattr(torrent, "hashString", "") or ""
                     name = getattr(torrent, "name", "") or ""
                     save_path = getattr(torrent, "save_path", "") or getattr(torrent, "download_dir", "") or ""
                     category = getattr(torrent, "category", "") or ""
                     size = getattr(torrent, "size", 0) or 0
+                    tags = getattr(torrent, "tags", "") or getattr(torrent, "tag", "") or ""
                 if not hash_str:
                     continue
+                if isinstance(tags, (list, tuple)):
+                    tags = ",".join(str(t) for t in tags)
                 out.append({"hash": str(hash_str).lower(), "name": name,
-                            "save_path": save_path, "category": category, "size": size})
+                            "save_path": save_path, "category": category, "size": size,
+                            "tags": str(tags or "")})
         except Exception as err:
             logger.error(f"MP 下载器 {self.name} 读取失败：{err}")
         return out
 
+    def has(self, info_hash: str) -> bool:
+        """MP 客户端没有现成的「有没有这颗」接口，用扫描结果做一次短缓存。"""
+        if not info_hash:
+            return False
+        cached = getattr(self, "_hash_cache", None)
+        if cached is None or time.time() - getattr(self, "_hash_cache_at", 0) > 30:
+            cached = {t.get("hash") for t in self.list_completed() if t.get("hash")}
+            self._hash_cache, self._hash_cache_at = cached, time.time()
+        return str(info_hash).lower() in cached
+
     def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
             hash_hint: str = "") -> str:
+        """MP 的下载器模块把多余参数透传给 qB/TR，这里必须显式要求「跳过校验」和标签。
+
+        之前只传了 content/download_dir —— 于是「跳过校验」形同虚设（每次都要重校验），
+        标签也全丢（补进来的种子在 qB 里是「无标签」）。
+        """
+        kwargs: Dict[str, Any] = {"content": torrent, "download_dir": save_path}
+        kwargs["skip_checking"] = bool(skip_check)
+        if label:
+            kwargs["tag"] = label
         try:
-            res = self._add(content=torrent, download_dir=save_path)
+            res = self._add(**kwargs)
+        except TypeError:
+            # 老版本 MP 的 add_torrent 不认 skip_checking/tag：退回最小参数，至少能加上
+            try:
+                res = self._add(content=torrent, download_dir=save_path)
+            except Exception as err:
+                logger.error(f"MP 下载器 {self.name} 添加失败：{err}")
+                return "fail"
         except Exception as err:
             logger.error(f"MP 下载器 {self.name} 添加失败：{err}")
             return "fail"
+        ok = res[0] if isinstance(res, tuple) else res
         # MP 的下载器模块对重复种子一般回 False 或者抛异常，拿不到更细的原因；
         # 有 hash 时再问一次客户端，能区分「已经在」和「真失败」。
-        if not res and hash_hint and self.has(hash_hint):
+        if not ok and hash_hint and self.has(hash_hint):
             return "dup"
-        return "ok" if res else "fail"
+        if ok:
+            self._hash_cache = None   # 加进去了，缓存作废
+        return "ok" if ok else "fail"
