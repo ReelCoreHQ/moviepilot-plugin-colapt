@@ -366,6 +366,14 @@ class _Client:
         """从客户端移除种子（默认不删文件）。"""
         return False
 
+    def tags_for(self, hashes: List[str]) -> Dict[str, str]:
+        """返回 {info_hash: "tag1, tag2"}；用于自愈删除前把用户/MP 打的标签记下来。"""
+        return {}
+
+    def add_tags(self, info_hash: str, tags: str) -> bool:
+        """给已有种子追加标签（不会覆盖原有标签）。"""
+        return False
+
     def close(self) -> None:
         pass
 
@@ -521,6 +529,32 @@ class QBittorrentClient(_Client):
             logger.warn(f"qBittorrent ({self.name}) 查询缺失种子失败：{err}")
             return []
 
+    def tags_for(self, hashes: List[str]) -> Dict[str, str]:
+        if not hashes:
+            return {}
+        try:
+            rsp = self._session.get(f"{self.url}/api/v2/torrents/info",
+                                    params={"hashes": "|".join(hashes)},
+                                    timeout=REQUEST_TIMEOUT)
+            if rsp.status_code == 200:
+                return {str(t.get("hash", "")).lower(): str(t.get("tags") or "")
+                        for t in (rsp.json() or []) if t.get("hash")}
+        except Exception as err:
+            logger.warn(f"qBittorrent ({self.name}) 读取标签失败：{err}")
+        return {}
+
+    def add_tags(self, info_hash: str, tags: str) -> bool:
+        if not info_hash or not tags:
+            return False
+        try:
+            rsp = self._session.post(f"{self.url}/api/v2/torrents/addTags",
+                                     data={"hashes": info_hash.lower(), "tags": tags},
+                                     timeout=REQUEST_TIMEOUT)
+            return rsp.status_code == 200
+        except Exception as err:
+            logger.warn(f"qBittorrent ({self.name}) 追加标签失败：{err}")
+            return False
+
     def delete(self, hashes: List[str], delete_files: bool = False) -> bool:
         if not hashes:
             return False
@@ -614,7 +648,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.14"
+    plugin_version = "0.10.15"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1405,7 +1439,12 @@ class ColaCrossSeed(_PluginBase):
             stats["duplicate"] = stats.get("duplicate", 0) + 1
             self._remember(key)
             return
+        remembered = self._take_tags(hash_hint) if hash_hint else ""
         result = client.add(data, save_path, self._skip_check, label, hash_hint)
+        if remembered and result in ("ok", "dup"):
+            # 先把种子放回去，再把删之前记下的标签补上（addTags 只追加不覆盖）
+            if client.add_tags(hash_hint, remembered):
+                logger.info(f"{hash_hint[:8]} 重新补种后已恢复原标签：{remembered}")
         if result == "ok":
             stats[bucket] += 1
             self._record_add()
@@ -1509,6 +1548,46 @@ class ColaCrossSeed(_PluginBase):
         """撤销一条去重记忆：客户端里已经没有这颗种子时，必须允许再补一次。"""
         done = [k for k in self._done() if k != key]
         self.save_data("done", done)
+
+    # 自愈删除时把种子原有的标签记下来：重新补种时原样加回去（issue #11）。
+    TAG_MEMORY_LIMIT = 800
+
+    def _tag_memory(self) -> Dict[str, str]:
+        try:
+            data = self.get_data("tag_memory") or {}
+            return {str(k).lower(): str(v) for k, v in data.items() if k and v} if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _remember_tags(self, mapping: Dict[str, str]) -> None:
+        if not mapping:
+            return
+        memory = self._tag_memory()
+        for info_hash, tags in mapping.items():
+            extra = [t.strip() for t in str(tags or "").split(",")
+                     if t.strip() and t.strip() != MANDATORY_TAG]
+            if not extra:
+                continue
+            merged = [t for t in (memory.get(str(info_hash).lower(), "").split(",") if memory.get(str(info_hash).lower()) else []) if t]
+            for tag in extra:
+                if tag not in merged:
+                    merged.append(tag)
+            memory[str(info_hash).lower()] = ",".join(merged)
+        if len(memory) > self.TAG_MEMORY_LIMIT:
+            keep = list(memory.items())[-self.TAG_MEMORY_LIMIT:]
+            memory = dict(keep)
+        self.save_data("tag_memory", memory)
+
+    def _take_tags(self, info_hash: str) -> str:
+        """取出这颗种子被删前记下的标签（取走即删，避免无限增长）。"""
+        info_hash = str(info_hash or "").lower()
+        if not info_hash:
+            return ""
+        memory = self._tag_memory()
+        tags = memory.pop(info_hash, "")
+        if tags:
+            self.save_data("tag_memory", memory)
+        return tags
 
     def _dead_hashes(self) -> List[str]:
         """文件确实缺失、被自愈清掉的 hash：这些不再重试，避免每小时加了又删。"""
@@ -2114,6 +2193,9 @@ class ColaCrossSeed(_PluginBase):
         for client in clients:
             missing = client.tagged_missing(MANDATORY_TAG)
             if missing:
+                # 用户/MP 给这些种子打的标签（已整理、订阅、MEDIA-AGENT…）不是我们的，
+                # 删种子会把它们一起抹掉；删之前记下来，重新补种时原样加回去（issue #11）。
+                self._remember_tags(client.tags_for(missing))
                 client.delete(missing)
                 self._mark_dead(missing)
                 logger.warn(f"{client.name}：清理 {len(missing)} 个文件缺失的辅种种（只删种子，不删文件）")
