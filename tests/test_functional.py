@@ -352,6 +352,41 @@ class CaptchaTest(unittest.TestCase):
         self.assertIn("502", plugin.get_data("captcha_error"))
 
 
+class ParallelCurlTest(unittest.TestCase):
+    """并发拉 RSS 靠 curl 子进程，Python 侧不开线程。"""
+
+    def test_parallel_results_in_order(self):
+        cmds = [["sh", "-c", "printf 'a\\n200'"], ["sh", "-c", "printf 'b\\n500'"],
+                ["sh", "-c", "printf 'c\\n404'"]]
+        got = mod._curl_parallel(cmds, [""] * 3, workers=2)
+        self.assertEqual([r.status_code for r in got], [200, 500, 404])
+        self.assertEqual([r.text for r in got], ["a", "b", "c"])
+
+    def test_bad_command_yields_zero(self):
+        got = mod._curl_parallel([["/nonexistent-binary-xyz"]], [""], workers=1)
+        self.assertEqual(got[0].status_code, 0)
+
+    def test_rss_needs_fetch_respects_cache(self):
+        plugin = support.make_plugin(mod, store={
+            "rss_cache": {"pt.example": {"at": int(time.time()), "items": {"ab" * 20: {"url": "u"}}}},
+        })
+        site = {"name": "示例", "url": "https://pt.example", "passkey": "p" * 32}
+        self.assertFalse(plugin._rss_needs_fetch(site), "缓存新鲜时不该再拉")
+        plugin2 = support.make_plugin(mod, store={"rss_cache": {"pt.example": {"at": 0, "items": {}}}})
+        self.assertTrue(plugin2._rss_needs_fetch(site))
+
+    def test_rss_needs_fetch_respects_interval(self):
+        plugin = support.make_plugin(mod, store={"rss_at": {"audiences.me": time.time()}})
+        site = {"name": "观众", "url": "https://audiences.me", "rsskey": "r" * 32}
+        self.assertFalse(plugin._rss_needs_fetch(site), "2 分钟保护期内不拉")
+
+    def test_prefetch_uses_first_try_only(self):
+        plugin = support.make_plugin(mod)
+        site = {"name": "朋友", "url": "https://pt.example", "passkey": "p" * 32, "rsskey": "r" * 32}
+        tries = plugin._rss_tries(site)
+        self.assertEqual(tries[0][2], "rsskey", "有 rsskey 时优先用它")
+
+
 class HttpResultJsonTest(unittest.TestCase):
     """站点回空 body / HTML 时不能把异常抛给 MoviePilot（用户报「执行失败 Expecting value」）。"""
 
