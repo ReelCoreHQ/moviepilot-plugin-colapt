@@ -70,8 +70,20 @@ class _HttpResult:
         self.content = content
         self.text = text
 
-    def json(self):
-        return json.loads(self.text)
+    def json(self, default=None):
+        """解析响应体；空 body / HTML 错误页 / 截断的 JSON 一律返回 default，不抛异常。
+
+        站点被 Cloudflare 挡一下时经常回「200 + 空 body」或者一页 HTML，
+        以前这里直接 json.loads，异常会一路冒到 MoviePilot，
+        整轮任务就报「执行失败 Expecting value: line 1 column 1 (char 0)」。
+        """
+        if not (self.text or "").strip():
+            return default
+        try:
+            return json.loads(self.text)
+        except Exception as err:
+            logger.warn(f"响应不是合法 JSON（{type(err).__name__}），按空处理：{self.text[:120]}")
+            return default
 
 
 def _curl(method: str, url: str, headers=None, params=None, json_body=None, data=None,
@@ -406,7 +418,7 @@ class QBittorrentClient(_Client):
             )
             rsp.raise_for_status()
             out = []
-            for item in rsp.json():
+            for item in (rsp.json() or []):
                 out.append({
                     "hash": (item.get("hash") or "").lower(),
                     "name": item.get("name") or "",
@@ -657,7 +669,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.19"
+    plugin_version = "0.10.20"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -2250,6 +2262,19 @@ class ColaCrossSeed(_PluginBase):
     # ---------------- 任务 ----------------
 
     def auto_seed(self):
+        """辅种主流程：任何未预料的异常都只记日志 + 站内通知，不要让 MoviePilot 报「执行失败」。"""
+        try:
+            self._auto_seed()
+        except Exception as err:
+            logger.error(f"辅种任务异常终止：{type(err).__name__}: {err}")
+            try:
+                self.post_message(mtype=NotificationType.Plugin,
+                                  title="【可乐PT辅种】本轮执行异常",
+                                  text=f"{type(err).__name__}: {err}\n下一轮会重新开始，详细栈见 MoviePilot 日志。")
+            except Exception:
+                pass
+
+    def _auto_seed(self):
         # 事件是类级 Event：reload/停止会把上一实例的 set 带过来，这里先清掉，
         # 否则本次任务会在第一个 torrent 就 break（表现为 matched=0、耗时 1 秒）。
         self._event.clear()
