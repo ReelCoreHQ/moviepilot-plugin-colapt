@@ -352,6 +352,26 @@ class CaptchaTest(unittest.TestCase):
         self.assertIn("502", plugin.get_data("captcha_error"))
 
 
+class HttpResultJsonTest(unittest.TestCase):
+    """站点回空 body / HTML 时不能把异常抛给 MoviePilot（用户报「执行失败 Expecting value」）。"""
+
+    def test_empty_body_returns_default(self):
+        self.assertIsNone(mod._HttpResult(200, b"", "").json())
+        self.assertEqual(mod._HttpResult(200, b"", "  \n ").json(default={}), {})
+
+    def test_html_body_returns_default(self):
+        html = "<html><body>502 Bad Gateway</body></html>"
+        self.assertIsNone(mod._HttpResult(200, html.encode(), html).json())
+        self.assertEqual(mod._HttpResult(502, html.encode(), html).json(default={}), {})
+
+    def test_valid_json_still_parsed(self):
+        body = '{"matched": [{"client_hash": "ab"}]}'
+        self.assertEqual(mod._HttpResult(200, body.encode(), body).json()["matched"][0]["client_hash"], "ab")
+
+    def test_truncated_json_returns_default(self):
+        self.assertEqual(mod._HttpResult(200, b'{"a":', '{"a":').json(default={}), {})
+
+
 class TagMemoryTest(unittest.TestCase):
     """自愈删种子会把用户/MP 打的标签一起抹掉，重新补种时得原样加回去（issue #11）。"""
 
