@@ -86,13 +86,9 @@ class _HttpResult:
             return default
 
 
-def _curl(method: str, url: str, headers=None, params=None, json_body=None, data=None,
-          timeout: int = 20, proxy: str = "") -> _HttpResult:
-    """用系统 curl 发请求。
-
-    为什么不用 requests：部分 NAS/容器镜像里的 python+OpenSSL 组合会被 Cloudflare 拦（握手超时），
-    而 curl 同一台机器可以正常访问；插件里对可乐PT 的请求因此走 curl，其它站点仍用 requests。
-    """
+def _curl_cmd(method: str, url: str, headers=None, params=None, json_body=None, data=None,
+              timeout: int = 20, proxy: str = "") -> Tuple[List[str], str]:
+    """拼出 curl 命令（返回 cmd 和最终 URL），不发请求；并发版和单发版共用。"""
     # -L：站点常把下载地址 302 到另一台机器（M-Team 的签名地址就跳一次），requests 默认跟随，
     # curl 不加就得自己处理，漏了会拿到 0 字节。
     cmd = ["curl", "-sS", "-L", "--max-time", str(timeout), "-X", method]
@@ -109,6 +105,18 @@ def _curl(method: str, url: str, headers=None, params=None, json_body=None, data
     for key, value in (headers or {}).items():
         cmd += ["-H", f"{key}: {value}"]
     cmd += ["-w", "\n%{http_code}", url]
+    return cmd, url
+
+
+def _curl(method: str, url: str, headers=None, params=None, json_body=None, data=None,
+          timeout: int = 20, proxy: str = "") -> _HttpResult:
+    """用系统 curl 发请求。
+
+    为什么不用 requests：部分 NAS/容器镜像里的 python+OpenSSL 组合会被 Cloudflare 拦（握手超时），
+    而 curl 同一台机器可以正常访问；插件里对可乐PT 的请求因此走 curl，其它站点仍用 requests。
+    """
+    cmd, url = _curl_cmd(method, url, headers=headers, params=params, json_body=json_body,
+                         data=data, timeout=timeout, proxy=proxy)
     result = _run_curl(cmd)
     if result.status_code == 0:
         # 有些网络里 colapt.com 会被解析到连不通的 Cloudflare 段（实测 188.114.9x 在国内网络
@@ -125,6 +133,43 @@ def _curl(method: str, url: str, headers=None, params=None, json_body=None, data
                 result = again
                 break
     return result
+
+
+def _curl_parallel(cmds: List[List[str]], urls: List[str], workers: int = 3) -> List[_HttpResult]:
+    """并发跑多条 curl（每条一个子进程，最多 workers 个同时在飞）。
+
+    刻意不用线程池：2026-11 那次 MoviePilot 段错误就是插件里的 ThreadPoolExecutor 引起的，
+    之后插件里不再出现线程；这里靠「网络等待交给子进程」实现并发，Python 侧始终是顺序的。
+    """
+    results: List[Optional[_HttpResult]] = [None] * len(cmds)
+    running: List[Tuple[int, Any]] = []
+    pending = list(enumerate(zip(cmds, urls)))
+    while pending or running:
+        while pending and len(running) < max(1, workers):
+            index, (cmd, _url) = pending.pop(0)
+            try:
+                running.append((index, subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                                        stderr=subprocess.DEVNULL)))
+            except Exception as err:
+                logger.warn(f"curl 启动失败：{err}")
+                results[index] = _HttpResult(0, b"", "")
+        if not running:
+            continue
+        index, proc = running.pop(0)
+        try:
+            out = proc.communicate()[0] or b""
+        except Exception as err:
+            logger.warn(f"curl 执行失败：{err}")
+            out = b""
+        body, status = out, 0
+        if b"\n" in body:
+            body, _, tail = body.rpartition(b"\n")
+            try:
+                status = int(tail.strip() or 0)
+            except ValueError:
+                status = 0
+        results[index] = _HttpResult(status, body, body.decode("utf-8", "replace"))
+    return [r or _HttpResult(0, b"", "") for r in results]
 
 
 def _run_curl(cmd: List[str]) -> _HttpResult:
@@ -669,7 +714,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.20"
+    plugin_version = "0.10.21"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1870,7 +1915,33 @@ class ColaCrossSeed(_PluginBase):
             data[host] = time.time()
             self.save_data("rss_at", data)
 
-    def _rss_fetch(self, site: Dict[str, str], timeout: int = 40) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    def _rss_tries(self, site: Dict[str, str]) -> List[Tuple[str, Dict[str, Any], str]]:
+        """这个站要按什么顺序、用什么密钥去拉 RSS（第一个候选也用于并发预取）。"""
+        host = site.get("url", "").split("://", 1)[-1].split("/")[0].lower()
+        rsskey = str(site.get("rsskey") or "")
+        passkey = str(site.get("passkey") or "")
+        personal = str(site.get("rss_url") or "").strip()
+        url = f"{site.get('url') or 'https://' + host}/torrentrss.php"
+        tries: List[Tuple[str, Dict[str, Any], str]] = []
+        if personal:
+            # 站点给的个人 RSS 链接（带签名/有效期）。家园、听听歌这类只认这个，通用参数一律过期。
+            tries.append((personal, {}, "rss_url"))
+        if rsskey:
+            tries.append((
+                url,
+                {"rsskey": rsskey, "linktype": "dl", "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
+                "rsskey",
+            ))
+        if passkey:
+            tries.append((
+                url,
+                {"passkey": passkey, "linktype": "dl", "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
+                "passkey",
+            ))
+        return tries
+
+    def _rss_fetch(self, site: Dict[str, str], timeout: int = 40,
+                   prefetched: Optional[Dict[str, "_HttpResult"]] = None) -> Tuple[Dict[str, Dict[str, Any]], str]:
         """真去拉一次 RSS，返回 (info_hash -> {url,title,size}, 用的是哪个密钥/为什么失败)。
 
         NexusPHP 的 torrentrss.php 每条 item 带着三样硬信息：
@@ -1893,30 +1964,16 @@ class ColaCrossSeed(_PluginBase):
             cached = ((self.get_data("rss_cache") or {}).get(host) or {}).get("items") or {}
             return (cached if isinstance(cached, dict) else {}), \
                 f"限流保护：{wait} 秒后才允许再拉（该站要求 ≥{interval} 秒一次）"
-        url = f"{site.get('url') or 'https://' + host}/torrentrss.php"
-        tries: List[Tuple[str, Dict[str, Any], str]] = []
-        if personal:
-            # 站点给的个人 RSS 链接（带签名/有效期）。家园、听听歌这类只认这个，通用参数一律过期。
-            tries.append((personal, {}, "rss_url"))
-        if rsskey:
-            tries.append((
-                url,
-                {"rsskey": rsskey, "linktype": "dl", "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
-                "rsskey",
-            ))
-        if passkey:
-            tries.append((
-                url,
-                {"passkey": passkey, "linktype": "dl", "inclbookmarked": 0, "allsec": 1, "rows": self.RSS_ROWS},
-                "passkey",
-            ))
+        tries = self._rss_tries(site)
         first_bad = ""
         last = "RSS 没有可用地址"
         self._rss_mark(host)   # 打点放在发请求之前：失败的尝试也算“拉过一次”
         for target, params, label in tries:
+            rsp = (prefetched or {}).get(label)
             try:
-                rsp = _site_request("GET", target, params=params, headers=_site_headers(site),
-                                    timeout=timeout, proxy=site.get("proxy") or "")
+                if rsp is None:
+                    rsp = _site_request("GET", target, params=params, headers=_site_headers(site),
+                                        timeout=timeout, proxy=site.get("proxy") or "")
             except Exception as err:
                 last = f"RSS 连不上（{type(err).__name__}）"
                 first_bad = first_bad or last
@@ -1947,18 +2004,65 @@ class ColaCrossSeed(_PluginBase):
         # 第一个失败原因通常最接近真相（后面的 passkey 尝试会被站点直接怼回 missing rsskey）
         return {}, first_bad or last
 
-    def _rss_index(self, site: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    RSS_WORKERS = 3   # 并发拉 RSS 的 curl 子进程数（不用线程，见 _curl_parallel）
+
+    def _rss_cached(self, host: str) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+        """返回 (缓存的索引, 缓存是否新鲜)。"""
+        cache = self.get_data("rss_cache") or {}
+        entry = cache.get(host) or {}
+        cached = dict(entry.get("items")) if isinstance(entry.get("items"), dict) else {}
+        fresh = bool(cached) and bool(entry.get("at")) and time.time() - int(entry["at"]) < self.RSS_TTL
+        return cached, fresh
+
+    def _rss_needs_fetch(self, site: Dict[str, str]) -> bool:
+        """这一轮要不要真去拉这个站的 RSS：缓存过期 + 不在最小间隔保护期 + 有可用密钥。"""
+        host = site.get("url", "").split("://", 1)[-1].split("/")[0].lower()
+        _cached, fresh = self._rss_cached(host)
+        if fresh:
+            return False
+        if not self._rss_tries(site):
+            return False
+        last = float(self._rss_at().get(host) or 0)
+        if last and (time.time() - last) < self._rss_interval(site):
+            return False
+        return True
+
+    def _rss_prefetch(self, sites: List[Dict[str, str]]) -> Dict[str, Dict[str, "_HttpResult"]]:
+        """把这一轮要拉的 RSS 用 N 个 curl 子进程并发拉下来（每个站只拉第一个候选）。
+
+        返回 host -> {label: _HttpResult}；_rss_index 会先用这份结果，失败再按原顺序补试。
+        """
+        specs: List[Tuple[str, str, List[str], str]] = []
+        for site in sites:
+            tries = self._rss_tries(site)
+            if not tries:
+                continue
+            target, params, label = tries[0]
+            host = site.get("url", "").split("://", 1)[-1].split("/")[0].lower()
+            cmd, url = _curl_cmd("GET", target, params=params, headers=_site_headers(site),
+                                 timeout=40, proxy=site.get("proxy") or "")
+            specs.append((host, label, cmd, url))
+        if not specs:
+            return {}
+        logger.info(f"RSS 并发预取 {len(specs)} 个站（{self.RSS_WORKERS} 路 curl）")
+        results = _curl_parallel([x[2] for x in specs], [x[3] for x in specs],
+                                 workers=self.RSS_WORKERS)
+        out: Dict[str, Dict[str, _HttpResult]] = {}
+        for (host, label, _cmd, _url), rsp in zip(specs, results):
+            out.setdefault(host, {})[label] = rsp
+        return out
+
+    def _rss_index(self, site: Dict[str, str],
+                   prefetched: Optional[Dict[str, Dict[str, "_HttpResult"]]] = None) -> Dict[str, Dict[str, Any]]:
         """带缓存的 RSS 索引（info_hash -> {url,title,size}）：10 分钟内同一站只拉一次。
 
         拉失败**不覆盖已有索引**：站点偶尔限流一次，不应该把本来好用的通道关掉。
         """
         host = site.get("url", "").split("://", 1)[-1].split("/")[0].lower()
-        cache = self.get_data("rss_cache") or {}
-        entry = cache.get(host) or {}
-        cached = dict(entry.get("items")) if isinstance(entry.get("items"), dict) else {}
-        if cached and entry.get("at") and time.time() - int(entry["at"]) < self.RSS_TTL:
+        cached, fresh = self._rss_cached(host)
+        if fresh:
             return cached
-        items, note = self._rss_fetch(site)
+        items, note = self._rss_fetch(site, prefetched=(prefetched or {}).get(host))
         with self._rss_lock:
             notes = self.get_data("rss_notes") or {}
             if not isinstance(notes, dict):
@@ -2350,11 +2454,14 @@ class ColaCrossSeed(_PluginBase):
         rss_idx: Dict[str, Dict[str, Dict[str, Any]]] = {}
         rss_by_url: Dict[str, Dict[str, str]] = {}
         if rss_sites:
-            # 顺序拉，不开线程池。历史上这里并发拉 + 并发写插件数据，在 CPython 3.14 上
+            # 网络并发交给 curl 子进程（_curl_parallel），Python 侧仍然顺序执行：
+            # 历史上这里用 ThreadPoolExecutor 并发拉 + 并发写插件数据，在 CPython 3.14 上
             # 会偶发整解释器段错误（MoviePilot 直接 SIGSEGV 重启，见 2026-11 的崩溃排查）。
-            # 26 个站顺序拉约 30–60 秒，比整个任务动辄十几分钟便宜得多。
+            # 27 个站顺序拉要 15 分钟以上，3 路并发后降到几分钟。
+            need = [site for site in rss_sites if self._rss_needs_fetch(site)]
+            prefetched = self._rss_prefetch(need) if need else {}
             for site in rss_sites:
-                idx = self._rss_index(site)
+                idx = self._rss_index(site, prefetched)
                 if idx:
                     key = site.get("url") or site.get("name") or ""
                     rss_idx[key] = idx
