@@ -714,7 +714,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.21"
+    plugin_version = "0.10.22"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -2062,7 +2062,12 @@ class ColaCrossSeed(_PluginBase):
         cached, fresh = self._rss_cached(host)
         if fresh:
             return cached
-        items, note = self._rss_fetch(site, prefetched=(prefetched or {}).get(host))
+        prefetched_host = (prefetched or {}).get(host) or {}
+        if prefetched_host:
+            # 预取已经用 curl 打过这个站了：后面补试别的候选时别再让 requests 先撞一次
+            # （那些站大多是 Cloudflare 后面的站，requests 每次都要等到 20 秒超时才回退）。
+            _CURL_ONLY_HOSTS[host] = True
+        items, note = self._rss_fetch(site, prefetched=prefetched_host)
         with self._rss_lock:
             notes = self.get_data("rss_notes") or {}
             if not isinstance(notes, dict):
