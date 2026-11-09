@@ -395,8 +395,13 @@ class _Client:
         raise NotImplementedError
 
     def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
-            hash_hint: str = "") -> str:
-        """添加一颗种子，返回 "ok" / "dup"（客户端里已经有了）/ "fail"。"""
+            hash_hint: str = "", category: str = "", auto_tmm: bool = False) -> str:
+        """添加一颗种子，返回 "ok" / "dup"（客户端里已经有了）/ "fail"。
+
+        category / auto_tmm 是原种子的分类与自动管理状态：qB 开着「自动种子管理」时
+        下载路径由分类决定，辅种必须沿用原种子的分类，否则新种子会被放到别的目录、
+        校验全部失败（issue #23）。
+        """
         raise NotImplementedError
 
     def has(self, info_hash: str) -> bool:
@@ -474,6 +479,8 @@ class QBittorrentClient(_Client):
                     "tags": item.get("tags") or "",
                     # 状态：同一颗种子出现在多个下载器时，优先在「正在做种」的那个里辅
                     "state": item.get("state") or "",
+                    # 自动种子管理：开着时下载路径由分类决定，辅种要沿用同一套（issue #23）
+                    "auto_tmm": bool(item.get("auto_tmm")),
                 })
             return out
         except Exception as err:
@@ -546,13 +553,17 @@ class QBittorrentClient(_Client):
         return False
 
     def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
-            hash_hint: str = "") -> str:
+            hash_hint: str = "", category: str = "", auto_tmm: bool = False) -> str:
         data = {
             "savepath": save_path,
             "skip_checking": "true" if skip_check else "false",
             "paused": "false",
-            "autoTMM": "false",
+            # 原种子走自动管理时照样交给 qB 管：路径由分类决定，正好和原种子落在同一目录。
+            "autoTMM": "true" if auto_tmm else "false",
         }
+        if category:
+            # 分类是分类、标签是标签：以前把分类塞进 tags，既脏了标签又让路径对不上（issue #23）。
+            data["category"] = category
         # 强制标签：辅种一律带 MANDATORY_TAG，方便在 qB 里一眼筛出来/批量清理；
         # 用户自己填的 add_label 作为第二个标签附上（不填就只带强制标签）。
         tags = [MANDATORY_TAG] + ([label] if label and label != MANDATORY_TAG else [])
@@ -692,7 +703,7 @@ class TransmissionClient(_Client):
         return bool(((rsp.get("arguments") or {}).get("torrents")) or [])
 
     def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
-            hash_hint: str = "") -> str:
+            hash_hint: str = "", category: str = "", auto_tmm: bool = False) -> str:
         # Transmission 没有「跳过校验」参数：torrent-add 后由客户端自己校验，
         # 所以这里的 skip_check 只是语义占位，实际等价于总是校验。
         args = {
@@ -714,7 +725,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.22"
+    plugin_version = "0.10.23"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1557,10 +1568,12 @@ class ColaCrossSeed(_PluginBase):
             tags += [t.strip() for t in str(torrent.get("tags") or "").split(",")
                      if t.strip() and t.strip() != MANDATORY_TAG]
         tags += [t.strip() for t in str(self._extra_tags or "").split(",") if t.strip()]
-        base_label = self._add_label or torrent.get("category", "")
-        if base_label and base_label != MANDATORY_TAG:
-            tags.append(base_label)
+        # 用户显式填的「辅种标签」才是标签；原种子的分类走 category 字段，不进 tags。
+        if self._add_label and self._add_label != MANDATORY_TAG:
+            tags.append(self._add_label)
         label = ",".join(dict.fromkeys(tags))
+        category = str(torrent.get("category") or "").strip()
+        auto_tmm = bool(torrent.get("auto_tmm"))
         if site_key and self._site_budget_left(site_key) <= 0:
             stats["skipped"] = stats.get("skipped", 0) + 1
             return  # 这个站这一轮已经补满 max_per_site 颗
@@ -1570,7 +1583,8 @@ class ColaCrossSeed(_PluginBase):
             self._remember(key)
             return
         remembered = self._take_tags(hash_hint) if hash_hint else ""
-        result = client.add(data, save_path, self._skip_check, label, hash_hint)
+        result = client.add(data, save_path, self._skip_check, label, hash_hint,
+                            category=category, auto_tmm=auto_tmm)
         if remembered and result in ("ok", "dup"):
             # 先把种子放回去，再把删之前记下的标签补上（addTags 只追加不覆盖）
             if client.add_tags(hash_hint, remembered):
@@ -2827,7 +2841,7 @@ class ColaCrossSeed(_PluginBase):
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "add_label", "label": "辅种标签（留空则沿用原种分类）",
+                            {"component": "VTextField", "props": {"model": "add_label", "label": "辅种标签（可留空；分类会跟随原种子，不再塞进标签）",
                              "placeholder": "cross-seed"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "extra_tags",
@@ -2941,7 +2955,7 @@ class _MPClient(_Client):
         return str(info_hash).lower() in cached
 
     def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
-            hash_hint: str = "") -> str:
+            hash_hint: str = "", category: str = "", auto_tmm: bool = False) -> str:
         """MP 的下载器模块把多余参数透传给 qB/TR，这里必须显式要求「跳过校验」和标签。
 
         之前只传了 content/download_dir —— 于是「跳过校验」形同虚设（每次都要重校验），
@@ -2951,6 +2965,9 @@ class _MPClient(_Client):
         kwargs["skip_checking"] = bool(skip_check)
         if label:
             kwargs["tag"] = label
+        if category:
+            # 分类单独传，别混进标签；qB 开着自动管理时路径由它决定（issue #23）
+            kwargs["category"] = category
         try:
             res = self._add(**kwargs)
         except TypeError:

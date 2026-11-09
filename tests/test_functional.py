@@ -387,6 +387,71 @@ class ParallelCurlTest(unittest.TestCase):
         self.assertEqual(tries[0][2], "rsskey", "有 rsskey 时优先用它")
 
 
+class CategoryNotTagTest(unittest.TestCase):
+    """issue #23：原种子的分类不能被塞进新种子的标签，且要按分类/自动管理落盘。"""
+
+    def _place(self, **attrs):
+        plugin = support.make_plugin(mod, **attrs)
+        client = support.FakeClient(add_result="ok")
+        stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0,
+                 "duplicate": 0, "retried": 0, "already": 0, "trackers": 0}
+        torrent = {"save_path": "/downloads/剧流", "category": "剧流", "tags": "NovaHD",
+                   "auto_tmm": True}
+        plugin._place(client, b"t", torrent, "k", stats, "filled")
+        return client.added[0]
+
+    def test_category_not_in_tags(self):
+        added = self._place()
+        self.assertNotIn("剧流", added["label"], f"分类被塞进标签了：{added['label']}")
+        self.assertIn("NovaHD", added["label"], "原种子的标签仍应继承")
+
+    def test_category_and_auto_tmm_passed(self):
+        added = self._place()
+        self.assertEqual(added["category"], "剧流")
+        self.assertIs(added["auto_tmm"], True)
+
+    def test_qb_payload_uses_category_field(self):
+        client = mod.QBittorrentClient("qB", "http://127.0.0.1:8080")
+
+        class _Rsp:
+            status_code = 200
+            text = "Ok."
+
+        captured = {}
+
+        class _Session:
+            def post(self, url, files=None, data=None, timeout=None):
+                captured.update(data or {})
+                return _Rsp()
+
+        client._session = _Session()
+        self.assertEqual(client.add(b"t", "/downloads/剧流", True, "NovaHD,辅种",
+                                    category="剧流", auto_tmm=True), "ok")
+        self.assertEqual(captured.get("category"), "剧流")
+        self.assertEqual(captured.get("autoTMM"), "true")
+        self.assertEqual(captured.get("savepath"), "/downloads/剧流")
+        self.assertNotIn("剧流", captured.get("tags", ""), "分类不该出现在 tags 里")
+
+    def test_qb_payload_without_auto_tmm(self):
+        client = mod.QBittorrentClient("qB", "http://127.0.0.1:8080")
+
+        class _Rsp:
+            status_code = 200
+            text = "Ok."
+
+        captured = {}
+
+        class _Session:
+            def post(self, url, files=None, data=None, timeout=None):
+                captured.update(data or {})
+                return _Rsp()
+
+        client._session = _Session()
+        client.add(b"t", "/downloads", False, "", category="", auto_tmm=False)
+        self.assertEqual(captured.get("autoTMM"), "false")
+        self.assertNotIn("category", captured)
+
+
 class HttpResultJsonTest(unittest.TestCase):
     """站点回空 body / HTML 时不能把异常抛给 MoviePilot（用户报「执行失败 Expecting value」）。"""
 
