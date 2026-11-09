@@ -148,9 +148,10 @@ class FakeClient:
     def has(self, info_hash):
         return info_hash in self._has
 
-    def add(self, torrent, save_path, skip_check, label="", hash_hint=""):
+    def add(self, torrent, save_path, skip_check, label="", hash_hint="", category="", auto_tmm=False):
         self.added.append({"save_path": save_path, "skip_check": skip_check,
-                           "label": label, "hash_hint": hash_hint})
+                           "label": label, "hash_hint": hash_hint,
+                           "category": category, "auto_tmm": auto_tmm})
         return self._add_result
 
     def add_trackers(self, info_hash, urls):
