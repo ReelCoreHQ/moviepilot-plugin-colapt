@@ -63,6 +63,86 @@ COLA_FALLBACK_IPS = ("104.21.66.130", "172.67.132.88", "104.26.10.0")
 REQUEST_TIMEOUT = 20
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
 
+# ---------------- 可乐保种组 ----------------
+# 「可乐保种组」= 站点侧的定向保种计划：给授权成员开放一组资源池，成员按档位
+# （2T / 5T / 10T / 20T+）把池子纳入做种，**体积只能超、不能少**。
+# 站点的权限/资源接口尚未上线，这里先按预留的 v1 契约探测（见 docs/seed-group-api.md）：
+# 拿不到 200 就整块锁定，面板上直说缺什么，不静默失败。
+SEED_GROUP_TAG = "可乐保种组"
+SEED_GROUP_API = "/api/v1/plugin/seed-group"
+GIB = 1024 ** 3
+# 档位 -> 体积下限（GiB）
+SEED_GROUP_TIERS: Dict[str, int] = {"2T": 2048, "5T": 5120, "10T": 10240, "20T+": 20480}
+SEED_GROUP_TIER_LABELS: Dict[str, str] = {
+    "2T": "2T 档（≥ 2048 GiB）",
+    "5T": "5T 档（≥ 5120 GiB）",
+    "10T": "10T 档（≥ 10240 GiB）",
+    "20T+": "20T+ 档（≥ 20480 GiB）",
+}
+
+
+def seed_group_target_gib(tier: str) -> int:
+    """档位 → 体积下限（GiB）。未知档位退回最小档，绝不返回 0。"""
+    return SEED_GROUP_TIERS.get(str(tier or "").strip(), SEED_GROUP_TIERS["2T"])
+
+
+def _seed_group_size_gib(size: Any) -> float:
+    """站点返回的 size 是字节；也容忍已经是 GiB 的数字（< 1e6 当 GiB 看）。"""
+    try:
+        value = float(size or 0)
+    except Exception:
+        return 0.0
+    if value <= 0:
+        return 0.0
+    return value if value < 1e6 else value / GIB
+
+
+def seed_group_plan(items: List[Dict[str, Any]], target_gib: float) \
+        -> Tuple[List[Dict[str, Any]], float, float]:
+    """按档位挑种子：只超不少。
+
+    规则：
+      1. 官方标记排前面，同优先按体积从大到小（条数少、覆盖快）；
+      2. 若有一颗能一次性盖住剩余空间，就挑其中**最小**的那颗（超额最少）——
+         体积只超不少，但也不能为了凑数白塞几百 G；
+      3. 否则在放得下的里面挑最大的（best-fit decreasing），继续填；
+      4. 池子耗尽仍未到档位：返回缺口，调用方必须把缺口报出来，不能假装达标。
+
+    :return: (挑中的条目, 累计体积 GiB, 缺口 GiB)
+    """
+    pool: List[Dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        size = _seed_group_size_gib(item.get("size"))
+        if size <= 0:
+            continue
+        entry = dict(item)
+        entry["size_gib"] = size
+        pool.append(entry)
+    pool.sort(key=lambda x: (0 if x.get("official") else 1, -x["size_gib"],
+                             str(x.get("info_hash") or "")))
+    picked: List[Dict[str, Any]] = []
+    total = 0.0
+    remaining = float(target_gib)
+    while remaining > 1e-9 and pool:
+        # ① 有能一颗盖住剩余空间的：挑其中最小的（超额最少），收工
+        cover = [x for x in pool if x["size_gib"] >= remaining - 1e-9]
+        if cover:
+            choice = min(cover, key=lambda x: (x["size_gib"], 0 if x.get("official") else 1))
+            picked.append(choice)
+            total += choice["size_gib"]
+            break
+        # ② 没有能一次性盖住的：在放得下的里面挑最大的（条数少）
+        fit = [x for x in pool if x["size_gib"] <= remaining + 1e-9]
+        choice = fit[0]          # 排序已保证这是「放得下的里面最大的」
+        picked.append(choice)
+        pool.remove(choice)
+        total += choice["size_gib"]
+        remaining = float(target_gib) - total
+    shortfall = max(0.0, round(float(target_gib) - total, 3))
+    return picked, round(total, 3), shortfall
+
 
 class _HttpResult:
     def __init__(self, status: int, content: bytes, text: str):
@@ -725,7 +805,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.23"
+    plugin_version = "0.10.24"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -761,6 +841,13 @@ class ColaCrossSeed(_PluginBase):
     _extra_tags = ""          # 额外附加的标签，逗号分隔
     _fallback_skip_check = True
     _retry_failed = True
+    # ---- 可乐保种组（站点权限 API 未上线时整块锁定，见 docs/seed-group-api.md）----
+    _seedgroup_enabled = False
+    _seedgroup_tier = "2T"
+    _seedgroup_api_token = ""
+    _seedgroup_cron = "0 */6 * * *"
+    _seedgroup_save_path = ""
+    _seedgroup_skip_check = True
     _event = Event()
     _csrf = ""
     # host -> 可用的 pieces-hash 路径（憨憨是 /nexusapi/pieces-hash，其余多为 /api/pieces-hash）；"" 表示不支持
@@ -794,6 +881,15 @@ class ColaCrossSeed(_PluginBase):
             self._extra_tags = str(config.get("extra_tags") or "").strip()
             self._fallback_skip_check = bool(config.get("fallback_skip_check", True))
             self._retry_failed = bool(config.get("retry_failed", True))
+            # 可乐保种组：档位只认白名单里的四个，写错退回最小档（不能退化成「不保种」）
+            self._seedgroup_enabled = bool(config.get("seedgroup_enabled", False))
+            self._seedgroup_tier = str(config.get("seedgroup_tier") or "2T").strip()
+            if self._seedgroup_tier not in SEED_GROUP_TIERS:
+                self._seedgroup_tier = "2T"
+            self._seedgroup_api_token = str(config.get("seedgroup_api_token") or "").strip()
+            self._seedgroup_cron = str(config.get("seedgroup_cron") or "0 */6 * * *").strip()
+            self._seedgroup_save_path = str(config.get("seedgroup_save_path") or "").strip()
+            self._seedgroup_skip_check = bool(config.get("seedgroup_skip_check", True))
             try:
                 self._max_per_hour = max(0, min(2000, int(config.get("max_per_hour", 0) or 0)))
                 self._max_per_site = max(1, min(200, int(config.get("max_per_site", 20) or 20)))
@@ -839,6 +935,12 @@ class ColaCrossSeed(_PluginBase):
             "extra_tags": self._extra_tags,
             "fallback_skip_check": self._fallback_skip_check,
             "retry_failed": self._retry_failed,
+            "seedgroup_enabled": self._seedgroup_enabled,
+            "seedgroup_tier": self._seedgroup_tier,
+            "seedgroup_api_token": self._seedgroup_api_token,
+            "seedgroup_cron": self._seedgroup_cron,
+            "seedgroup_save_path": self._seedgroup_save_path,
+            "seedgroup_skip_check": self._seedgroup_skip_check,
         })
 
     # ---------------- 站点登录 / 匹配 / 下载 ----------------
@@ -2676,23 +2778,348 @@ class ColaCrossSeed(_PluginBase):
                       + (f"\n待下一轮重试：{len(self._pending())} 个" if self._pending() else "")),
             )
 
+    # ---------------- 可乐保种组 ----------------
+    #
+    # 与辅种是两条独立的腿：辅种是「客户端里已有 → 反向找可乐的种子」，
+    # 保种组是「站点资源池 → 按档位把池子搬进客户端」，体积只能超不能少。
+    # 站点侧权限 API 还没上线，所以这里的每一步都可以在「没开通」的状态下安全空转。
+
+    def _sg_headers(self) -> Dict[str, str]:
+        headers = {"Accept": "application/json"}
+        token = (self._seedgroup_api_token or "").strip()
+        if token:
+            headers["X-Seed-Group-Token"] = token
+        if self._session_token:
+            headers["Cookie"] = f"reelcore_session={self._session_token}"
+        return headers
+
+    def _sg_api(self, method: str, path: str, **kwargs) -> Optional[_HttpResult]:
+        try:
+            return _curl(method, f"{COLA_BASE}{SEED_GROUP_API}{path}",
+                         headers=self._sg_headers(), timeout=REQUEST_TIMEOUT, **kwargs)
+        except Exception as err:
+            logger.warn(f"保种组 API 请求失败 {path}：{err}")
+            return None
+
+    def seed_group_probe(self) -> Dict[str, Any]:
+        """探测站点侧的保种组权限 API（预留契约见 docs/seed-group-api.md）。
+
+        · 404/405/501 → 站点还没上线，整块锁定但不动任何其它功能
+        · 401/403     → token 缺失或无效
+        · 200         → 以站点返回的 enabled / tier / quota_gib 为准（站点额度优先）
+        """
+        tier = self._seedgroup_tier if self._seedgroup_tier in SEED_GROUP_TIERS else "2T"
+        out: Dict[str, Any] = {
+            "ok": False, "activated": False, "reason": "", "tier": tier,
+            "quota_gib": float(seed_group_target_gib(tier)), "used_gib": 0.0,
+            "api_version": "",
+            "token": "present" if (self._seedgroup_api_token or "").strip() else "missing",
+        }
+        if not self._seedgroup_api_token and not self._session_token:
+            out["reason"] = "未登录可乐PT，也没有填保种组 API Token"
+            return out
+        rsp = self._sg_api("GET", "/profile")
+        if rsp is None:
+            out["reason"] = "保种组 API 连不上（网络 / Cloudflare），下一轮再试"
+            return out
+        if rsp.status_code in (404, 405, 501):
+            out["reason"] = "站点尚未开放保种组权限 API（v1 契约已预留，见 docs/seed-group-api.md）"
+            return out
+        if rsp.status_code in (401, 403):
+            out["reason"] = "保种组权限未通过：X-Seed-Group-Token 缺失或无效"
+            return out
+        if rsp.status_code != 200:
+            out["reason"] = f"保种组 API 返回 HTTP {rsp.status_code}"
+            return out
+        body = rsp.json() or {}
+        out["ok"] = True
+        out["api_version"] = str(body.get("api_version") or "1")
+        out["activated"] = bool(body.get("enabled")) and bool(
+            str(body.get("tier") or "").strip() in SEED_GROUP_TIERS)
+        out["tier"] = str(body.get("tier") or tier)
+        try:
+            if body.get("quota_gib"):
+                out["quota_gib"] = float(body["quota_gib"])
+            if body.get("used_gib"):
+                out["used_gib"] = float(body["used_gib"])
+        except Exception:
+            pass
+        if not out["activated"]:
+            out["reason"] = str(body.get("reason") or "账号不在保种组，或档位未开通")
+        else:
+            out["reason"] = ""
+        return out
+
+    SG_PAGE_LIMIT = 200
+    SG_MAX_PAGES = 50
+
+    def _sg_candidates(self) -> List[Dict[str, Any]]:
+        """按游标分页把站点保种组资源池拉全（池子大时也不会一次爆内存）。"""
+        items: List[Dict[str, Any]] = []
+        cursor = ""
+        for _ in range(self.SG_MAX_PAGES):
+            params: Dict[str, Any] = {"limit": self.SG_PAGE_LIMIT}
+            if cursor:
+                params["cursor"] = cursor
+            rsp = self._sg_api("GET", "/torrents", params=params)
+            if rsp is None or rsp.status_code != 200:
+                if items:
+                    logger.warn(f"保种组资源池翻页中断（已取 {len(items)} 条）")
+                    break
+                return []
+            body = rsp.json() or {}
+            batch = body.get("items") or body.get("torrents") or []
+            for row in batch:
+                if isinstance(row, dict):
+                    items.append(row)
+            cursor = str(body.get("next_cursor") or "")
+            if not cursor or not batch:
+                break
+        return items
+
+    def _sg_download(self, item: Dict[str, Any]) -> bytes:
+        """拿种子字节：优先站点给的 download_url（带签名的直链），否则按 torrent_id 走授权流程。"""
+        url = str(item.get("download_url") or "").strip()
+        if url:
+            try:
+                rsp = _curl("GET", url, headers=self._sg_headers(), timeout=REQUEST_TIMEOUT)
+                if rsp.status_code == 200 and _valid_torrent(rsp.content):
+                    return rsp.content
+                logger.warn(f"保种组直链下载失败：HTTP {rsp.status_code} {url[:80]}")
+            except Exception as err:
+                logger.warn(f"保种组直链下载异常：{err}")
+        torrent_id = item.get("torrent_id") or item.get("id")
+        if torrent_id:
+            try:
+                return self._download_cola(int(torrent_id))
+            except Exception as err:
+                logger.warn(f"保种组按 id 下载失败（{torrent_id}）：{err}")
+        return b""
+
+    def _sg_current(self, clients: List[_Client]) -> Tuple[set, float, int]:
+        """客户端里已经带着「可乐保种组」标签的种子：返回 (hash 集合, 体积 GiB, 无标签能力的客户端数)。
+
+        Transmission 的 list_completed 不带 tags，这类客户端只能靠插件自己记的条目兜底。
+        """
+        hashes: set = set()
+        total = 0.0
+        blind = 0
+        for client in clients:
+            try:
+                torrents = client.list_completed()
+            except Exception:
+                blind += 1
+                continue
+            tagged = False
+            for torrent in torrents or []:
+                tags = str(torrent.get("tags") or "")
+                if tags:
+                    tagged = True
+                if SEED_GROUP_TAG not in tags:
+                    continue
+                info_hash = str(torrent.get("hash") or "").lower()
+                if not info_hash or info_hash in hashes:
+                    continue
+                hashes.add(info_hash)
+                total += _seed_group_size_gib(torrent.get("size"))
+            if torrents and not tagged:
+                blind += 1
+        return hashes, round(total, 3), blind
+
+    def seed_group_status(self) -> Dict[str, Any]:
+        state = self.get_data("seedgroup_state") or {}
+        return state if isinstance(state, dict) else {}
+
+    def _seedgroup_panel(self) -> Dict[str, Any]:
+        """插件页顶部的「可乐保种组」面板：档位 / 覆盖体积 / 缺口 / 激活状态一眼可见。"""
+        tier = self._seedgroup_tier if self._seedgroup_tier in SEED_GROUP_TIERS else "2T"
+        target = float(seed_group_target_gib(tier))
+        state = self.seed_group_status()
+        try:
+            if state.get("target_gib"):
+                target = float(state["target_gib"])
+        except Exception:
+            pass
+        covered = float(state.get("covered_gib") or state.get("current_gib") or 0.0)
+        pct = 0 if target <= 0 else max(0, min(100, int(round(covered / target * 100))))
+        lines = [f"档位：{SEED_GROUP_TIER_LABELS.get(tier, tier)}；目标 {target:.0f} GiB；"
+                 f"实际覆盖 {covered:.1f} GiB（{pct}%）"]
+        if state.get("at"):
+            lines.append(f"上次同步 {state['at']}：新增 {state.get('added', 0)} 条"
+                         f"（+{state.get('added_gib', 0)} GiB），重复 {state.get('duplicate', 0)}，"
+                         f"失败 {state.get('failed', 0)}，缺口 {state.get('shortfall_gib', 0)} GiB")
+        if not self._seedgroup_enabled:
+            lines.append("状态：未启用 —— 在插件设置里打开「可乐保种组」并选档位")
+        elif not state.get("activated"):
+            lines.append("状态：未激活 —— " + str(state.get("reason") or
+                                                  "站点保种组权限 API 尚未开通"
+                                                  "（v1 契约已预留：docs/seed-group-api.md）"))
+        elif float(state.get("shortfall_gib") or 0) > 0:
+            lines.append("状态：已激活，但体积还没到档位 —— "
+                         + str(state.get("reason") or "等下一轮同步补齐"))
+        else:
+            lines.append("状态：已激活且达到档位下限（只超不少）")
+        return {
+            "component": "VCard",
+            "props": {"class": "mb-4", "variant": "outlined"},
+            "content": [
+                {"component": "div", "text": "可乐保种组",
+                 "props": {"style": "font-weight: 600; font-size: 1.05rem; margin-bottom: 6px"}},
+                {"component": "VProgressLinear",
+                 "props": {"model-value": pct, "height": 6, "rounded": True, "class": "mb-2"}},
+                {"component": "div", "text": "\n".join(lines),
+                 "props": {"style": "white-space: pre-wrap; line-height: 1.7"}},
+            ],
+        }
+
+    def seed_group_sync(self):
+        """保种组任务入口：任何异常只记日志 + 通知，不让 MoviePilot 报「执行失败」。"""
+        try:
+            self._seed_group_sync()
+        except Exception as err:
+            logger.error(f"保种组任务异常终止：{type(err).__name__}: {err}")
+            try:
+                self.post_message(mtype=NotificationType.Plugin,
+                                  title="【可乐PT辅种】保种组执行异常",
+                                  text=f"{type(err).__name__}: {err}\n下一轮会重新开始，详细栈见 MoviePilot 日志。")
+            except Exception:
+                pass
+
+    def _seed_group_sync(self):
+        if not self._seedgroup_enabled:
+            return
+        tier = self._seedgroup_tier if self._seedgroup_tier in SEED_GROUP_TIERS else "2T"
+        target = float(seed_group_target_gib(tier))
+        clients = self._clients()
+        state: Dict[str, Any] = {
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "tier": tier, "target_gib": target, "current_gib": 0.0,
+            "activated": False, "reason": "", "picked": 0,
+            "added": 0, "duplicate": 0, "failed": 0, "added_gib": 0.0,
+            "covered_gib": 0.0, "shortfall_gib": 0.0, "api_version": "",
+        }
+        if not self._session_token:
+            state["reason"] = "插件还没登录可乐PT：先在插件页取验证码登录"
+            self.save_data("seedgroup_state", state)
+            logger.warn("保种组：未登录可乐PT，跳过本轮")
+            return
+        if not clients:
+            state["reason"] = "没有可用的下载器"
+            self.save_data("seedgroup_state", state)
+            logger.warn("保种组：没有可用的下载器")
+            return
+        probe = self.seed_group_probe()
+        existing, current_gib, blind = self._sg_current(clients)
+        if probe.get("quota_gib"):
+            # 站点给的额度才是准的：插件档位只是下限，站点额度更大时按站点来
+            target = max(target, float(probe["quota_gib"]))
+        state.update({"target_gib": target, "current_gib": current_gib,
+                      "activated": bool(probe.get("activated")),
+                      "reason": probe.get("reason") or "",
+                      "api_version": probe.get("api_version") or ""})
+        if not probe.get("activated"):
+            self.save_data("seedgroup_state", state)
+            logger.warn(f"保种组未激活：{probe.get('reason')}")
+            return
+        need = round(target - current_gib, 3)
+        state["need_gib"] = max(0.0, need)
+        if need <= 0:
+            state.update({"covered_gib": current_gib, "shortfall_gib": 0.0})
+            self.save_data("seedgroup_state", state)
+            logger.info(f"保种组已达标：档位 {tier} / 目标 {target} GiB / 现有 {current_gib} GiB")
+            return
+        candidates = [x for x in self._sg_candidates()
+                      if str(x.get("info_hash") or "").lower() not in existing]
+        if not candidates:
+            state["reason"] = "站点保种组资源池为空或取不到（API 返回 0 条）"
+            state["shortfall_gib"] = need
+            self.save_data("seedgroup_state", state)
+            logger.warn(f"保种组：资源池没有可用条目，缺口 {need} GiB")
+            return
+        picked, planned_gib, shortfall = seed_group_plan(candidates, need)
+        client = clients[0]
+        if self._target_client:
+            named = [c for c in clients if c.name == self._target_client]
+            if named:
+                client = named[0]
+        added = duplicate = failed = 0
+        added_gib = 0.0
+        for item in picked:
+            if self._event.is_set():
+                break
+            data = self._sg_download(item)
+            if not data:
+                failed += 1
+                continue
+            result = client.add(data, self._seedgroup_save_path, self._seedgroup_skip_check,
+                                label=SEED_GROUP_TAG,
+                                hash_hint=str(item.get("info_hash") or ""))
+            if result == "ok":
+                added += 1
+                added_gib += float(item.get("size_gib") or 0)
+            elif result == "dup":
+                duplicate += 1
+                added_gib += float(item.get("size_gib") or 0)
+            else:
+                failed += 1
+        covered = round(current_gib + added_gib, 3)
+        state.update({"picked": len(picked), "added": added, "duplicate": duplicate,
+                      "failed": failed, "added_gib": round(added_gib, 3), "planned_gib": planned_gib,
+                      "covered_gib": covered,
+                      # 缺口按「真实覆盖」算：计划得漂亮但下载/添加失败时，这里必须露出来
+                      "shortfall_gib": max(0.0, round(target - covered, 3))})
+        if state["shortfall_gib"] > 0 and not state["reason"]:
+            state["reason"] = (f"资源池不足或添加失败：还差 {state['shortfall_gib']} GiB"
+                               f"（计划缺口 {shortfall} GiB）")
+        if blind:
+            state["reason"] = (state["reason"] + "；" if state["reason"] else "") + \
+                              f"{blind} 个下载器不返回标签，体积统计可能偏低"
+        self.save_data("seedgroup_state", state)
+        logger.info(f"保种组完成：档位 {tier} 目标 {target} GiB，新增 {added} 条 (+{round(added_gib, 1)} GiB)，"
+                    f"覆盖 {covered} GiB，缺口 {state['shortfall_gib']} GiB，失败 {failed}")
+        if self._notify and (added or failed):
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title="【可乐PT辅种】保种组同步",
+                text=(f"档位：{SEED_GROUP_TIER_LABELS.get(tier, tier)}\n"
+                      f"目标：{target} GiB / 现有：{current_gib} GiB\n"
+                      f"本轮新增：{added} 条（+{round(added_gib, 1)} GiB，重复 {duplicate}，失败 {failed}）\n"
+                      f"覆盖：{covered} GiB" +
+                      (f"\n缺口：{state['shortfall_gib']} GiB" if state["shortfall_gib"] else "\n已达标")),
+            )
+
     def get_state(self) -> bool:
         return bool(self._enabled and self._session_token)
 
     def get_service(self) -> List[Dict[str, Any]]:
+        services: List[Dict[str, Any]] = []
         if self._enabled and self._cron:
             try:
                 trigger = CronTrigger.from_crontab(self._cron) if len(str(self._cron).split()) == 5 else self._cron
             except Exception:
                 trigger = "0 */1 * * *"
-            return [{
+            services.append({
                 "id": "ColaCrossSeed",
                 "name": "可乐PT自动辅种",
                 "trigger": trigger,
                 "func": self.auto_seed,
                 "kwargs": {},
-            }]
-        return []
+            })
+        if self._seedgroup_enabled and self._seedgroup_cron:
+            # 保种组是独立任务：MP「任务」页里能单独看它跑没跑、单独设周期
+            try:
+                sg_trigger = (CronTrigger.from_crontab(self._seedgroup_cron)
+                              if len(str(self._seedgroup_cron).split()) == 5 else self._seedgroup_cron)
+            except Exception:
+                sg_trigger = "0 */6 * * *"
+            services.append({
+                "id": "ColaCrossSeedSeedGroup",
+                "name": "可乐保种组",
+                "trigger": sg_trigger,
+                "func": self.seed_group_sync,
+                "kwargs": {},
+            })
+        return services
 
     def stop_service(self) -> None:
         self._event.set()
@@ -2723,6 +3150,8 @@ class ColaCrossSeed(_PluginBase):
                                          f"重复 {last.get('duplicate', 0)}，失败 {last.get('failed', 0)}；"
                                          f"待重试 {len(pending)} 个。"}
         ]
+        # ---- 可乐保种组面板：导航区第一块，档位与缺口一眼可见 ----
+        blocks.insert(0, self._seedgroup_panel())
         sites = self._other_sites()
         if sites:
             per = (last.get("by_site") or {}) if isinstance(last, dict) else {}
@@ -2800,6 +3229,27 @@ class ColaCrossSeed(_PluginBase):
                 "methods": ["GET", "POST"],
                 "summary": "检测可乐/下载器/其他站连通性",
                 "description": "返回可乐登录、每个下载器、每个其他站的连接结果；结果也会显示在插件页",
+            },
+            {
+                "path": "/seedgroup/status",
+                "endpoint": self.seed_group_status,
+                "methods": ["GET", "POST"],
+                "summary": "可乐保种组状态",
+                "description": "返回档位、目标体积、实际覆盖、缺口、上次同步结果（面板同款数据）",
+            },
+            {
+                "path": "/seedgroup/probe",
+                "endpoint": self.seed_group_probe,
+                "methods": ["GET", "POST"],
+                "summary": "探测保种组权限 API",
+                "description": "检查站点是否已开放保种组权限、当前账号的档位与配额（v1 契约见 docs/seed-group-api.md）",
+            },
+            {
+                "path": "/seedgroup/sync",
+                "endpoint": self.seed_group_sync,
+                "methods": ["POST"],
+                "summary": "立即同步一次保种组",
+                "description": "按当前档位把资源池补齐到体积下限（只超不少），缺口会如实报出",
             },
         ]
 
@@ -2893,6 +3343,34 @@ class ColaCrossSeed(_PluginBase):
                              "label": "直接导入 IYUU 站点配置（把 IYUU 导出的 JSON 整个粘贴进来，自动取启用的站点）",
                              "placeholder": "[{\"site\":\"keepfrds\",\"nickname\":\"朋友\",\"base_url\":\"pt.keepfrds.com\",\"options\":{\"passkey\":\"...\"}}]"}}]},
                     ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VAlert", "props": {
+                                "type": "info", "variant": "tonal", "density": "compact",
+                                "title": "可乐保种组",
+                                "text": "按档位（2T / 5T / 10T / 20T+）把站点资源池搬进下载器，体积只能超不能少；"
+                                        "站点尚未开放保种组权限 API 时整块自动锁定，不影响辅种。"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                            {"component": "VSwitch", "props": {"model": "seedgroup_enabled", "label": "启用可乐保种组"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VSelect", "props": {"model": "seedgroup_tier", "label": "保种档位", "items": [
+                                {"title": SEED_GROUP_TIER_LABELS[k], "value": k} for k in SEED_GROUP_TIERS]}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
+                            {"component": "VTextField", "props": {"model": "seedgroup_cron", "label": "保种组执行周期（cron）",
+                             "placeholder": "0 */6 * * *"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
+                            {"component": "VTextField", "props": {"model": "seedgroup_api_token",
+                             "label": "保种组 API Token（站点签发，X-Seed-Group-Token）", "type": "password"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
+                            {"component": "VTextField", "props": {"model": "seedgroup_save_path",
+                             "label": "保种组保存路径（留空=下载器默认目录）"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [
+                            {"component": "VSwitch", "props": {"model": "seedgroup_skip_check", "label": "跳过校验"}}]},
+                    ]},
                 ],
             }
         ], {
@@ -2902,6 +3380,8 @@ class ColaCrossSeed(_PluginBase):
             "use_mp_clients": True, "clients_json": "", "clients_lines": "", "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "", "sites_mode": "merge",
             "add_label": "", "extra_tags": "", "inherit_tags": True, "target_client": "",
             "fallback_skip_check": True, "retry_failed": True,
+            "seedgroup_enabled": False, "seedgroup_tier": "2T", "seedgroup_api_token": "",
+            "seedgroup_cron": "0 */6 * * *", "seedgroup_save_path": "", "seedgroup_skip_check": True,
         }
 
 
