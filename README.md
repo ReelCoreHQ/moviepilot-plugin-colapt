@@ -72,10 +72,12 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 |---|---|
 | 解锁资格 | **只认站点工作组**：账号密码登录后读本人资料里的工作组头衔（组名以「工作组」开头，即 `工作组-审核 / 工作组-保种 / 工作组-组长 / 工作组-转载`）。不是工作组的账号，保存配置时插件会把开关**强制关掉**，面板写明原因 |
 | 管理员 | 默认也放行（可在设置里关） |
-| 档位 | `2T` / `5T` / `10T` / `20T+`，对应体积下限 2048 / 5120 / 10240 / 20480 GiB |
+| 档位 | `2T` / `5T` / `10T` / `15T` / `20T`，对应体积下限 2048 / 5120 / 10240 / 15360 / 20480 GiB；另有**自定义档**，填 GiB，**不允许低于 2048（2T）**，低于会被抬到 2048 |
 | 体积规则 | **只能超、不能少**：官方优先 → 能一颗盖住就挑最小的那颗 → 否则挑放得下的最大颗 → 池子不够如实报缺口，不虚报达标 |
 | 资源池 | 官方发布清单。填了「站点 API Key」就走机器面 `/official/torrents`（100 条/页，最快）；不填就走会话面 `/media?official=true`，账号登录即可 |
 | 下载器 | 默认用 MoviePilot 已配置的那台 —— 种子交给 MP 自己的规则**刮削/整理**；也可以单独填 qB/TR（只给保种组用，不影响辅种），再指定加到哪一台 |
+| 动态保种 | **体积达标后**才轮换：删「做种人数最多」的 N 颗、补「做种人数最少」的 N 颗（默认 5，可调 1–50；默认连文件一起删）。没达标就只补满、不轮换 | 
+| 下架清理 | 每轮同步后回站点逐个核对 `status/official`：`withdrawn/rejected/deleted`、不再是 `approved`、或官方标记被撤掉的，直接从下载器删掉（默认只删种子、保留文件；可在设置里改成连文件一起删）。站点上已经 404 的也删 |
 | 任务 | 独立任务 `可乐保种组`（自己的 cron，默认 6 小时），在 MoviePilot「任务」里单独可见、可手动跑 |
 | 接口 | 见 [docs/seed-group-api.md](./docs/seed-group-api.md)（全部走站点现有 API，不需要后端改动） |
 
@@ -94,6 +96,54 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 - 插件页显示：上次运行统计（匹配 / 可乐补种 / 其他站补种 / 重复 / 降级成功 / 失败）、待重试清单、连通性检测结果；
 - `POST /api/v1/plugin/ColaCrossSeed/run` 手动跑一次（仍守每小时上限）；
 - `POST /api/v1/plugin/ColaCrossSeed/test` 检测可乐、下载器、其他站连通性。
+
+## 一键导入 IYUU 配置（推荐）
+
+不用手写站点行：把 **IYUU 导出的站点 JSON** 整个粘到「直接导入 IYUU 站点配置」里保存即可。
+
+- 插件自动展开：`域名 / passkey / uid / downhash / rsskey / x_api_key / 下载模板 / sid` 一次全带走；
+- `disabled=1` 的站自动跳过，已关闭的站（烧包）也不导入；
+- 保存后插件页会显示 `IYUU 导入：N 个启用站点（带 uid x / downhash y / Cookie z）`——这就是「生效了没」的凭据；
+- 「站点来源」三档：**只用 IYUU 导入**（不写行）／**IYUU + 手写行补充**（默认，行优先）／只用手写行；
+- **本地文件导入**：把导出的 JSON 放到宿主的 MP 配置目录（容器内 `/config/cola-sites.json`），
+  在设置里填「IYUU 配置文件路径」，保存即导入；文件为准，粘进文本框的内容会被覆盖；
+- 也可以用接口推送（脚本/定时同步 IYUU 配置）：
+
+```bash
+curl -X POST "http://<MP地址>/api/v1/plugin/ColaCrossSeed/sites/import" \
+  -H "Authorization: Bearer <MP API Token>" -H "Content-Type: application/json" \
+  -d "{\"json\": $(cat cn_sites.json)}"
+```
+
+返回 `{ok, total, enabled, usable, skipped}`：`total` 是文件里的条数，`enabled` 是未禁用的，
+`usable` 是真正带 passkey 能被插件使用的，`skipped` 是被跳过的域名与原因。
+
+> 为什么以前「粘了也不全生效」：IYUU 的凭据不只有 passkey。下载模板里的 `{uid}`、家园的 `downhash`、
+> `cookie_required` 站的 Cookie 都分散在 `options` 与顶层字段里，少一个就会出现「导入成功但辅种全失败」。
+> 0.10.26 起一次全带走。
+
+## 保种限速接管（只作用于保种组）
+
+| 设置 | 行为 |
+|---|---|
+| 「保种下载/上传限速」填了数字（KiB/s） | **强行改客户端**：qB 用 `app/setPreferences` 的 `dl_limit/up_limit`（字节/秒），TR 用 `session-set` 的 `speed-limit-*` + `*_enabled=true`；每次任务开始都会重新下发一次，所以有人在客户端里手改限速，下一轮会被改回来 |
+| 留空或 0 | **完全不碰**客户端的原有设置（这一项不接管） |
+| 只填一边 | 只接管那一边，另一边保持客户端原值 |
+
+### 限速情况上报（强制，界面不提供开关）
+
+**只统计开了保种组的用户，且强制上报**：设置页不显示上报地址与 Token，也没有关闭开关。
+
+
+开了保种组的用户，每轮同步结束会把**每台客户端此刻的限速**（qB 读 `preferences.dl_limit/up_limit`，
+TR 读 `session-get` 的 `speed-limit-*`）连同档位、覆盖体积、缺口、插件是否接管限速，一起
+`POST` 到站点收集端 **`https://www.colapt.com/seedgroup-report`**（站点 nginx 反代到本机收集服务，带 `X-Report-Token`）。
+
+- 只采集保种组用户：**没开保种组的用户一条都不发**；
+- 上报失败只记日志与面板，不影响保种；
+- 站点侧落盘：`23:/var/log/colapt-seedgroup/report-YYYYMMDD.jsonl`（一行一条 JSON）。
+
+`_MPClient`（走 MoviePilot 已配置下载器）目前不支持反向设置，会在日志里记「失败 1 台」；要用限速接管请把 qB/TR 写成自定义下载器行。
 
 ## 每个站点单独配置
 

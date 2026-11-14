@@ -9,7 +9,7 @@
 
 辅种是「本地已有文件 → 去站点找同一颗种子」；保种组相反：
 
-> 站点给**工作组**成员开放官方资源池，成员按档位（2T / 5T / 10T / 20T+）把池子搬进下载器长期做种，
+> 站点给**工作组**成员开放官方资源池，成员按档位（2T / 5T / 10T / 15T / 20T，或自定义 ≥2T）把池子搬进下载器长期做种，
 > **体积只能超、不能少**。
 
 ---
@@ -73,7 +73,19 @@ Cookie: reelcore_session=...
 - 每条给到 `id`（= torrent_id）、`release_name`、`size_bytes`；
 - 分页是**作品**粒度，所以比机器面慢，但不需要 API Key。
 
-### 3.3 取种
+### 3.3 下架清理（prune）
+
+同步结束后逐个回站点核对本地保种：
+
+```
+GET /api/v1/torrents/{id}   → { status, official, gate_phase, ... }
+```
+
+判据：`status ∈ {withdrawn, rejected, deleted}` / `status ≠ approved` / `official == false` / `404`
+→ 从下载器删掉那颗（默认 `delete_files=false`，只删种子保留文件）。
+没有 `torrent_id` 映射的种子一律不删（宁可不删）。映射来自插件自己记录的 hash → torrent_id。
+
+### 3.4 取种
 
 `GET /torrents/{id}/authorizations`（签发）→ `GET /torrents/{id}/download?authorization_id=` —— 插件已有这套（`_download_cola`）。
 
@@ -86,7 +98,11 @@ Cookie: reelcore_session=...
 | `2T` | 2048 GiB |
 | `5T` | 5120 GiB |
 | `10T` | 10240 GiB |
-| `20T+` | 20480 GiB |
+| `15T` | 15360 GiB |
+| `20T` | 20480 GiB |
+| `custom` | 自定义 GiB，**下限 2048（2T）**，低于按 2048 算 |
+
+> 历史配置里的 `20T+` 会自动归一成 `20T`（改名不改数值）。
 
 `seed_group_plan` 的规则：官方优先、体积降序 → 能一颗盖住剩余空间就挑**最小**那颗（超额最少）→
 否则挑放得下的最大颗 → 池子耗尽仍未到档位就如实报缺口（`state.shortfall_gib`）。
