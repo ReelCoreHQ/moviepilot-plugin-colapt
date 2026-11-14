@@ -64,26 +64,30 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 | 执行周期 | cron，默认每小时 |
 | **可乐保种组** | 见下节；站点开放保种组权限 API 后填 Token 即可启用 |
 
-## 可乐保种组
+## 可乐保种组（仅工作组可解锁）
 
-辅种是「我已有 → 去站点找同一颗」；保种组反过来：**站点给授权成员一个资源池，成员按档位把它搬进下载器长期做种**。
+辅种是「我已有 → 去站点找同一颗」；保种组反过来：**站点给工作组一个官方资源池，成员按档位把它搬进下载器长期做种**。
 
 | 项 | 说明 |
 |---|---|
+| 解锁资格 | **只认站点工作组**：账号密码登录后读本人资料里的工作组头衔（组名以「工作组」开头，即 `工作组-审核 / 工作组-保种 / 工作组-组长 / 工作组-转载`）。不是工作组的账号，保存配置时插件会把开关**强制关掉**，面板写明原因 |
+| 管理员 | 默认也放行（可在设置里关） |
 | 档位 | `2T` / `5T` / `10T` / `20T+`，对应体积下限 2048 / 5120 / 10240 / 20480 GiB |
-| 体积规则 | **只能超、不能少**：每轮从池子里按「官方优先 + 放得下的最大颗」填，最后允许多吃一颗把档位顶过去；池子不够时面板如实报缺口，不虚报达标 |
-| 与已有种子去重 | 按 `info_hash`；客户端里已经带着「可乐保种组」标签的种子体积计入已覆盖 |
+| 体积规则 | **只能超、不能少**：官方优先 → 能一颗盖住就挑最小的那颗 → 否则挑放得下的最大颗 → 池子不够如实报缺口，不虚报达标 |
+| 资源池 | 官方发布清单。填了「站点 API Key」就走机器面 `/official/torrents`（100 条/页，最快）；不填就走会话面 `/media?official=true`，账号登录即可 |
+| 下载器 | 默认用 MoviePilot 已配置的那台 —— 种子交给 MP 自己的规则**刮削/整理**；也可以单独填 qB/TR（只给保种组用，不影响辅种），再指定加到哪一台 |
 | 任务 | 独立任务 `可乐保种组`（自己的 cron，默认 6 小时），在 MoviePilot「任务」里单独可见、可手动跑 |
-| 激活条件 | 站点签发的 **保种组 API Token**（请求头 `X-Seed-Group-Token`）。站点还没开放该接口时整块锁定，面板写明原因，**不影响辅种** |
-| 接口契约 | 见 [docs/seed-group-api.md](./docs/seed-group-api.md)（v1，已预留：`profile` + `torrents`） |
+| 接口 | 见 [docs/seed-group-api.md](./docs/seed-group-api.md)（全部走站点现有 API，不需要后端改动） |
 
-插件页顶部就是「可乐保种组」面板：档位、目标体积、实际覆盖、进度条、上次同步的新增/重复/失败与缺口。
+插件页顶部就是「可乐保种组」面板：档位、目标体积、实际覆盖、进度条、上次同步的新增/重复/失败与缺口，
+以及**当前账号的工作组资格与解锁时间**。
 
 接口：
 
-- `POST /api/v1/plugin/ColaCrossSeed/seedgroup/sync` 立即同步一次；
+- `POST /api/v1/plugin/ColaCrossSeed/seedgroup/unlock` 手动解锁（校验工作组资格，通过后 24 小时有效）；
+- `GET  /api/v1/plugin/ColaCrossSeed/seedgroup/identity` 看当前账号的组与是否够资格；
 - `GET  /api/v1/plugin/ColaCrossSeed/seedgroup/status` 看档位与缺口；
-- `GET  /api/v1/plugin/ColaCrossSeed/seedgroup/probe` 探测站点是否已开放保种组权限。
+- `POST /api/v1/plugin/ColaCrossSeed/seedgroup/sync` 立即同步一次。
 
 ## 插件页与接口
 

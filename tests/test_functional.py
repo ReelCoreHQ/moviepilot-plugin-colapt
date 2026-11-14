@@ -802,46 +802,104 @@ class SeedGroupPluginTest(unittest.TestCase):
         plugin._seedgroup_enabled = True
         plugin._seedgroup_tier = "2T"
         plugin._seedgroup_cron = "0 */6 * * *"
-        plugin._seedgroup_api_token = ""
+        plugin._seedgroup_api_key = ""
+        plugin._seedgroup_staff_prefix = "工作组"
+        plugin._seedgroup_allow_admin = True
+        plugin._seedgroup_use_mp_clients = True
+        plugin._seedgroup_clients_lines = ""
+        plugin._seedgroup_target_client = ""
         plugin._seedgroup_save_path = ""
         plugin._seedgroup_skip_check = True
         return plugin
 
-    def test_panel_shows_group_and_tier(self):
-        plugin = self._plugin()
-        panel = plugin._seedgroup_panel()
-        blob = json.dumps(panel, ensure_ascii=False)
-        self.assertIn("可乐保种组", blob)
-        self.assertIn("2048", blob)
-        self.assertIn("未激活", blob)       # 没跑过同步 → 默认未激活
+    @staticmethod
+    def _fake_cola(me=None, profile=None):
+        def call(method, path, **kwargs):
+            if path == "/api/v1/me":
+                body = json.dumps(me or {"id": 0}).encode()
+                return mod._HttpResult(200, body, body.decode())
+            if path.startswith("/api/v1/users/"):
+                body = json.dumps(profile or {}).encode()
+                return mod._HttpResult(200, body, body.decode())
+            return mod._HttpResult(404, b"", "404")
+        return call
 
-    def test_panel_reports_shortfall(self):
+    def test_identity_requires_login(self):
         plugin = self._plugin()
-        plugin.save_data("seedgroup_state", {"at": "2026-11-15 01:00:00", "tier": "2T",
-                                             "target_gib": 2048, "current_gib": 1024,
-                                             "covered_gib": 1024, "shortfall_gib": 1024,
-                                             "activated": True, "added": 3})
+        plugin._session_token = ""
+        ident = plugin.seed_group_identity()
+        self.assertFalse(ident["ok"])
+        self.assertIn("登录", ident["reason"])
+
+    def test_identity_staff_detected(self):
+        plugin = self._plugin()
+        plugin._cola = self._fake_cola(
+            me={"id": 7, "username": "yg", "roles": ["member"]},
+            profile={"groups": ["VIP", "工作组-保种"], "display_group": "工作组-保种"})
+        ident = plugin.seed_group_identity()
+        self.assertTrue(ident["ok"])
+        self.assertTrue(ident["staff"])
+        self.assertIn("工作组-保种", ident["groups"])
+
+    def test_identity_non_staff_rejected(self):
+        plugin = self._plugin()
+        plugin._cola = self._fake_cola(
+            me={"id": 8, "username": "member", "roles": ["member"]},
+            profile={"groups": ["VIP"], "display_group": "VIP"})
+        ident = plugin.seed_group_identity()
+        self.assertTrue(ident["ok"])
+        self.assertFalse(ident["staff"])
+        self.assertIn("不在工作组", ident["reason"])
+
+    def test_identity_admin_allowed_by_default(self):
+        plugin = self._plugin()
+        plugin._cola = self._fake_cola(
+            me={"id": 1, "username": "root", "roles": ["admin"]},
+            profile={"groups": []})
+        self.assertTrue(plugin.seed_group_identity()["staff"])
+
+    def test_identity_admin_can_be_denied(self):
+        plugin = self._plugin()
+        plugin._seedgroup_allow_admin = False
+        plugin._cola = self._fake_cola(
+            me={"id": 1, "username": "root", "roles": ["admin"]},
+            profile={"groups": []})
+        self.assertFalse(plugin.seed_group_identity()["staff"])
+
+    def test_unlock_persists_for_staff(self):
+        plugin = self._plugin()
+        plugin._cola = self._fake_cola(
+            me={"id": 7, "username": "yg", "roles": ["member"]},
+            profile={"groups": ["工作组-组长"]})
+        record = plugin.seed_group_unlock()
+        self.assertTrue(record["ok"])
+        self.assertGreater(record["until"], record["at"])
+        self.assertTrue(plugin.get_data("seedgroup_unlock")["ok"])
+        self.assertTrue(plugin._sg_unlocked(refresh=False)[0])
+
+    def test_unlock_refused_for_non_staff(self):
+        plugin = self._plugin()
+        plugin._cola = self._fake_cola(
+            me={"id": 8, "username": "member", "roles": ["member"]},
+            profile={"groups": ["VIP"]})
+        record = plugin.seed_group_unlock()
+        self.assertFalse(record["ok"])
+        self.assertFalse(plugin._sg_unlocked(refresh=False)[0])
+
+    def test_panel_shows_staff_status(self):
+        plugin = self._plugin()
+        plugin.save_data("seedgroup_unlock", {"ok": True, "at": 1763000000, "until": 1999999999,
+                                             "groups": ["工作组-保种"], "username": "yg"})
         blob = json.dumps(plugin._seedgroup_panel(), ensure_ascii=False)
-        self.assertIn("还没到档位", blob)
-        self.assertIn("1024", blob)
+        self.assertIn("可乐保种组", blob)
+        self.assertIn("工作组-保种", blob)
 
-    def test_probe_locked_when_api_missing(self):
+    def test_panel_shows_locked_reason(self):
         plugin = self._plugin()
-        plugin._sg_api = lambda *a, **k: mod._HttpResult(404, b"", "404 page not found")
-        probe = plugin.seed_group_probe()
-        self.assertFalse(probe["ok"])
-        self.assertFalse(probe["activated"])
-        self.assertIn("尚未开放", probe["reason"])
-
-    def test_probe_activated_reads_quota(self):
-        plugin = self._plugin()
-        body = json.dumps({"api_version": "1", "enabled": True, "tier": "5T",
-                           "quota_gib": 5120, "used_gib": 1200}).encode()
-        plugin._sg_api = lambda *a, **k: mod._HttpResult(200, body, body.decode())
-        probe = plugin.seed_group_probe()
-        self.assertTrue(probe["activated"])
-        self.assertEqual(probe["tier"], "5T")
-        self.assertEqual(probe["quota_gib"], 5120)
+        plugin.save_data("seedgroup_unlock", {"ok": False, "at": 0, "until": 0,
+                                             "reason": "账号不在工作组：组名需以「工作组」开头"})
+        blob = json.dumps(plugin._seedgroup_panel(), ensure_ascii=False)
+        self.assertIn("无法解锁", blob)
 
     def test_service_registers_seed_group_job(self):
         plugin = self._plugin()
@@ -857,24 +915,25 @@ class SeedGroupPluginTest(unittest.TestCase):
     def test_sync_locked_does_not_add(self):
         plugin = self._plugin()
         client = support.FakeClient()
-        plugin._clients = lambda: [client]
-        plugin.seed_group_probe = lambda: {"ok": False, "activated": False,
-                                           "reason": "站点尚未开放保种组权限 API",
-                                           "tier": "2T", "quota_gib": 2048, "api_version": ""}
+        plugin._sg_clients = lambda: [client]
+        plugin._cola = self._fake_cola(
+            me={"id": 8, "username": "member", "roles": ["member"]},
+            profile={"groups": ["VIP"]})
         plugin._sg_candidates = lambda: [{"torrent_id": 1, "info_hash": "a", "size": mod.GIB}]
         plugin._sg_download = lambda item: support.make_torrent()
         plugin._seed_group_sync()
         self.assertEqual(client.added, [])
         state = plugin.get_data("seedgroup_state")
-        self.assertFalse(state["activated"])
-        self.assertIn("尚未开放", state["reason"])
+        self.assertFalse(state["unlocked"])
+        self.assertIn("不在工作组", state["reason"])
 
     def test_sync_fills_to_tier_and_reports_covered(self):
         plugin = self._plugin()
         client = support.FakeClient()
-        plugin._clients = lambda: [client]
-        plugin.seed_group_probe = lambda: {"ok": True, "activated": True, "reason": "",
-                                           "tier": "2T", "quota_gib": 2048, "api_version": "1"}
+        plugin._sg_clients = lambda: [client]
+        plugin._cola = self._fake_cola(
+            me={"id": 7, "username": "yg", "roles": ["member"]},
+            profile={"groups": ["工作组-保种"]})
         plugin._sg_candidates = lambda: [
             {"torrent_id": 11, "info_hash": "a" * 40, "size": 1500 * mod.GIB},
             {"torrent_id": 12, "info_hash": "b" * 40, "size": 600 * mod.GIB},
@@ -885,6 +944,7 @@ class SeedGroupPluginTest(unittest.TestCase):
         self.assertEqual(len(client.added), 2)          # 1500 + 600 = 2100 ≥ 2048
         self.assertTrue(all(mod.SEED_GROUP_TAG in a["label"] for a in client.added))
         state = plugin.get_data("seedgroup_state")
+        self.assertTrue(state["unlocked"])
         self.assertEqual(state["added"], 2)
         self.assertGreaterEqual(state["covered_gib"], 2048)
         self.assertEqual(state["shortfall_gib"], 0)
@@ -896,16 +956,100 @@ class SeedGroupPluginTest(unittest.TestCase):
             {"hash": "e" * 40, "name": "old", "size": 2048 * mod.GIB,
              "tags": f"{mod.MANDATORY_TAG},{mod.SEED_GROUP_TAG}", "state": "uploading"},
         ]
-        plugin._clients = lambda: [client]
-        plugin.seed_group_probe = lambda: {"ok": True, "activated": True, "reason": "",
-                                           "tier": "2T", "quota_gib": 2048, "api_version": "1"}
+        plugin._sg_clients = lambda: [client]
+        plugin._cola = self._fake_cola(
+            me={"id": 7, "username": "yg", "roles": ["member"]},
+            profile={"groups": ["工作组-保种"]})
         plugin._sg_candidates = lambda: [
             {"torrent_id": 21, "info_hash": "f" * 40, "size": 300 * mod.GIB}]
         plugin._sg_download = lambda item: support.make_torrent()
         plugin._seed_group_sync()
-        # 已经够了：一颗都不该再加
         self.assertEqual(client.added, [])
         self.assertGreaterEqual(plugin.get_data("seedgroup_state")["covered_gib"], 2048)
+
+    def test_official_machine_page_parses_items(self):
+        plugin = self._plugin()
+        plugin._seedgroup_api_key = "rcapi_test"
+        body = json.dumps({"items": [{"torrent_id": 5, "release_name": "Movie",
+                                      "size_bytes": 2 * mod.GIB, "official": True}],
+                           "page": 1, "page_size": 100, "total": 1}).encode()
+        plugin_curl = mod._curl
+
+        def fake_curl(method, url, **kwargs):
+            return mod._HttpResult(200, body, body.decode())
+
+        mod._curl = fake_curl
+        try:
+            items, total, source = plugin._sg_official_machine_page(1)
+        finally:
+            mod._curl = plugin_curl
+        self.assertEqual(total, 1)
+        self.assertEqual(source, "api-key")
+        self.assertEqual(items[0]["torrent_id"], 5)
+        self.assertAlmostEqual(mod._seed_group_size_gib(items[0]["size"]), 2.0)
+
+    def test_browse_page_extracts_official_versions(self):
+        plugin = self._plugin()
+        body = json.dumps({"items": [{"versions": [
+            {"id": 31, "release_name": "A", "size_bytes": mod.GIB, "official": True},
+            {"id": 32, "release_name": "B", "size_bytes": mod.GIB, "official": False},
+        ]}], "page": 1, "page_size": 50, "total": 1}).encode()
+        plugin._cola = lambda m, p, **k: mod._HttpResult(200, body, body.decode())
+        items, total, source = plugin._sg_official_browse_page(1)
+        self.assertEqual(total, 1)
+        self.assertEqual(source, "session")
+        self.assertEqual([x["torrent_id"] for x in items], [31])
+
+
+class SeedGroupClientTest(unittest.TestCase):
+    def _plugin(self):
+        plugin = support.make_plugin(mod)
+        plugin._use_mp_clients = True
+        plugin._clients_lines = ""
+        plugin._clients_json = ""
+        plugin._seedgroup_use_mp_clients = True
+        plugin._seedgroup_clients_lines = ""
+        plugin._seedgroup_target_client = ""
+        return plugin
+
+    def test_custom_lines_used_first(self):
+        plugin = self._plugin()
+        plugin._seedgroup_clients_lines = "qb,192.168.1.9:8080,admin,pw"
+        plugin._mp_clients = lambda: (_ for _ in ()).throw(AssertionError("不该走 MP"))
+
+        class DummyQB:
+            def __init__(self, *args, **kwargs):
+                self.name = args[0] if args else "qb"
+
+        original, mod.QBittorrentClient = mod.QBittorrentClient, DummyQB
+        try:
+            clients = plugin._sg_clients()
+        finally:
+            mod.QBittorrentClient = original
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(clients[0].name, "192.168.1.9:8080")
+
+    def test_mp_clients_used_when_no_lines(self):
+        plugin = self._plugin()
+        fake = support.FakeClient()
+        fake.name = "MP-qb"
+        plugin._mp_clients = lambda: [fake]
+        self.assertEqual([c.name for c in plugin._sg_clients()], ["MP-qb"])
+
+    def test_target_client_filters(self):
+        plugin = self._plugin()
+        a, b = support.FakeClient(), support.FakeClient()
+        a.name, b.name = "MP-qb", "MP-tr"
+        plugin._mp_clients = lambda: [a, b]
+        plugin._seedgroup_target_client = "MP-tr"
+        self.assertEqual([c.name for c in plugin._sg_clients()], ["MP-tr"])
+
+    def test_falls_back_to_crossseed_clients(self):
+        plugin = self._plugin()
+        fake = support.FakeClient()
+        plugin._seedgroup_use_mp_clients = False
+        plugin._clients = lambda: [fake]
+        self.assertEqual(plugin._sg_clients(), [fake])
 
 
 if __name__ == "__main__":
