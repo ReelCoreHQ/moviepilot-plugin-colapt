@@ -731,12 +731,1028 @@ class SiteReportTest(unittest.TestCase):
         self.assertTrue(lines[1].startswith("✅"))
 
 
+class InitOrderTest(unittest.TestCase):
+    """保存配置时的顺序与失败语义（审查发现的 S1 / 网络瞬断 Q5）。"""
+
+    def _ident(self, ok=True, staff=True, reason=""):
+        return {"ok": ok, "staff": staff, "reason": reason, "uid": 7,
+                "username": "yg", "roles": ["member"], "groups": ["工作组-保种"]}
+
+    def _plugin(self):
+        plugin = support.make_plugin(mod)
+        plugin._session_token = "tok"
+        plugin.update_config = lambda cfg: None
+        plugin.run_tests = lambda persist=True: None
+        return plugin
+
+    def test_limits_survive_unlock_failure(self):
+        plugin = self._plugin()
+        plugin.seed_group_identity = lambda: self._ident(ok=False, staff=False, reason="站点 502")
+        plugin.init_plugin({"enabled": True, "max_per_hour": 50, "max_per_site": 30,
+                            "seedgroup_enabled": True})
+        # 解锁校验失败不能把限速写成类属性默认值（0 = 不限）
+        self.assertEqual(plugin._max_per_hour, 50)
+        self.assertEqual(plugin._max_per_site, 30)
+
+    def test_network_failure_keeps_switch(self):
+        plugin = self._plugin()
+        plugin.seed_group_identity = lambda: self._ident(ok=False, staff=False, reason="站点 502")
+        plugin.init_plugin({"enabled": True, "seedgroup_enabled": True})
+        self.assertTrue(plugin._seedgroup_enabled, "网络失败不是没资格，不该静默关功能")
+
+    def test_non_staff_forces_switch_off(self):
+        plugin = self._plugin()
+        written = {}
+        plugin.update_config = lambda cfg: written.update(cfg)
+        plugin.seed_group_identity = lambda: self._ident(ok=True, staff=False, reason="不在工作组")
+        plugin.init_plugin({"enabled": True, "seedgroup_enabled": True, "max_per_hour": 40})
+        self.assertFalse(plugin._seedgroup_enabled)
+        self.assertFalse(written.get("seedgroup_enabled"))
+        self.assertEqual(written.get("max_per_hour"), 40)
+
+    def test_staff_keeps_switch_on(self):
+        plugin = self._plugin()
+        plugin.seed_group_identity = lambda: self._ident()
+        plugin.init_plugin({"enabled": True, "seedgroup_enabled": True})
+        self.assertTrue(plugin._seedgroup_enabled)
+
+
+class SeedGroupPaginationTest(unittest.TestCase):
+    def _plugin(self):
+        plugin = support.make_plugin(mod)
+        plugin._seedgroup_enabled = True
+        plugin._seedgroup_tier = "10T"
+        plugin._seedgroup_custom_gib = 2048
+        plugin._seedgroup_cron = "0 */6 * * *"
+        plugin._seedgroup_api_key = ""
+        plugin._seedgroup_staff_prefix = "工作组"
+        plugin._seedgroup_allow_admin = True
+        plugin._seedgroup_use_mp_clients = True
+        plugin._seedgroup_clients_lines = ""
+        plugin._seedgroup_target_client = ""
+        plugin._seedgroup_save_path = ""
+        plugin._seedgroup_skip_check = True
+        return plugin
+
+    def test_machine_pages_by_total_not_by_page_size(self):
+        plugin = self._plugin()
+
+        def probe(page):
+            start = (page - 1) * 40          # 服务端每页只给 40 条
+            return ([{"torrent_id": start + i} for i in range(40)], 200, "api-key")
+
+        items, total, _ = plugin._sg_collect(probe, True)
+        self.assertEqual(total, 200)
+        self.assertEqual(len(items), 200)
+
+    def test_browse_pages_by_media_total(self):
+        plugin = self._plugin()
+
+        def probe(page):
+            return ([{"torrent_id": page * 100}], 120, "session")   # 120 个作品，每页 50
+
+        items, total, _ = plugin._sg_collect(probe, False)
+        self.assertEqual(len(items), 3)      # ceil(120/50) = 3 页
+
+    def test_empty_page_without_total_stops(self):
+        plugin = self._plugin()
+        calls = []
+
+        def probe(page):
+            calls.append(page)
+            return [], 0, "session"
+
+        items, _, _ = plugin._sg_collect(probe, False)
+        self.assertEqual(items, [])
+        self.assertEqual(len(calls), 1)
+
+    def test_collect_dedupes_torrent_ids(self):
+        plugin = self._plugin()
+
+        def probe(page):
+            if page == 1:
+                return ([{"torrent_id": 1}, {"torrent_id": 1}, {"torrent_id": 2}], 3, "api-key")
+            return ([], 3, "api-key")
+
+        items, _, _ = plugin._sg_collect(probe, True)
+        self.assertEqual([x["torrent_id"] for x in items], [1, 2])
+
+
+class SeedGroupSyncRobustnessTest(unittest.TestCase):
+    def _plugin(self):
+        plugin = support.make_plugin(mod)
+        plugin._session_token = "tok"
+        plugin._seedgroup_enabled = True
+        plugin._seedgroup_tier = "2T"
+        plugin._seedgroup_custom_gib = 2048
+        plugin._seedgroup_cron = "0 */6 * * *"
+        plugin._seedgroup_api_key = ""
+        plugin._seedgroup_staff_prefix = "工作组"
+        plugin._seedgroup_allow_admin = True
+        plugin._seedgroup_use_mp_clients = True
+        plugin._seedgroup_clients_lines = ""
+        plugin._seedgroup_target_client = ""
+        plugin._seedgroup_save_path = ""
+        plugin._seedgroup_skip_check = True
+        plugin.update_config = lambda cfg: None
+        plugin.post_message = lambda **k: None
+        return plugin
+
+    def test_duplicate_does_not_inflate_coverage(self):
+        plugin = self._plugin()
+        torrent = support.make_torrent()
+        hash_ = support.info_hash_of(torrent)
+        client = support.FakeClient(has_hash=[hash_])
+        client.list_completed = lambda: [
+            {"hash": hash_, "name": "x", "size": 1024 * mod.GIB,
+             "tags": mod.SEED_GROUP_TAG, "state": "uploading"}]
+        plugin._sg_clients = lambda: [client]
+        plugin._cola = lambda m, p, **k: mod._HttpResult(200, b"{}", "{}")
+        plugin.seed_group_identity = lambda: {"ok": True, "staff": True, "reason": "", "uid": 7,
+                                              "username": "yg", "roles": [], "groups": ["工作组-保种"]}
+        plugin._sg_candidates = lambda: [{"torrent_id": 9, "size": 1500 * mod.GIB}]
+        plugin._sg_download = lambda item: torrent
+        plugin._seed_group_sync()
+        state = plugin.get_data("seedgroup_state")
+        self.assertEqual(state["duplicate"], 1)
+        self.assertEqual(state["added"], 0)
+        # 重复的那颗不能算进覆盖：1024 还是 1024，缺口照实报
+        self.assertEqual(state["covered_gib"], 1024)
+        self.assertEqual(state["shortfall_gib"], 1024)
+
+    def test_failed_add_is_skipped_next_round(self):
+        plugin = self._plugin()
+        client = support.FakeClient(add_result="fail")
+        client.list_completed = lambda: []
+        plugin._sg_clients = lambda: [client]
+        plugin.seed_group_identity = lambda: {"ok": True, "staff": True, "reason": "", "uid": 7,
+                                              "username": "yg", "roles": [], "groups": ["工作组-保种"]}
+        plugin._sg_candidates = lambda: [{"torrent_id": 5, "info_hash": "a" * 40, "size": 3000 * mod.GIB}]
+        plugin._sg_download = lambda item: support.make_torrent()
+        plugin._seed_group_sync()
+        self.assertEqual(plugin.get_data("seedgroup_state")["failed"], 1)
+        self.assertIn("5", plugin.get_data("seedgroup_skip"))
+
+    def test_add_exception_does_not_kill_round(self):
+        plugin = self._plugin()
+        client = support.FakeClient()
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("qb 连接断了")
+
+        client.add = boom
+        client.list_completed = lambda: []
+        plugin._sg_clients = lambda: [client]
+        plugin.seed_group_identity = lambda: {"ok": True, "staff": True, "reason": "", "uid": 7,
+                                              "username": "yg", "roles": [], "groups": ["工作组-保种"]}
+        plugin._sg_candidates = lambda: [{"torrent_id": 6, "info_hash": "b" * 40, "size": 3000 * mod.GIB}]
+        plugin._sg_download = lambda item: support.make_torrent()
+        plugin._seed_group_sync()
+        state = plugin.get_data("seedgroup_state")
+        self.assertEqual(state["failed"], 1)
+        self.assertGreater(state["shortfall_gib"], 0)
+
+
+class IyuuRobustnessTest(unittest.TestCase):
+    GOOD = json.dumps([{"site": "keepfrds", "nickname": "朋友", "base_url": "pt.keepfrds.com",
+                        "sid": 1, "disabled": 0, "options": {"passkey": "a" * 32}}], ensure_ascii=False)
+
+    def _plugin(self):
+        plugin = support.make_plugin(mod)
+        plugin.update_config = lambda cfg: None
+        plugin._iyuu_json = ""
+        plugin._sites_lines = ""
+        plugin._sites_mode = "merge"
+        return plugin
+
+    def test_dirty_sid_does_not_crash(self):
+        plugin = self._plugin()
+        plugin._iyuu_json = json.dumps([{"site": "x", "base_url": "x.example", "sid": "abc",
+                                         "disabled": 0, "options": {"passkey": "b" * 32}}])
+        sites = plugin._iyuu_sites()
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0]["sid"], 0)
+
+    def test_disabled_string_zero_is_enabled(self):
+        plugin = self._plugin()
+        plugin._iyuu_json = json.dumps([{"site": "x", "base_url": "x.example", "disabled": "0",
+                                         "options": {"passkey": "c" * 32}}])
+        self.assertEqual(len(plugin._iyuu_sites()), 1)
+
+    def test_empty_import_keeps_previous_config(self):
+        plugin = self._plugin()
+        plugin._iyuu_json = self.GOOD
+        out = plugin._iyuu_import(json.dumps([{"site": "y", "base_url": "y.example",
+                                               "disabled": 0}]))   # 没有 passkey
+        self.assertFalse(out["ok"])
+        self.assertEqual(plugin._iyuu_json, self.GOOD)
+
+    def test_top_level_credentials_also_read(self):
+        plugin = self._plugin()
+        plugin._iyuu_json = json.dumps([{"site": "x", "base_url": "x.example", "disabled": 0,
+                                         "passkey": "d" * 32, "x_api_key": "k"}])
+        sites = plugin._iyuu_sites()
+        self.assertEqual(sites[0]["passkey"], "d" * 32)
+        self.assertEqual(sites[0]["x_api_key"], "k")
+
+
+class SeedGroupPruneTest(unittest.TestCase):
+    """站点下架/撤掉官方标记后，本地那颗要不要删。"""
+
+    HASH = "a" * 40
+
+    def _plugin(self, status="approved", official=True, http=200):
+        plugin = support.make_plugin(mod)
+        plugin._seedgroup_enabled = True
+        plugin._seedgroup_tier = "2T"
+        plugin._seedgroup_custom_gib = 2048
+        plugin._seedgroup_cron = "0 */6 * * *"
+        plugin._seedgroup_api_key = ""
+        plugin._seedgroup_staff_prefix = "工作组"
+        plugin._seedgroup_allow_admin = True
+        plugin._seedgroup_use_mp_clients = True
+        plugin._seedgroup_clients_lines = ""
+        plugin._seedgroup_target_client = ""
+        plugin._seedgroup_save_path = ""
+        plugin._seedgroup_skip_check = True
+        plugin._seedgroup_prune = True
+        plugin._seedgroup_prune_files = False
+        client = support.FakeClient()
+        client.list_completed = lambda: [
+            {"hash": self.HASH, "name": "x", "size": mod.GIB,
+             "tags": mod.SEED_GROUP_TAG, "state": "uploading"}]
+        plugin._sg_clients = lambda: [client]
+        body = json.dumps({"id": 3, "status": status, "official": official,
+                           "gate_phase": "confirmed"}).encode()
+        plugin._cola = lambda m, p, **k: mod._HttpResult(http, body, body.decode())
+        plugin.save_data("seedgroup_items", {self.HASH: {"torrent_id": 3, "size_gib": 1}})
+        return plugin, client
+
+    def test_withdrawn_is_removed(self):
+        plugin, client = self._plugin(status="withdrawn")
+        out = plugin._sg_prune()
+        self.assertEqual(out["removed"], 1)
+        self.assertIn(self.HASH, client.deleted)
+
+    def test_rejected_is_removed(self):
+        plugin, client = self._plugin(status="rejected")
+        self.assertEqual(plugin._sg_prune()["removed"], 1)
+
+    def test_official_flag_dropped_is_removed(self):
+        plugin, client = self._plugin(status="approved", official=False)
+        self.assertEqual(plugin._sg_prune()["removed"], 1)
+
+    def test_site_404_is_removed(self):
+        plugin, client = self._plugin(http=404)
+        self.assertEqual(plugin._sg_prune()["removed"], 1)
+
+    def test_still_official_is_kept(self):
+        plugin, client = self._plugin()
+        out = plugin._sg_prune()
+        self.assertEqual(out["removed"], 0)
+        self.assertEqual(out["kept"], 1)
+        self.assertEqual(client.deleted, [])
+
+    def test_unmapped_seed_is_never_deleted(self):
+        plugin, client = self._plugin(status="withdrawn")
+        plugin.save_data("seedgroup_items", {})
+        out = plugin._sg_prune()
+        self.assertEqual(out["unmapped"], 1)
+        self.assertEqual(out["removed"], 0)
+        self.assertEqual(client.deleted, [])
+
+    def test_delete_files_flag_is_honoured(self):
+        plugin, client = self._plugin(status="withdrawn")
+        plugin._seedgroup_prune_files = True
+        seen = {}
+        client.delete = lambda hashes, delete_files=False: seen.update(
+            {"hashes": hashes, "files": delete_files}) or True
+        plugin._sg_prune()
+        self.assertTrue(seen["files"])
+
+
+class IyuuFileImportTest(unittest.TestCase):
+    SAMPLE = json.dumps([{"site": "keepfrds", "nickname": "朋友",
+                          "base_url": "pt.keepfrds.com", "sid": 1, "disabled": 0,
+                          "options": {"passkey": "a" * 32}}], ensure_ascii=False)
+
+    def _plugin(self):
+        plugin = support.make_plugin(mod)
+        plugin.update_config = lambda cfg: None
+        plugin._iyuu_json = ""
+        plugin._iyuu_json_file = ""
+        plugin._sites_lines = ""
+        plugin._sites_mode = "merge"
+        return plugin
+
+    def test_import_from_file(self):
+        import tempfile
+        plugin = self._plugin()
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
+            handle.write(self.SAMPLE)
+            path = handle.name
+        try:
+            out = plugin._iyuu_import_from_file(path)
+        finally:
+            import os
+            os.unlink(path)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["usable"], 1)
+        self.assertEqual(out["source"], "file")
+
+    def test_missing_file_reports_reason(self):
+        plugin = self._plugin()
+        out = plugin._iyuu_import_from_file("/config/definitely-not-there.json")
+        self.assertFalse(out["ok"])
+        self.assertIn("文件不存在", out["reason"])
+
+    def test_empty_path_reports_reason(self):
+        plugin = self._plugin()
+        out = plugin._iyuu_import_from_file("")
+        self.assertFalse(out["ok"])
+        self.assertIn("路径", out["reason"])
+
+
+class IyuuExtraFieldsTest(unittest.TestCase):
+    """IYUU 站点里那些「导入后就能直接跑」的参数。"""
+
+    SAMPLE = json.dumps([{
+        "site": "m-team", "nickname": "馒头", "base_url": "api.m-team.cc",
+        "sid": 3, "disabled": 0, "download_page": "api/torrent/genDlToken",
+        "options": {
+            "passkey": "a" * 32, "x_api_key": "k",
+            "limit": {"count": "35", "sleep": "5"},
+            "url_join": {"https": "1", "ipv4": "1", "ipv6": "1"},
+            "rss_url": "https://rss.m-team.cc/api/rss/fetch?dl=1&uid=1",
+            "curl_opt_proxy": "192.168.1.2:8080",
+            "curl_opt_proxy_auth": "user:pass",
+        },
+    }], ensure_ascii=False)
+
+    def _plugin(self):
+        plugin = support.make_plugin(mod)
+        plugin.update_config = lambda cfg: None
+        plugin._iyuu_json = self.SAMPLE
+        plugin._sites_lines = ""
+        plugin._sites_mode = "iyuu_only"
+        plugin._site_limits = {}
+        return plugin
+
+    def test_rss_url_and_limit_are_imported(self):
+        site = self._plugin()._iyuu_sites()[0]
+        self.assertEqual(site["max_per_site"], 35)
+        self.assertIn("rss.m-team.cc", site["rss_url"])
+
+    def test_interval_imported(self):
+        site = self._plugin()._iyuu_sites()[0]
+        self.assertEqual(site["interval"], 5.0)
+
+    def test_proxy_is_assembled(self):
+        site = self._plugin()._iyuu_sites()[0]
+        self.assertEqual(site["proxy"], "http://user:pass@192.168.1.2:8080")
+
+    def test_proxy_helper_variants(self):
+        self.assertEqual(mod._site_proxy("", ""), "")
+        self.assertEqual(mod._site_proxy("1.2.3.4:8080", ""), "http://1.2.3.4:8080")
+        self.assertEqual(mod._site_proxy("1.2.3.4:8080", "u:p"), "http://u:p@1.2.3.4:8080")
+        self.assertEqual(mod._site_proxy("socks5h://1.2.3.4:1080", "u:p"),
+                         "socks5h://u:p@1.2.3.4:1080")
+
+    def test_per_site_limit_caps_budget(self):
+        plugin = self._plugin()
+        plugin._max_per_site = 20
+        sites = plugin._other_sites()
+        self.assertEqual(len(sites), 1)
+        url = sites[0]["url"]
+        self.assertEqual(plugin._site_limits.get(url), 35)
+        self.assertEqual(plugin._site_budget_left(url), 35)
+        plugin._site_counter[url] = 30
+        self.assertEqual(plugin._site_budget_left(url), 5)
+
+    def test_budget_falls_back_to_global(self):
+        plugin = self._plugin()
+        plugin._max_per_site = 12
+        plugin._site_limits = {}
+        self.assertEqual(plugin._site_budget_left("https://x.example/"), 12)
+
+
+class SpeedLimitTest(unittest.TestCase):
+    """限速接管：填了才强行改，不填一点不碰。"""
+
+    def _plugin(self, dl=0, up=0):
+        plugin = support.make_plugin(mod)
+        plugin._limit_dl_kib = dl
+        plugin._limit_up_kib = up
+        return plugin
+
+    def test_unset_does_nothing(self):
+        plugin = self._plugin()
+        client = support.FakeClient()
+        out = plugin._apply_speed_limits([client])
+        self.assertTrue(out["skipped_all"])
+        self.assertIsNone(client.speed_limits)
+
+    def test_apply_sets_both(self):
+        plugin = self._plugin(dl=1024, up=2048)
+        client = support.FakeClient()
+        out = plugin._apply_speed_limits([client])
+        self.assertEqual(client.speed_limits, (1024, 2048))
+        self.assertEqual(out["applied"], 1)
+        self.assertEqual(out["failed"], 0)
+
+    def test_only_one_direction(self):
+        plugin = self._plugin(dl=500, up=0)
+        client = support.FakeClient()
+        plugin._apply_speed_limits([client])
+        self.assertEqual(client.speed_limits, (500, 0))
+
+    def test_failure_counted(self):
+        plugin = self._plugin(dl=100, up=100)
+
+        class Broken(support.FakeClient):
+            name = "broken"
+
+            def set_speed_limits(self, dl_kib, up_kib):
+                raise RuntimeError("qb 连不上")
+
+        out = plugin._apply_speed_limits([Broken()])
+        self.assertEqual(out["failed"], 1)
+        self.assertEqual(out["applied"], 0)
+
+    def test_per_client_override(self):
+        plugin = self._plugin()
+        plugin._limit_lines = "198.72.127.68:8081,1024,2048"
+        a = support.FakeClient()
+        a.name = "198.72.127.68:8081"
+        b = support.FakeClient()
+        b.name = "192.168.31.100:8080"
+        out = plugin._apply_speed_limits([a, b])
+        self.assertEqual(a.speed_limits, (1024, 2048))
+        self.assertIsNone(b.speed_limits)     # 没配、全局也是 0 → 不接管
+        self.assertEqual(out["applied"], 1)
+        self.assertEqual(out["skipped"], 1)
+        self.assertEqual(out["clients"][0]["source"], "198.72.127.68:8081")
+
+    def test_override_beats_global(self):
+        plugin = self._plugin(dl=100, up=100)
+        plugin._limit_lines = "mp-qb,3000,4000"
+        a = support.FakeClient()
+        a.name = "MP-qb"
+        b = support.FakeClient()
+        b.name = "other"
+        plugin._apply_speed_limits([a, b])
+        self.assertEqual(a.speed_limits, (3000, 4000))
+        self.assertEqual(b.speed_limits, (100, 100))   # 未命中用全局
+
+    def test_override_partial_match(self):
+        plugin = self._plugin()
+        plugin._limit_lines = "198.72,500,0"
+        a = support.FakeClient()
+        a.name = "198.72.127.68:8081"
+        plugin._apply_speed_limits([a])
+        self.assertEqual(a.speed_limits, (500, 0))
+
+    def test_limit_lines_parsing(self):
+        plugin = self._plugin()
+        plugin._limit_lines = "# 注释\n198.72.127.68:8081,1024,2048\nMP-qb，3000，4000\n坏行\n"
+        mapping = plugin._speed_limit_map()
+        self.assertEqual(mapping["198.72.127.68:8081"], (1024, 2048))
+        self.assertEqual(mapping["mp-qb"], (3000, 4000))
+        self.assertEqual(len(mapping), 2)
+
+    def test_config_parsing_clamps(self):
+        plugin = support.make_plugin(mod)
+        plugin.update_config = lambda cfg: None
+        plugin.run_tests = lambda persist=True: None
+        plugin.init_plugin({"limit_dl_kib": "1500", "limit_up_kib": -5})
+        self.assertEqual(plugin._limit_dl_kib, 1500)
+        self.assertEqual(plugin._limit_up_kib, 0)
+
+
+class PruneSafetyTest(unittest.TestCase):
+    """下架清理的安全边界：删失败不能记账、读不到 status 不能删、关了就不能删。"""
+
+    HASH = "b" * 40
+
+    def _plugin(self, status="withdrawn", mode="seed", delete_ok=True):
+        plugin = support.make_plugin(mod)
+        plugin._seedgroup_enabled = True
+        plugin._seedgroup_prune_mode = mode
+        plugin._seedgroup_prune = mode != "off"
+        plugin._seedgroup_prune_files = mode == "files"
+        plugin._seedgroup_tier = "2T"
+        plugin._seedgroup_custom_gib = 2048
+        plugin._seedgroup_cron = "0 */6 * * *"
+        plugin._seedgroup_api_key = ""
+        plugin._seedgroup_staff_prefix = "工作组"
+        plugin._seedgroup_allow_admin = True
+        plugin._seedgroup_client_mode = "custom"
+        plugin._seedgroup_use_mp_clients = False
+        plugin._seedgroup_clients_lines = ""
+        plugin._seedgroup_target_client = ""
+        plugin._seedgroup_save_path = ""
+        plugin._seedgroup_skip_check = True
+        client = support.FakeClient()
+        client.list_completed = lambda: [
+            {"hash": self.HASH, "name": "x", "size": mod.GIB,
+             "tags": mod.SEED_GROUP_TAG, "state": "uploading"}]
+        if not delete_ok:
+            client.delete = lambda hashes, delete_files=False: False
+        plugin._sg_clients = lambda: [client]
+        body = json.dumps({"id": 3, "status": status, "official": True}).encode()
+        plugin._cola = lambda m, p, **k: mod._HttpResult(200, body, body.decode())
+        plugin.save_data("seedgroup_items", {self.HASH: {"torrent_id": 3}})
+        return plugin, client
+
+    def test_delete_failure_is_not_counted(self):
+        plugin, client = self._plugin(status="withdrawn", delete_ok=False)
+        out = plugin._sg_prune()
+        self.assertEqual(out["removed"], 0)
+        self.assertEqual(out["failed"], 1)
+        self.assertIn(self.HASH, plugin.get_data("seedgroup_items"))
+
+    def test_missing_status_is_kept(self):
+        plugin, client = self._plugin(status="")
+        out = plugin._sg_prune()
+        self.assertEqual(out["removed"], 0)
+        self.assertEqual(out["kept"], 1)
+
+    def test_prune_off_does_nothing(self):
+        plugin, client = self._plugin(status="withdrawn", mode="off")
+        out = plugin._sg_prune()
+        self.assertEqual(out["removed"], 0)
+        self.assertEqual(client.deleted, [])
+        self.assertIn("关闭", out["reason"])
+
+    def test_dirty_torrent_id_is_unmapped(self):
+        plugin, client = self._plugin()
+        plugin.save_data("seedgroup_items", {self.HASH: {"torrent_id": "abc"}})
+        out = plugin._sg_prune()
+        self.assertEqual(out["unmapped"], 1)
+        self.assertEqual(out["removed"], 0)
+
+    def test_mp_client_without_delete_reports_failure(self):
+        plugin = self._plugin()
+        mp = mod._MPClient("MP-x", lambda: [], lambda **kw: (True, []), None)
+        self.assertFalse(mp.delete(["deadbeef"]))
+
+
+class RotateTest(unittest.TestCase):
+    """动态保种：达标后删「做种人数最多」的、补「最少」的，每次 N 颗。"""
+
+    def _plugin(self, rotate=True, count=5):
+        plugin = support.make_plugin(mod)
+        plugin._seedgroup_enabled = True
+        plugin._seedgroup_rotate = rotate
+        plugin._seedgroup_rotate_count = count
+        plugin._seedgroup_rotate_files = True
+        plugin._seedgroup_tier = "2T"
+        plugin._seedgroup_custom_gib = 2048
+        plugin._seedgroup_cron = "0 */6 * * *"
+        plugin._seedgroup_api_key = ""
+        plugin._seedgroup_staff_prefix = "工作组"
+        plugin._seedgroup_allow_admin = True
+        plugin._seedgroup_client_mode = "custom"
+        plugin._seedgroup_use_mp_clients = False
+        plugin._seedgroup_clients_lines = ""
+        plugin._seedgroup_target_client = ""
+        plugin._seedgroup_save_path = ""
+        plugin._seedgroup_skip_check = True
+        plugin.update_config = lambda cfg: None
+        plugin.post_message = lambda **k: None
+        plugin.SG_DOWNLOAD_GAP = 0        # 测试里不等节流
+        return plugin
+
+    def test_rotate_disabled(self):
+        plugin = self._plugin(rotate=False)
+        out = plugin._sg_rotate([support.FakeClient()], {}, [])
+        self.assertIn("关闭", out["reason"])
+
+    def test_drops_highest_seeders_and_adds_lowest(self):
+        plugin = self._plugin()
+        # 客户端里已有 A(seeders=900) B(seeders=400)；C(seeders=3)/D(seeders=1) 未保
+        client = support.FakeClient()
+        client.list_completed = lambda: [
+            {"hash": "a" * 40, "tags": mod.SEED_GROUP_TAG, "size": mod.GIB},
+            {"hash": "b" * 40, "tags": mod.SEED_GROUP_TAG, "size": mod.GIB},
+        ]
+        plugin.save_data("seedgroup_items", {
+            "a" * 40: {"torrent_id": 1, "name": "A"},
+            "b" * 40: {"torrent_id": 2, "name": "B"},
+        })
+        pool = [
+            {"torrent_id": 1, "info_hash": "a" * 40, "name": "A", "seeders": 900, "size": mod.GIB},
+            {"torrent_id": 2, "info_hash": "b" * 40, "name": "B", "seeders": 400, "size": mod.GIB},
+            {"torrent_id": 3, "info_hash": "c" * 40, "name": "C", "seeders": 3, "size": mod.GIB},
+            {"torrent_id": 4, "info_hash": "d" * 40, "name": "D", "seeders": 1, "size": mod.GIB},
+        ]
+        plugin._sg_download = lambda item: support.make_torrent(name=str(item.get("name")))
+        out = plugin._sg_rotate([client], {}, pool)
+        self.assertEqual(out["dropped"], 2)          # count=5 但只有 2 颗可删
+        self.assertEqual(out["added"], 2)
+        self.assertTrue(any("A" in n for n in out["dropped_names"]))   # 900 先删
+        self.assertTrue(any("D" in n for n in out["added_names"]))     # 1 先补
+        self.assertIn("a" * 40, client.deleted)
+
+    def test_rotate_respects_count(self):
+        plugin = self._plugin(count=1)
+        client = support.FakeClient()
+        client.list_completed = lambda: [{"hash": "a" * 40, "tags": mod.SEED_GROUP_TAG, "size": mod.GIB}]
+        plugin.save_data("seedgroup_items", {"a" * 40: {"torrent_id": 1, "name": "A"}})
+        pool = [{"torrent_id": 1, "info_hash": "a" * 40, "name": "A", "seeders": 50, "size": mod.GIB},
+                {"torrent_id": 2, "info_hash": "b" * 40, "name": "B", "seeders": 0, "size": mod.GIB}]
+        plugin._sg_download = lambda item: support.make_torrent()
+        out = plugin._sg_rotate([client], {}, pool)
+        self.assertEqual(out["dropped"], 1)
+        self.assertEqual(out["added"], 1)
+
+    def test_rotate_skips_unknown_torrent(self):
+        plugin = self._plugin()
+        client = support.FakeClient()
+        client.list_completed = lambda: [{"hash": "z" * 40, "tags": mod.SEED_GROUP_TAG, "size": mod.GIB}]
+        plugin.save_data("seedgroup_items", {"z" * 40: {"torrent_id": 99, "name": "Z"}})
+        out = plugin._sg_rotate([client], {}, [{"torrent_id": 1, "name": "A", "seeders": 1}])
+        self.assertEqual(out["dropped"], 0)
+        self.assertIn("查不到", out["reason"])
+
+
+class AllTierTest(unittest.TestCase):
+    """「全站官种」档：目标按未过滤的池子算，跳过表不能让它缩水。"""
+
+    def _plugin(self):
+        plugin = support.make_plugin(mod)
+        plugin._session_token = "tok"
+        plugin._seedgroup_enabled = True
+        plugin._seedgroup_tier = "all"
+        plugin._seedgroup_custom_gib = 2048
+        plugin._seedgroup_cron = "0 */6 * * *"
+        plugin._seedgroup_api_key = ""
+        plugin._seedgroup_staff_prefix = "工作组"
+        plugin._seedgroup_allow_admin = True
+        plugin._seedgroup_client_mode = "custom"
+        plugin._seedgroup_use_mp_clients = False
+        plugin._seedgroup_clients_lines = ""
+        plugin._seedgroup_target_client = ""
+        plugin._seedgroup_save_path = ""
+        plugin._seedgroup_skip_check = True
+        plugin._seedgroup_prune_mode = "off"
+        plugin._seedgroup_prune = False
+        plugin._seedgroup_report = False
+        plugin.update_config = lambda cfg: None
+        plugin.post_message = lambda **k: None
+        plugin.seed_group_identity = lambda: {"ok": True, "staff": True, "reason": "", "uid": 7,
+                                              "username": "yg", "roles": [], "groups": ["工作组-保种"]}
+        return plugin
+
+    def test_target_ignores_skip_table(self):
+        plugin = self._plugin()
+        client = support.FakeClient()
+        client.list_completed = lambda: []
+        plugin._sg_clients = lambda: [client]
+        plugin._cola = lambda m, p, **k: mod._HttpResult(200, b"{}", "{}")
+        plugin._sg_candidates = lambda: [
+            {"torrent_id": 1, "info_hash": "a" * 40, "size": 100 * mod.GIB},
+            {"torrent_id": 2, "info_hash": "c" * 40, "size": 50 * mod.GIB},
+        ]
+        plugin.save_data("seedgroup_skip", {"2": {"at": 9_999_999_999, "reason": "fail"}})
+        plugin._sg_download = lambda item: support.make_torrent()
+        plugin._seed_group_sync()
+        state = plugin.get_data("seedgroup_state")
+        # 池子总量 150；跳过的 50 只是这轮不加，目标不能缩成 100
+        self.assertEqual(state["target_gib"], 150.0)
+        self.assertEqual(state["pool_count"], 2)
+        self.assertEqual(state["pool_pending"], 1)
+
+    def test_custom_unit_from_config(self):
+        plugin = self._plugin()
+        plugin.update_config = lambda cfg: None
+        plugin.run_tests = lambda persist=True: None
+        plugin._session_token = ""
+        plugin.init_plugin({"seedgroup_tier": "custom", "seedgroup_custom_gib": "1T"})
+        self.assertEqual(plugin._seedgroup_custom_gib, 1024)
+        self.assertEqual(mod.seed_group_target_gib("custom", plugin._seedgroup_custom_gib), 1024)
+
+
+class SpeedReportTest(unittest.TestCase):
+    """限速情况上报：只统计开了保种组的用户。"""
+
+    def _plugin(self, enabled=True, report=True):
+        plugin = support.make_plugin(mod)
+        plugin._seedgroup_enabled = enabled
+        plugin._seedgroup_report = report
+        plugin._seedgroup_report_url = "http://23.81.118.186:18099/report"
+        plugin._seedgroup_report_token = ""
+        plugin._seedgroup_tier = "2T"
+        plugin._seedgroup_scope = "site"
+        plugin._seedgroup_custom_gib = 2048
+        plugin.save_data("seedgroup_unlock", {"ok": True, "at": 1, "until": 9999999999,
+                                             "uid": 18, "username": "goblin",
+                                             "groups": ["工作组-组长"]})
+        return plugin
+
+    def test_skips_when_group_disabled(self):
+        plugin = self._plugin(enabled=False)
+        out = plugin._report_seedgroup([support.FakeClient()], {})
+        self.assertTrue(out["skipped"])
+        self.assertIn("未启用", out["reason"])
+
+    def test_skips_when_report_off(self):
+        plugin = self._plugin(report=False)
+        out = plugin._report_seedgroup([support.FakeClient()], {})
+        self.assertTrue(out["skipped"])
+
+    def test_payload_contains_client_limits(self):
+        plugin = self._plugin()
+
+        class Limited(support.FakeClient):
+            name = "198.72.127.68:8081"
+
+            def get_speed_limits(self):
+                return {"dl_kib": 1024, "up_kib": 2048, "dl_enabled": True, "up_enabled": True}
+
+        captured = {}
+
+        def fake_curl(method, url, **kwargs):
+            captured["url"] = url
+            captured["body"] = kwargs.get("json_body")
+            return mod._HttpResult(200, b"{}", "{}")
+
+        original, mod._curl = mod._curl, fake_curl
+        try:
+            out = plugin._report_seedgroup([Limited()], {"tier": "2T", "covered_gib": 100})
+        finally:
+            mod._curl = original
+        self.assertTrue(out["ok"])
+        client = captured["body"]["clients"][0]
+        self.assertEqual(client["client"], "198.72.127.68:8081")
+        self.assertEqual(client["dl_kib"], 1024)
+        self.assertEqual(client["up_kib"], 2048)
+        self.assertEqual(captured["body"]["uid"], 18)
+        self.assertEqual(captured["body"]["username"], "goblin")
+        self.assertIn("enforced", captured["body"])
+
+    def test_failure_is_recorded_not_raised(self):
+        plugin = self._plugin()
+
+        def fake_curl(method, url, **kwargs):
+            return mod._HttpResult(404, b"", "404 page not found")
+
+        original, mod._curl = mod._curl, fake_curl
+        try:
+            out = plugin._report_seedgroup([support.FakeClient()], {})
+        finally:
+            mod._curl = original
+        self.assertFalse(out["ok"])
+        self.assertIn("404", out["reason"])
+        self.assertFalse(plugin.get_data("seedgroup_report_last")["ok"])
+
+    def test_unreadable_client_marked(self):
+        plugin = self._plugin()
+
+        class Blind(support.FakeClient):
+            name = "mp-client"
+
+        captured = {}
+
+        def fake_curl(method, url, **kwargs):
+            captured["body"] = kwargs.get("json_body")
+            return mod._HttpResult(200, b"", "")
+
+        original, mod._curl = mod._curl, fake_curl
+        try:
+            plugin._report_seedgroup([Blind()], {})
+        finally:
+            mod._curl = original
+        row = captured["body"]["clients"][0]
+        self.assertFalse(row["readable"])
+        self.assertIsNone(row["dl_kib"])
+
+
+class SeedGroupModeTest(unittest.TestCase):
+    """档位/下载器来源/清理模式这三处「容易互相打架」的配置。"""
+
+    def _plugin(self, **over):
+        plugin = support.make_plugin(mod)
+        plugin.update_config = lambda cfg: None
+        plugin.run_tests = lambda persist=True: None
+        plugin._session_token = ""
+        plugin.init_plugin(dict(over))
+        return plugin
+
+    def test_all_tier_is_dynamic(self):
+        self.assertEqual(mod.seed_group_tier_key("all"), "all")
+        self.assertEqual(mod.seed_group_tier_key("SITE"), "all")
+        self.assertEqual(mod.seed_group_target_gib("all"), 0)
+        self.assertIn("全站官种", mod.SEED_GROUP_TIER_LABELS["all"])
+
+    def test_client_mode_explicit(self):
+        self.assertEqual(self._plugin(seedgroup_client_mode="custom")._seedgroup_client_mode, "custom")
+        self.assertFalse(self._plugin(seedgroup_client_mode="custom")._seedgroup_use_mp_clients)
+
+    def test_client_mode_backward_compatible(self):
+        # 老配置只有 use_mp_clients=false → 等价于 custom
+        plugin = self._plugin(seedgroup_use_mp_clients=False)
+        self.assertEqual(plugin._seedgroup_client_mode, "custom")
+
+    def test_prune_mode_explicit(self):
+        self.assertEqual(self._plugin(seedgroup_prune_mode="off")._seedgroup_prune_mode, "off")
+        self.assertFalse(self._plugin(seedgroup_prune_mode="off")._seedgroup_prune)
+        files = self._plugin(seedgroup_prune_mode="files")
+        self.assertTrue(files._seedgroup_prune and files._seedgroup_prune_files)
+
+    def test_prune_mode_backward_compatible(self):
+        plugin = self._plugin(seedgroup_prune=True, seedgroup_prune_files=True)
+        self.assertEqual(plugin._seedgroup_prune_mode, "files")
+        plugin = self._plugin(seedgroup_prune=False)
+        self.assertEqual(plugin._seedgroup_prune_mode, "off")
+
+    def test_form_has_no_scope_selector(self):
+        plugin = support.make_plugin(mod)
+        form, _ = plugin.get_form()
+        blob = json.dumps(form, ensure_ascii=False)
+        self.assertNotIn('"model": "seedgroup_scope"', blob)
+        self.assertIn('"model": "seedgroup_client_mode"', blob)
+        self.assertIn('"model": "seedgroup_prune_mode"', blob)
+        self.assertIn('"value": "all"', blob)
+
+
+class FormLayoutTest(unittest.TestCase):
+    """设置页排版的结构检查：字段不漏、组件合法、分区顺序稳定。"""
+
+    ALLOWED = {"VForm", "VRow", "VCol", "VAlert", "VSwitch", "VTextField",
+               "VSelect", "VTextarea", "VDivider"}
+
+    def _walk(self, node, components, models, titles):
+        if isinstance(node, dict):
+            comp = node.get("component")
+            if comp:
+                components.append(comp)
+            props = node.get("props") or {}
+            if props.get("model"):
+                models.append(props["model"])
+            if comp == "VAlert" and props.get("title"):
+                titles.append(props["title"])
+            for value in node.values():
+                self._walk(value, components, models, titles)
+        elif isinstance(node, list):
+            for item in node:
+                self._walk(item, components, models, titles)
+
+    def test_components_and_models_are_declared(self):
+        plugin = support.make_plugin(mod)
+        form, defaults = plugin.get_form()
+        components, models, titles = [], [], []
+        self._walk(form, components, models, titles)
+        unknown = set(components) - self.ALLOWED
+        self.assertFalse(unknown, f"表单里出现未验证过的组件：{unknown}")
+        missing = [m for m in models if m not in defaults]
+        self.assertFalse(missing, f"这些字段没有默认值：{missing}")
+        self.assertEqual(len(models), len(set(models)), "同一个字段在表单里出现了两次")
+
+    def test_sections_in_order(self):
+        plugin = support.make_plugin(mod)
+        form, _ = plugin.get_form()
+        _, _, titles = [], [], []
+        components, models, titles = [], [], []
+        self._walk(form, components, models, titles)
+        ordered = [t for t in titles if t[:1] in "①②③④⑤"]
+        self.assertEqual(len(ordered), 6, ordered)   # ④-2 是限速接管
+        self.assertTrue(ordered[0].startswith("①"))
+        self.assertTrue(ordered[2].startswith("③"))
+        self.assertTrue(ordered[-1].startswith("⑤"))
+
+    def test_critical_models_present(self):
+        plugin = support.make_plugin(mod)
+        form, _ = plugin.get_form()
+        components, models, titles = [], [], []
+        self._walk(form, components, models, titles)
+        for key in ("enabled", "username", "password", "captcha_code", "iyuu_json",
+                    "iyuu_json_file", "sites_mode", "seedgroup_prune_mode", "seedgroup_client_mode",
+                    "limit_dl_kib", "limit_up_kib", "limit_lines",
+                    "use_mp_clients", "clients_lines", "cron",
+                    "seedgroup_enabled", "seedgroup_tier", "seedgroup_custom_gib",
+                    "seedgroup_cron", "seedgroup_client_mode", "seedgroup_clients_lines",
+                    "seedgroup_rotate", "seedgroup_rotate_count"):
+            self.assertIn(key, models, key)
+
+    def test_removed_fields_stay_out_of_ui(self):
+        plugin = support.make_plugin(mod)
+        form, _ = plugin.get_form()
+        components, models, titles = [], [], []
+        self._walk(form, components, models, titles)
+        for key in ("seedgroup_api_key", "seedgroup_staff_prefix", "seedgroup_allow_admin"):
+            self.assertNotIn(key, models)
+
+
+class IyuuImportTest(unittest.TestCase):
+    SAMPLE = json.dumps([
+        {"id": 1, "sid": 1, "site": "keepfrds", "nickname": "朋友",
+         "base_url": "pt.keepfrds.com", "mirror": "", "cookie": "", "cookie_required": 0,
+         "download_page": "download.php?id={}&passkey={passkey}", "is_https": 2, "disabled": 0,
+         "options": {"passkey": "a" * 32, "uid": "133256"}},
+        {"id": 2, "sid": 2, "site": "hdhome", "nickname": "家园",
+         "base_url": "hdhome.org", "mirror": "", "cookie": "c=1", "cookie_required": 0,
+         "download_page": "download.php?id={}&uid={uid}&hash={hash}", "is_https": 1, "disabled": 0,
+         "options": {"passkey": "b" * 32, "uid": "1", "downhash": "abc"}},
+        {"id": 3, "sid": 3, "site": "off", "nickname": "关掉的",
+         "base_url": "off.example", "disabled": 1, "options": {"passkey": "c" * 32}},
+    ], ensure_ascii=False)
+
+    def _plugin(self):
+        plugin = support.make_plugin(mod)
+        plugin.update_config = lambda cfg: None
+        plugin._sites_lines = ""
+        plugin._sites_mode = "merge"
+        plugin._iyuu_json = ""
+        return plugin
+
+    def test_import_carries_uid_downhash_cookie(self):
+        plugin = self._plugin()
+        out = plugin._iyuu_import(self.SAMPLE)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["total"], 3)
+        self.assertEqual(out["enabled"], 2)
+        self.assertEqual(out["usable"], 2)
+        by_host = {s["url"].split("://", 1)[-1].split("/")[0]: s for s in plugin._iyuu_sites()}
+        self.assertEqual(by_host["pt.keepfrds.com"]["uid"], 133256)
+        self.assertEqual(by_host["hdhome.org"]["downhash"], "abc")
+        self.assertEqual(by_host["hdhome.org"]["cookie"], "c=1")
+
+    def test_import_switches_manual_to_merge(self):
+        # 原来只用行文本的用户：导入后变成「IYUU + 行文本」，手写行不会被丢掉
+        plugin = self._plugin()
+        plugin._sites_mode = "manual"
+        plugin._iyuu_import(self.SAMPLE)
+        self.assertEqual(plugin._sites_mode, "merge")
+
+    def test_iyuu_only_ignores_manual_lines(self):
+        plugin = self._plugin()
+        plugin._sites_mode = "iyuu_only"
+        plugin._sites_lines = "老站,https://old.example.com,passkey=" + "d" * 32
+        plugin._iyuu_json = self.SAMPLE
+        hosts = [s["url"] for s in plugin._other_sites()]
+        self.assertEqual(len(hosts), 2)
+        self.assertTrue(all("old.example.com" not in h for h in hosts))
+
+    def test_import_rejects_bad_json(self):
+        plugin = self._plugin()
+        out = plugin._iyuu_import("{not json")
+        self.assertFalse(out["ok"])
+        self.assertIn("解析失败", out["reason"])
+
+    def test_import_without_payload_uses_stored(self):
+        plugin = self._plugin()
+        plugin._iyuu_json = self.SAMPLE
+        out = plugin._iyuu_import("")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["usable"], 2)
+
+
 class SeedGroupTierTest(unittest.TestCase):
     def test_tiers_are_gib_floor(self):
         self.assertEqual(mod.seed_group_target_gib("2T"), 2048)
         self.assertEqual(mod.seed_group_target_gib("5T"), 5120)
         self.assertEqual(mod.seed_group_target_gib("10T"), 10240)
+        self.assertEqual(mod.seed_group_target_gib("15T"), 15360)
+        self.assertEqual(mod.seed_group_target_gib("20T"), 20480)
+
+    def test_old_20t_plus_alias(self):
+        # 老配置写的 20T+ 就是现在的 20T（改名不改数值）
         self.assertEqual(mod.seed_group_target_gib("20T+"), 20480)
+        self.assertEqual(mod.seed_group_tier_key("20T+"), "20T")
+
+    def test_custom_tier_accepts_free_sizes(self):
+        # 自定义档可以填 100M / 100G / 1T / 1P；只有 0 会被抬到 1 GiB
+        self.assertEqual(mod.seed_group_target_gib("custom", "100G"), 100)
+        self.assertEqual(mod.seed_group_target_gib("custom", "1T"), 1024)
+        self.assertEqual(mod.seed_group_target_gib("custom", "1P"), 1024 * 1024)
+        self.assertEqual(mod.seed_group_target_gib("custom", "2048"), 2048)
+        self.assertEqual(mod.seed_group_target_gib("custom", 2048), 2048)
+        self.assertEqual(mod.seed_group_target_gib("custom", "100M"), 1)
+        self.assertEqual(mod.seed_group_target_gib("custom", 0), 1)
+        self.assertEqual(mod.seed_group_target_gib("custom", None), 1)
+        self.assertEqual(mod.seed_group_target_gib("custom", "1p"), 1024 * 1024)
+
+    def test_parse_size_units(self):
+        self.assertAlmostEqual(mod.parse_size_gib("100M"), 100 / 1024, places=4)
+        self.assertAlmostEqual(mod.parse_size_gib("100G"), 100.0)
+        self.assertAlmostEqual(mod.parse_size_gib("1T"), 1024.0)
+        self.assertAlmostEqual(mod.parse_size_gib("2TiB"), 2048.0)
+        self.assertAlmostEqual(mod.parse_size_gib("2048"), 2048.0)
+        self.assertEqual(mod.parse_size_gib("abc"), 0.0)
+        self.assertEqual(mod.parse_size_gib(""), 0.0)
+
+    def test_form_has_custom_field_and_hides_removed(self):
+        plugin = support.make_plugin(mod)
+        form, defaults = plugin.get_form()
+        blob = json.dumps(form, ensure_ascii=False)
+        self.assertIn("seedgroup_custom_gib", blob)
+        self.assertIn("seedgroup_tier", blob)
+        # 这三项按老板要求从界面上撤掉了
+        for key in ("seedgroup_api_key", "seedgroup_staff_prefix", "seedgroup_allow_admin"):
+            self.assertNotIn('"model": "%s"' % key, blob)
+        self.assertEqual(defaults["seedgroup_custom_gib"], 2048)
+        self.assertEqual(defaults.get("seedgroup_scope"), "site")
 
     def test_unknown_tier_falls_back_to_smallest(self):
         # 写错档位不能退化成「不保种」：一律按 2T 下限走
@@ -894,6 +1910,14 @@ class SeedGroupPluginTest(unittest.TestCase):
         self.assertIn("可乐保种组", blob)
         self.assertIn("工作组-保种", blob)
 
+    def test_panel_ignores_expired_unlock(self):
+        plugin = self._plugin()
+        plugin.save_data("seedgroup_unlock", {"ok": True, "at": 1, "until": 2,
+                                             "groups": ["工作组-保种"]})
+        blob = json.dumps(plugin._seedgroup_panel(), ensure_ascii=False)
+        self.assertIn("强制锁定", blob)
+        self.assertNotIn("资格：工作组", blob)
+
     def test_panel_shows_locked_reason(self):
         plugin = self._plugin()
         plugin.save_data("seedgroup_unlock", {"ok": False, "at": 0, "until": 0,
@@ -903,8 +1927,35 @@ class SeedGroupPluginTest(unittest.TestCase):
 
     def test_service_registers_seed_group_job(self):
         plugin = self._plugin()
+        plugin._enabled = True
+        plugin._crossseed_enabled = True
         names = [s["name"] for s in plugin.get_service()]
         self.assertIn("可乐保种组", names)
+
+    def test_service_matrix(self):
+        """总开关 × 功能开关 四种组合：两个功能互不影响，总开关一关全不跑。"""
+        plugin = self._plugin()
+        plugin._cron = "0 */1 * * *"
+        plugin._seedgroup_cron = "0 */6 * * *"
+
+        def names(enabled, cross, seed):
+            plugin._enabled, plugin._crossseed_enabled, plugin._seedgroup_enabled = enabled, cross, seed
+            return [x["id"] for x in plugin.get_service()]
+
+        self.assertEqual(names(False, True, True), [])
+        self.assertEqual(names(True, True, True), ["ColaCrossSeed", "ColaCrossSeedSeedGroup"])
+        self.assertEqual(names(True, True, False), ["ColaCrossSeed"])
+        self.assertEqual(names(True, False, True), ["ColaCrossSeedSeedGroup"])
+
+    def test_service_trigger_is_object_not_string(self):
+        plugin = self._plugin()
+        plugin._enabled = True
+        plugin._crossseed_enabled = True
+        plugin._cron = "0 */1 * * *"
+        plugin._seedgroup_cron = "   "      # 空白：应回退成合法触发器而不是原样字符串
+        for svc in plugin.get_service():
+            self.assertNotIsInstance(svc["trigger"], str, svc)
+            self.assertTrue(hasattr(svc["trigger"], "from_crontab") or svc["trigger"] is not None)
 
     def test_service_empty_when_disabled(self):
         plugin = self._plugin()

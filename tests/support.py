@@ -114,7 +114,19 @@ def _install_stubs() -> None:
     if not _loadable("apscheduler.triggers.cron"):
         _module("apscheduler").__path__ = []
         _module("apscheduler.triggers").__path__ = []
-        _module("apscheduler.triggers.cron", CronTrigger=type("CronTrigger", (), {}))
+        class _StubCronTrigger:
+            """桩：记录 crontab 表达式，够测「传进去的是对象还是字符串」。"""
+
+            def __init__(self, expr: str = ""):
+                self.expr = expr
+
+            @classmethod
+            def from_crontab(cls, expr):
+                if len(str(expr).split()) != 5:
+                    raise ValueError(f"bad crontab: {expr!r}")
+                return cls(str(expr))
+
+        _module("apscheduler.triggers.cron", CronTrigger=_StubCronTrigger)
 
 
 def load_plugin():
@@ -141,6 +153,7 @@ class FakeClient:
         self.added = []
         self.trackers = []
         self.deleted = []
+        self.speed_limits = None
 
     def list_completed(self):
         return []
@@ -156,6 +169,10 @@ class FakeClient:
 
     def add_trackers(self, info_hash, urls):
         self.trackers.append((info_hash, list(urls)))
+        return True
+
+    def set_speed_limits(self, dl_kib, up_kib):
+        self.speed_limits = (dl_kib, up_kib)
         return True
 
     def tagged_missing(self, tag):
@@ -191,6 +208,7 @@ def make_plugin(module, store=None, **attrs):
     plugin._site_counter = {}
     plugin._site_fails = {}
     plugin._iyuu_rate_limited = False
+    plugin._seedgroup_report = False      # 测试默认不往 23 汇报，避免真发请求
     plugin._max_per_hour = 0
     plugin._max_per_site = 20
     plugin._skip_check = True

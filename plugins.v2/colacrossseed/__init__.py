@@ -65,7 +65,7 @@ UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chr
 
 # ---------------- 可乐保种组 ----------------
 # 「可乐保种组」= 站点侧的定向保种计划：给授权成员开放一组资源池，成员按档位
-# （2T / 5T / 10T / 20T+）把池子纳入做种，**体积只能超、不能少**。
+# （2T / 5T / 10T / 15T / 20T / 自定义≥2T）把池子纳入做种，**体积只能超、不能少**。
 # 站点的权限/资源接口尚未上线，这里先按预留的 v1 契约探测（见 docs/seed-group-api.md）：
 # 拿不到 200 就整块锁定，面板上直说缺什么，不静默失败。
 SEED_GROUP_TAG = "可乐保种组"
@@ -77,21 +77,131 @@ SEED_GROUP_STAFF_PREFIX = "工作组"
 # 官方发布清单（机器面）：X-API-Key，一页最多 100 条，不回 Cookie。
 OFFICIAL_API = "/api/v1/automation/official/torrents"
 OFFICIAL_PAGE_LIMIT = 100
+# 限速上报收集端：走站点域名（HTTPS），不暴露源站 IP
+SEED_GROUP_REPORT_URL = "https://www.colapt.com/seedgroup-report"
 # 站点将来若提供专用的保种组资源池接口，插件优先走它；没有就走官方清单。
 SEED_GROUP_API = "/api/v1/plugin/seed-group"
-# 档位 -> 体积下限（GiB）
-SEED_GROUP_TIERS: Dict[str, int] = {"2T": 2048, "5T": 5120, "10T": 10240, "20T+": 20480}
+# 档位 -> 体积下限（GiB）。固定档之外还有一个 custom（自定义），下限同样不许低于 20T。
+SEED_GROUP_TIERS: Dict[str, int] = {"2T": 2048, "5T": 5120, "10T": 10240, "15T": 15360, "20T": 20480}
+SEED_GROUP_CUSTOM_TIER = "custom"
+SEED_GROUP_ALL_TIER = "all"        # 全站官种：有多少保多少（target 由池子总量决定）
+SEED_GROUP_CUSTOM_MIN_GIB = 1              # 自定义档只要求「不是 0」：100M / 100G / 1T / 1P 都行
+SEED_GROUP_CUSTOM_MAX_GIB = 1024 * 1024    # 上限 1 PiB（防手滑填天文数字）
+# 老配置里的 “20T+” 就是现在的 20T（档位改名，不改数值）
+SEED_GROUP_TIER_ALIASES: Dict[str, str] = {"20T+": "20T"}
 SEED_GROUP_TIER_LABELS: Dict[str, str] = {
     "2T": "2T 档（≥ 2048 GiB）",
     "5T": "5T 档（≥ 5120 GiB）",
     "10T": "10T 档（≥ 10240 GiB）",
-    "20T+": "20T+ 档（≥ 20480 GiB）",
+    "15T": "15T 档（≥ 15360 GiB）",
+    "20T": "20T 档（≥ 20480 GiB）",
+    SEED_GROUP_CUSTOM_TIER: "自定义档（100M / 100G / 1T / 1P）",
+    SEED_GROUP_ALL_TIER: "全站官种（有多少保多少）",
 }
 
 
-def seed_group_target_gib(tier: str) -> int:
-    """档位 → 体积下限（GiB）。未知档位退回最小档，绝不返回 0。"""
-    return SEED_GROUP_TIERS.get(str(tier or "").strip(), SEED_GROUP_TIERS["2T"])
+def seed_group_tier_key(tier: str) -> str:
+    """把配置里的档位归一化：大小写不敏感，老值 20T+ → 20T，未知值 → 2T。"""
+    key = str(tier or "").strip()
+    key = SEED_GROUP_TIER_ALIASES.get(key, key)
+    if key.upper() == SEED_GROUP_CUSTOM_TIER.upper():
+        return SEED_GROUP_CUSTOM_TIER
+    if key.upper() in (SEED_GROUP_ALL_TIER.upper(), "SITE", "ALL-OFFICIAL"):
+        return SEED_GROUP_ALL_TIER
+    for name in SEED_GROUP_TIERS:
+        if key.upper() == name.upper():
+            return name
+    return "2T"
+
+
+SIZE_UNITS_GIB = {"M": 1.0 / 1024, "G": 1.0, "T": 1024.0, "P": 1024.0 * 1024}
+
+
+def parse_size_gib(value: Any) -> float:
+    """把「100M / 100G / 1T / 1P / 2048」解析成 GiB。
+
+    不带单位的数字按 GiB 理解（老配置 seedgroup_custom_gib=2048 仍成立）；
+    单位大小写、B/iB 后缀都容忍。解析不出来返回 0。
+    """
+    text = str(value or "").strip().upper().replace("IB", "").replace("B", "").strip()
+    if not text:
+        return 0.0
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([MGPT]?)$", text)
+    if not match:
+        return 0.0
+    try:
+        number = float(match.group(1))
+    except Exception:
+        return 0.0
+    unit = match.group(2) or "G"
+    return max(0.0, number * SIZE_UNITS_GIB.get(unit, 1.0))
+
+
+def seed_group_target_gib(tier: str, custom_gib: Any = None) -> int:
+    """档位 → 体积下限（GiB）。
+
+    · 固定档查表；未知档退回 2T，绝不返回 0；
+    · 自定义档支持带单位（100M / 100G / 1T / 1P），不带单位按 GiB；只有 0 会被抬到 1 GiB。
+    """
+    key = seed_group_tier_key(tier)
+    if key == SEED_GROUP_ALL_TIER:
+        return 0          # 0 = 动态：由资源池总量决定（调用方自己算）
+    if key == SEED_GROUP_CUSTOM_TIER:
+        value = int(round(parse_size_gib(custom_gib)))
+        # 只要求「大于 0」；上限 1 PiB 只是防手滑
+        return max(SEED_GROUP_CUSTOM_MIN_GIB, min(value, SEED_GROUP_CUSTOM_MAX_GIB))
+    return SEED_GROUP_TIERS[key]
+
+
+def _seed_group_key(item: Dict[str, Any]) -> str:
+    """条目唯一键：torrent_id 优先（0 也是合法值），否则退回 info_hash。"""
+    if not isinstance(item, dict):
+        return ""
+    tid = item.get("torrent_id")
+    if tid is not None and str(tid).strip() != "":
+        return str(tid).strip()
+    return str(item.get("info_hash") or "").strip()
+
+
+def _as_float(value: Any) -> float:
+    try:
+        return max(0.0, float(str(value).strip()))
+    except Exception:
+        return 0.0
+
+
+def _site_proxy(proxy: Any, auth: Any) -> str:
+    """把 IYUU 的「代理服务器 + 代理验证」拼成插件认的 proxy URL。
+
+    IYUU 存的是 `192.168.1.2:8080` 与 `user:pass`；插件需要 `http://user:pass@host:port`。
+    已经是完整 URL 的原样保留。
+    """
+    host = str(proxy or "").strip()
+    if not host:
+        return ""
+    if "://" not in host:
+        host = "http://" + host
+    secret = str(auth or "").strip()
+    if secret and "@" not in host:
+        head, _, tail = host.partition("://")
+        host = f"{head}://{secret}@{tail}"
+    return host
+
+
+def _disabled(item: Dict[str, Any]) -> bool:
+    """IYUU 的 disabled 有 0/1 也有 "0"/"false" 字符串，统一按真值语义判断。"""
+    value = item.get("disabled")
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no")
+    return bool(value)
+
+
+def _as_int(value: Any) -> int:
+    """sid / uid 这类字段可能是 "abc"：一律降级成 0，别让一行脏数据炸掉整次解析。"""
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return 0
 
 
 def _seed_group_size_gib(size: Any) -> float:
@@ -150,6 +260,22 @@ def seed_group_plan(items: List[Dict[str, Any]], target_gib: float) \
         remaining = float(target_gib) - total
     shortfall = max(0.0, round(float(target_gib) - total, 3))
     return picked, round(total, 3), shortfall
+
+
+def _cron_trigger(expr: Any, fallback: str):
+    """把 5 段 cron 表达式变成「触发器对象」，永远不把字符串交给 MoviePilot。
+
+    以前写错时会把裸字符串塞进 service["trigger"]，MP 原样交给 APScheduler 的
+    add_job(func, trigger) → LookupError → 任务注册失败、任务页看不到该任务。
+    现在：表达式合法就用自己的，非法/段数不对就用 fallback（两者都是硬编码合法值）。
+    """
+    for candidate in (str(expr or "").strip(), fallback):
+        if len(candidate.split()) == 5:
+            try:
+                return CronTrigger.from_crontab(candidate)
+            except Exception:
+                continue
+    return CronTrigger.from_crontab(fallback)
 
 
 class _HttpResult:
@@ -542,10 +668,57 @@ class QBittorrentClient(_Client):
                 data={"username": username, "password": password},
                 timeout=REQUEST_TIMEOUT,
             )
-            if "Ok" not in (rsp.text or ""):
-                logger.warn(f"qBittorrent ({self.name}) 登录失败：{rsp.status_code} {rsp.text[:80]}")
+            # qB 4.x 回 "Ok."，5.x 回 204 No Content（body 为空）：两种都算成功
+            if rsp.status_code in (200, 204) or "Ok" in (rsp.text or ""):
+                return
+            logger.warn(f"qBittorrent ({self.name}) 登录失败：{rsp.status_code} {rsp.text[:80]}")
         except Exception as err:
             logger.error(f"qBittorrent ({self.name}) 连接失败：{err}")
+
+    def get_speed_limits(self) -> Dict[str, Any]:
+        """读取客户端当前的限速设置（不管插件有没有配）。
+
+        返回 {dl_kib, up_kib, dl_enabled, up_enabled}；不支持/读不到返回 {}。
+        """
+        return {}
+
+    def get_speed_limits(self) -> Dict[str, Any]:
+        """qB：preferences 里的 dl_limit / up_limit 是字节/秒，0 = 不限。"""
+        try:
+            rsp = self._session.get(f"{self.url}/api/v2/app/preferences", timeout=REQUEST_TIMEOUT)
+            if rsp.status_code != 200:
+                logger.warn(f"qBittorrent ({self.name}) 读限速返回 {rsp.status_code}")
+                return {}
+            prefs = rsp.json() or {}
+            dl = int(prefs.get("dl_limit") or 0)
+            up = int(prefs.get("up_limit") or 0)
+            return {"dl_kib": dl // 1024, "up_kib": up // 1024,
+                    "dl_enabled": dl > 0, "up_enabled": up > 0, "raw": {"dl": dl, "up": up}}
+        except Exception as err:
+            logger.warn(f"qBittorrent ({self.name}) 读限速异常：{err}")
+            return {}
+
+    def set_speed_limits(self, dl_kib: int, up_kib: int) -> bool:
+        """qB：app/setPreferences 的 dl_limit / up_limit，单位是 **字节/秒**，0 = 不限。"""
+        payload: Dict[str, Any] = {}
+        if dl_kib > 0:
+            payload["dl_limit"] = int(dl_kib) * 1024
+        if up_kib > 0:
+            payload["up_limit"] = int(up_kib) * 1024
+        if not payload:
+            return False
+        try:
+            rsp = self._session.post(
+                f"{self.url}/api/v2/app/setPreferences",
+                data={"json": json.dumps(payload)},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if rsp.status_code == 200:
+                return True
+            logger.warn(f"qBittorrent ({self.name}) 设置限速返回 {rsp.status_code}")
+        except Exception as err:
+            logger.warn(f"qBittorrent ({self.name}) 设置限速异常：{err}")
+        return False
 
     def list_completed(self) -> List[Dict[str, Any]]:
         try:
@@ -740,6 +913,32 @@ class TransmissionClient(_Client):
             self._session.auth = (username, password)
         self._session_id = ""
 
+    def get_speed_limits(self) -> Dict[str, Any]:
+        """TR：session-get 的 speed-limit-down/up（KB/s）+ 各自的 enabled。"""
+        out = self._rpc({"method": "session-get", "arguments": {}})
+        if not out:
+            return {}
+        args = out.get("arguments") or {}
+        dl = int(args.get("speed-limit-down") or 0)
+        up = int(args.get("speed-limit-up") or 0)
+        return {"dl_kib": dl, "up_kib": up,
+                "dl_enabled": bool(args.get("speed-limit-down-enabled")),
+                "up_enabled": bool(args.get("speed-limit-up-enabled"))}
+
+    def set_speed_limits(self, dl_kib: int, up_kib: int) -> bool:
+        """TR：session-set 的 speed-limit-*，单位就是 KB/s，另需 *_enabled=true。"""
+        arguments: Dict[str, Any] = {}
+        if dl_kib > 0:
+            arguments["speed-limit-down"] = int(dl_kib)
+            arguments["speed-limit-down-enabled"] = True
+        if up_kib > 0:
+            arguments["speed-limit-up"] = int(up_kib)
+            arguments["speed-limit-up-enabled"] = True
+        if not arguments:
+            return False
+        out = self._rpc({"method": "session-set", "arguments": arguments})
+        return bool(out) and str(out.get("result") or "") == "success"
+
     def _rpc(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         for _ in range(2):
             try:
@@ -813,14 +1012,15 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.25"
+    plugin_version = "0.10.47"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
     plugin_order = 21
     auth_level = 1
 
-    _enabled = False
+    _enabled = False            # MP 插件总开关：关掉后两个功能都不跑
+    _crossseed_enabled = True   # 功能一：辅种
     _notify = True
     _cron = "0 */1 * * *"
     _username = ""
@@ -833,6 +1033,8 @@ class ColaCrossSeed(_PluginBase):
     _max_per_site = 20       # 单个站点每轮最多补多少
     _site_fail_limit = 3     # 同一个站在同一轮里失败几次后熔断
     _site_counter: Dict[str, int] = {}
+    _site_limits: Dict[str, int] = {}      # 站点 URL -> 本站每轮上限（IYUU 的「辅种数量」）
+    _site_intervals: Dict[str, float] = {} # 站点 URL -> 每颗之间的间隔秒（IYUU 的「辅种间隔」）
     _site_fails: Dict[str, int] = {}
     _direction = "both"
     _use_mp_clients = True
@@ -841,6 +1043,7 @@ class ColaCrossSeed(_PluginBase):
     _sites_json = ""
     _sites_lines = ""
     _iyuu_json = ""
+    _iyuu_json_file = ""       # 容器内路径，例如 /config/cola-sites.json；填了就以文件为准
     _iyuu_token = ""
     _sites_mode = "merge"
     _add_label = ""
@@ -849,20 +1052,41 @@ class ColaCrossSeed(_PluginBase):
     _extra_tags = ""          # 额外附加的标签，逗号分隔
     _fallback_skip_check = True
     _retry_failed = True
+    # 限速接管：>0 才接管对应方向，0/空 = 不去动客户端原有设置
+    _limit_dl_kib = 0
+    _limit_up_kib = 0
+    # 每客户端覆盖：每行 `客户端名或地址,下载KiB/s,上传KiB/s`（命中就覆盖全局，未命中用全局）
+    _limit_lines = ""
     # ---- 可乐保种组（只有工作组账号能解锁；见 docs/seed-group-api.md）----
     _seedgroup_enabled = False
     _seedgroup_tier = "2T"
+    # 保种范围：site = 全站官方种（默认）；pool = 站点保种组专用池（未开放时回落到全站官方种）
+    _seedgroup_scope = "site"
+    _seedgroup_custom_gib = 2048
     _seedgroup_api_key = ""      # 可选：站点机器面 API Key（X-API-Key，拉官方清单更快）
     _seedgroup_staff_prefix = SEED_GROUP_STAFF_PREFIX
     _seedgroup_allow_admin = True
     # 保种组自己的下载器：默认用 MP 已配置的那台（MP 会按自己的规则刮削/整理），
     # 也可以单独填 qB/TR（只给保种组用，不影响辅种的客户端）
+    _seedgroup_client_mode = "mp"      # mp = 用 MP 已配置下载器；custom = 用下面那行
     _seedgroup_use_mp_clients = True
     _seedgroup_clients_lines = ""
     _seedgroup_target_client = ""
     _seedgroup_cron = "0 */6 * * *"
     _seedgroup_save_path = ""
     _seedgroup_skip_check = True
+    # 下架清理：off=不清 / seed=只删种子（默认）/ files=连文件一起删
+    # 动态保种：体积达标后，删「做种人数最多」的、补「做种人数最少」的
+    _seedgroup_rotate = True
+    _seedgroup_rotate_count = 5
+    _seedgroup_rotate_files = True      # 轮换通常要腾空间，默认连文件一起删
+    _seedgroup_prune_mode = "seed"
+    _seedgroup_prune = True
+    _seedgroup_prune_files = False
+    # 限速情况上报：只统计「开了保种组」的用户，辅种用户不采集、不上报
+    _seedgroup_report = True
+    _seedgroup_report_url = "https://www.colapt.com/seedgroup-report"
+    _seedgroup_report_token = ""
     _event = Event()
     _csrf = ""
     # host -> 可用的 pieces-hash 路径（憨憨是 /nexusapi/pieces-hash，其余多为 /api/pieces-hash）；"" 表示不支持
@@ -873,8 +1097,9 @@ class ColaCrossSeed(_PluginBase):
         self.stop_service()
         if config is not None:
             self._enabled = bool(config.get("enabled", False))
+            self._crossseed_enabled = bool(config.get("crossseed_enabled", True))
             self._notify = bool(config.get("notify", True))
-            self._cron = str(config.get("cron") or "0 */1 * * *")
+            self._cron = str(config.get("cron") or "0 */1 * * *").strip()
             self._username = str(config.get("username") or "")
             self._password = str(config.get("password") or "")
             self._otp_code = str(config.get("otp_code") or "")
@@ -888,6 +1113,7 @@ class ColaCrossSeed(_PluginBase):
             self._sites_json = str(config.get("sites_json") or "")
             self._sites_lines = str(config.get("sites_lines") or "")
             self._iyuu_json = str(config.get("iyuu_json") or "")
+            self._iyuu_json_file = str(config.get("iyuu_json_file") or "").strip()
             self._iyuu_token = str(config.get("iyuu_token") or "")
             self._sites_mode = str(config.get("sites_mode") or "merge")
             self._add_label = str(config.get("add_label") or "").strip()
@@ -896,43 +1122,109 @@ class ColaCrossSeed(_PluginBase):
             self._extra_tags = str(config.get("extra_tags") or "").strip()
             self._fallback_skip_check = bool(config.get("fallback_skip_check", True))
             self._retry_failed = bool(config.get("retry_failed", True))
+            try:
+                self._limit_dl_kib = max(0, min(10 ** 7, int(config.get("limit_dl_kib", 0) or 0)))
+                self._limit_up_kib = max(0, min(10 ** 7, int(config.get("limit_up_kib", 0) or 0)))
+            except Exception:
+                self._limit_dl_kib = 0
+                self._limit_up_kib = 0
+            self._limit_lines = str(config.get("limit_lines") or "")
             # 可乐保种组：档位只认白名单里的四个，写错退回最小档（不能退化成「不保种」）
             self._seedgroup_enabled = bool(config.get("seedgroup_enabled", False))
-            self._seedgroup_tier = str(config.get("seedgroup_tier") or "2T").strip()
-            if self._seedgroup_tier not in SEED_GROUP_TIERS:
-                self._seedgroup_tier = "2T"
+            # 档位归一化：老值 20T+ → 20T；未知值退回 2T；custom 走自定义数值
+            self._seedgroup_tier = seed_group_tier_key(config.get("seedgroup_tier") or "2T")
+            # 范围已从 UI 撤掉：统一「全站官种」；老配置里的 pool 也归一成 site（机器面通道只看有没有 Key）
+            self._seedgroup_scope = "site"
+            # 支持 100M / 100G / 1T / 1P（parse_size_gib 也接受纯数字）
+            custom = int(round(parse_size_gib(config.get("seedgroup_custom_gib"))))
+            # 自定义档：100M / 100G / 1T / 1P 都行，只有 0 会被抬到 1 GiB
+            self._seedgroup_custom_gib = max(SEED_GROUP_CUSTOM_MIN_GIB, custom)
             # 旧配置键 seedgroup_api_token 的语义就是这把站点 API Key，读进来兼容
             self._seedgroup_api_key = str(config.get("seedgroup_api_key")
                                           or config.get("seedgroup_api_token") or "").strip()
             self._seedgroup_staff_prefix = (str(config.get("seedgroup_staff_prefix") or "").strip()
                                             or SEED_GROUP_STAFF_PREFIX)
             self._seedgroup_allow_admin = bool(config.get("seedgroup_allow_admin", True))
-            self._seedgroup_use_mp_clients = bool(config.get("seedgroup_use_mp_clients", True))
+            mode = str(config.get("seedgroup_client_mode") or "").strip().lower()
+            if mode in ("mp", "custom"):
+                self._seedgroup_client_mode = mode
+            else:
+                self._seedgroup_client_mode = ("mp" if bool(config.get("seedgroup_use_mp_clients", True))
+                                               else "custom")
+            self._seedgroup_use_mp_clients = self._seedgroup_client_mode == "mp"
             self._seedgroup_clients_lines = str(config.get("seedgroup_clients_lines") or "")
             self._seedgroup_target_client = str(config.get("seedgroup_target_client") or "").strip()
             self._seedgroup_cron = str(config.get("seedgroup_cron") or "0 */6 * * *").strip()
             self._seedgroup_save_path = str(config.get("seedgroup_save_path") or "").strip()
             self._seedgroup_skip_check = bool(config.get("seedgroup_skip_check", True))
-            # 启用保种组时立刻校验工作组资格：不是工作组直接强制关掉，绝不留「打开了但没资格」的状态。
-            if self._seedgroup_enabled and self._session_token:
-                unlock = self.seed_group_unlock()
-                if not unlock.get("ok"):
-                    self._seedgroup_enabled = False
-                    logger.warn(f"保种组解锁被拒：{unlock.get('reason')}")
-                    self._persist()
+            self._seedgroup_rotate = bool(config.get("seedgroup_rotate", True))
+            try:
+                self._seedgroup_rotate_count = max(1, min(50, int(config.get("seedgroup_rotate_count", 5) or 5)))
+            except Exception:
+                self._seedgroup_rotate_count = 5
+            self._seedgroup_rotate_files = bool(config.get("seedgroup_rotate_files", True))
+            prune_mode = str(config.get("seedgroup_prune_mode") or "").strip().lower()
+            if prune_mode not in ("off", "seed", "files"):
+                if not bool(config.get("seedgroup_prune", True)):
+                    prune_mode = "off"
+                elif bool(config.get("seedgroup_prune_files", False)):
+                    prune_mode = "files"
+                else:
+                    prune_mode = "seed"
+            self._seedgroup_prune_mode = prune_mode
+            self._seedgroup_prune = prune_mode != "off"
+            self._seedgroup_prune_files = prune_mode == "files"
+            # 限速上报是强制的（老板 2026-11-15）：不给用户开关，也不把地址/token 暴露在界面上
+            self._seedgroup_report = True
+            self._seedgroup_report_url = str(config.get("seedgroup_report_url")
+                                             or SEED_GROUP_REPORT_URL).strip()
+            self._seedgroup_report_token = str(config.get("seedgroup_report_token") or "").strip()
             try:
                 self._max_per_hour = max(0, min(2000, int(config.get("max_per_hour", 0) or 0)))
                 self._max_per_site = max(1, min(200, int(config.get("max_per_site", 20) or 20)))
             except Exception:
                 self._max_per_hour = 0
                 self._max_per_site = 20
+            # 启用保种组时立刻校验工作组资格。
+            # 注意顺序：这段必须在 max_per_hour / max_per_site 赋值之后 —— 它可能 _persist()，
+            # 写在前面会把这两个字段写成类属性默认值（0/20），等于把用户的限速悄悄改成「不限」。
+            if self._seedgroup_enabled:
+                # 未登录时 identity 会返回 ok=False（不是「没资格」），开关原样保留
+                ident = self.seed_group_identity()
+                if not ident.get("ok"):
+                    # 网络/会话问题不是「没资格」：保留开关，下一轮 _sg_unlocked 还会拦
+                    logger.warn(f"保种组资格校验暂时失败（保留开关）：{ident.get('reason')}")
+                elif not ident.get("staff"):
+                    self._seedgroup_enabled = False
+                    self.seed_group_unlock(ident)
+                    logger.warn(f"保种组已强制关闭：{ident.get('reason')}")
+                    self._persist()
+                else:
+                    self.seed_group_unlock(ident)
         # 保存配置时如果填了验证码，立刻换一次 token（一次性，成功/失败都会清掉验证码字段）。
         if self._captcha_code and self._username and self._password and not self._session_token:
             self._login(self._captcha_code)
             self._captcha_code = ""
             self._persist()
+        # IYUU 本地文件导入：填了容器内路径就以文件为准（粘进文本框的内容会被覆盖）。
+        # 放在所有字段赋值之后：_iyuu_import 内部会 _persist()。
+        if self._iyuu_json_file:
+            import os
+            try:
+                if os.path.isfile(self._iyuu_json_file):
+                    with open(self._iyuu_json_file, "r", encoding="utf-8", errors="replace") as handle:
+                        file_text = handle.read()
+                    if file_text.strip() and file_text.strip() != (self._iyuu_json or "").strip():
+                        result = self._iyuu_import(file_text)
+                        logger.info(f"IYUU 文件导入：{self._iyuu_json_file} → 可用 {result.get('usable')} 个站")
+                    else:
+                        logger.info(f"IYUU 文件与已存配置一致，跳过导入：{self._iyuu_json_file}")
+                else:
+                    logger.warn(f"IYUU 文件不存在：{self._iyuu_json_file}")
+            except Exception as err:
+                logger.warn(f"IYUU 文件导入失败：{type(err).__name__}: {err}")
         self._event.clear()
-        if self._enabled:
+        if self._enabled and (self._crossseed_enabled or self._seedgroup_enabled):
             # 保存后自动检测一次连通性（后台线程，不卡保存）；结果显示在插件页。
             import threading
             threading.Thread(target=self.run_tests, daemon=True).start()
@@ -940,6 +1232,7 @@ class ColaCrossSeed(_PluginBase):
     def _persist(self) -> None:
         self.update_config({
             "enabled": self._enabled,
+            "crossseed_enabled": self._crossseed_enabled,
             "notify": self._notify,
             "cron": self._cron,
             "username": self._username,
@@ -957,6 +1250,7 @@ class ColaCrossSeed(_PluginBase):
             "sites_json": self._sites_json,
             "sites_lines": self._sites_lines,
             "iyuu_json": self._iyuu_json,
+            "iyuu_json_file": self._iyuu_json_file,
             "iyuu_token": self._iyuu_token,
             "sites_mode": self._sites_mode,
             "add_label": self._add_label,
@@ -965,8 +1259,13 @@ class ColaCrossSeed(_PluginBase):
             "extra_tags": self._extra_tags,
             "fallback_skip_check": self._fallback_skip_check,
             "retry_failed": self._retry_failed,
+            "limit_dl_kib": self._limit_dl_kib,
+            "limit_up_kib": self._limit_up_kib,
+            "limit_lines": self._limit_lines,
             "seedgroup_enabled": self._seedgroup_enabled,
             "seedgroup_tier": self._seedgroup_tier,
+            "seedgroup_scope": self._seedgroup_scope,
+            "seedgroup_custom_gib": self._seedgroup_custom_gib,
             "seedgroup_api_key": self._seedgroup_api_key,
             "seedgroup_staff_prefix": self._seedgroup_staff_prefix,
             "seedgroup_allow_admin": self._seedgroup_allow_admin,
@@ -976,6 +1275,16 @@ class ColaCrossSeed(_PluginBase):
             "seedgroup_cron": self._seedgroup_cron,
             "seedgroup_save_path": self._seedgroup_save_path,
             "seedgroup_skip_check": self._seedgroup_skip_check,
+            "seedgroup_client_mode": self._seedgroup_client_mode,
+            "seedgroup_rotate": self._seedgroup_rotate,
+            "seedgroup_rotate_count": self._seedgroup_rotate_count,
+            "seedgroup_rotate_files": self._seedgroup_rotate_files,
+            "seedgroup_prune_mode": self._seedgroup_prune_mode,
+            "seedgroup_prune": self._seedgroup_prune,
+            "seedgroup_prune_files": self._seedgroup_prune_files,
+            "seedgroup_report": self._seedgroup_report,
+            "seedgroup_report_url": self._seedgroup_report_url,
+            "seedgroup_report_token": self._seedgroup_report_token,
         })
 
     # ---------------- 站点登录 / 匹配 / 下载 ----------------
@@ -1475,7 +1784,7 @@ class ColaCrossSeed(_PluginBase):
             return []
         out: List[Dict[str, str]] = []
         for item in data:
-            if not isinstance(item, dict) or item.get("disabled"):
+            if not isinstance(item, dict) or _disabled(item):
                 continue
             options = item.get("options") or {}
             if isinstance(options, str):
@@ -1485,7 +1794,7 @@ class ColaCrossSeed(_PluginBase):
                     options = {}
             if not isinstance(options, dict):
                 options = {}
-            passkey = str(options.get("passkey") or "").strip()
+            passkey = str(options.get("passkey") or item.get("passkey") or "").strip()
             if not passkey:
                 continue
             base = (item.get("mirror") or item.get("base_url") or "").strip()
@@ -1501,18 +1810,153 @@ class ColaCrossSeed(_PluginBase):
                 continue
             if host in SITE_REMAP:
                 url = SITE_REMAP[host]
+            # IYUU 的凭据不只有 passkey：下载模板里的 {uid}、家园的 downhash、
+            # cookie_required 站的 Cookie 都在这几个字段里。少一个就会「导入成功但辅种全失败」，
+            # 所以这里一次全带走（见 _site_download 的模板占位符）。
+            # IYUU 每站还带这些「导入后就能直接跑」的参数：
+            #   limit.count     → 本站每轮上限（IYUU 页面的「辅种数量」）
+            #   rss_url         → 站点自己的 RSS 直链（馒头这类带签名，插件可直接用）
+            #   curl_opt_proxy(_auth) → 本站代理
+            #   url_join.https  → 强制 https 还是 http
+            limit = options.get("limit") if isinstance(options.get("limit"), dict) else {}
+            join = options.get("url_join") if isinstance(options.get("url_join"), dict) else {}
+            proxy = _site_proxy(options.get("curl_opt_proxy"), options.get("curl_opt_proxy_auth"))
+            try:
+                per_site = int(str(limit.get("count") or 0).strip() or 0)
+            except Exception:
+                per_site = 0
             out.append({
                 "name": item.get("nickname") or item.get("site") or url,
                 "url": url.rstrip("/") + "/",
                 "passkey": passkey,
-                "rsskey": str((options or {}).get("rsskey") or ""),
-                "sid": int(item.get("sid") or 0),
+                "max_per_site": per_site,
+                "interval": _as_float(limit.get("sleep")),
+                "rss_url": str(options.get("rss_url") or ""),
+                "proxy": proxy,
+                "rsskey": str(options.get("rsskey") or ""),
+                "sid": _as_int(item.get("sid")),
+                "uid": _as_int(options.get("uid")),
+                "downhash": str(options.get("downhash") or ""),
+                "cookie": str(item.get("cookie") or options.get("cookie") or ""),
                 "channel": "auto",
                 "enabled": True,
                 "download_page": item.get("download_page") or "",
-                "x_api_key": str((options or {}).get("x_api_key") or ""),
+                "x_api_key": str(options.get("x_api_key") or item.get("x_api_key") or ""),
             })
+        if out:
+            logger.info(f"IYUU 导入 {len(out)} 个启用站点（含 passkey/uid/downhash/cookie）")
         return out
+
+    def iyuu_import(self, **kwargs) -> Dict[str, Any]:
+        """一键导入 IYUU 导出的站点 JSON（MP 插件 API：POST /ColaCrossSeed/sites/import）。
+
+        参数可以放在 `json` / `payload` / `sites` 任一键里，值是 IYUU 导出的**原始文本**
+        （数组或 {"sites":[...]}），也可以直接传对象。不传参数就重跑一次配置里已存的内容。
+        导入后立刻返回解析摘要；原本「只用手写行」的用户会被改成「IYUU + 手写行补充」，
+        手写的行不会被丢掉。
+        """
+        payload = kwargs.get("json") or kwargs.get("payload") or kwargs.get("sites") or ""
+        return self._iyuu_import(payload)
+
+    def _iyuu_import(self, payload: Any) -> Dict[str, Any]:
+        raw = payload
+        if isinstance(raw, (dict, list)):
+            raw = json.dumps(raw, ensure_ascii=False)
+        raw = str(raw or "").strip()
+        if not raw:
+            raw = (self._iyuu_json or "").strip()
+        out: Dict[str, Any] = {"ok": False, "total": 0, "enabled": 0, "usable": 0,
+                               "skipped": [], "reason": ""}
+        if not raw:
+            out["reason"] = "没有可导入的内容：把 IYUU 导出的 JSON 整个粘进来"
+            return out
+        try:
+            data = json.loads(raw)
+        except Exception as err:
+            out["reason"] = f"JSON 解析失败：{err}"
+            return out
+        if isinstance(data, dict):
+            data = data.get("sites") or list(data.values())
+        if not isinstance(data, list):
+            out["reason"] = "JSON 顶层必须是数组（IYUU 导出的站点列表）"
+            return out
+        out["total"] = len(data)
+        previous = self._iyuu_json
+        try:
+            self._iyuu_json = raw
+            parsed = self._iyuu_sites()
+        finally:
+            self._iyuu_json = previous
+        out["usable"] = len(parsed)
+        if not parsed:
+            # 一个字都解析不出来就别覆盖：粘错一次不该把上一份好的配置弄丢
+            out["reason"] = "这份 JSON 里没有可用站点（缺 passkey 或域名），已保留原配置不变"
+            return out
+        for item in data:
+            if isinstance(item, dict) and not item.get("disabled"):
+                out["enabled"] += 1
+        imported_hosts = {x["url"].split("://", 1)[-1].split("/")[0].lower() for x in parsed}
+        for item in data:
+            if not isinstance(item, dict) or item.get("disabled"):
+                continue
+            raw_host = str(item.get("base_url") or item.get("mirror") or "").strip()
+            host = self._normalise_url(raw_host, "https") if raw_host else ""
+            host = host.split("://", 1)[-1].split("/")[0].lower() if host else ""
+            if not host:
+                continue
+            mapped = SITE_REMAP.get(host, "")
+            candidates = {host}
+            if mapped:
+                candidates.add(mapped.split("://", 1)[-1].split("/")[0].lower())
+            if not (candidates & imported_hosts):
+                out["skipped"].append(host)
+        self._iyuu_json = raw
+        self.save_data("seedgroup_skip", {})
+        # 默认切 merge：IYUU 的站全部生效，手写的行继续作为补充（行优先）。
+        # 想彻底只认 IYUU，把「站点来源」改成「只用 IYUU 导入」即可。
+        if (self._sites_mode or "") == "manual":
+            self._sites_mode = "merge"
+        self._persist()
+        out["ok"] = out["usable"] > 0
+        if not out["ok"]:
+            out["reason"] = "启用的站点里没有可用的（缺 passkey 或域名）"
+        logger.info(f"IYUU 一键导入：总计 {out['total']} 条，启用 {out['enabled']}，可用 {out['usable']}")
+        return out
+
+    IYUU_FILE_MAX_BYTES = 5 * 1024 * 1024
+
+    def iyuu_import_file(self, **kwargs) -> Dict[str, Any]:
+        """从**本地文件**导入 IYUU 配置（MP 插件 API：POST /ColaCrossSeed/sites/import-file）。
+
+        插件跑在容器里，路径是容器内路径；默认读 `/config/cola-sites.json`，
+        也就是宿主的 `<MP 配置目录>/cola-sites.json` —— 把文件丢进去、保存配置即生效。
+        """
+        path = str(kwargs.get("path") or self._iyuu_json_file or "/config/cola-sites.json").strip()
+        return self._iyuu_import_from_file(path)
+
+    def _iyuu_import_from_file(self, path: str) -> Dict[str, Any]:
+        import os
+        out: Dict[str, Any] = {"ok": False, "total": 0, "enabled": 0, "usable": 0,
+                               "skipped": [], "reason": "", "source_file": path}
+        if not path:
+            out["reason"] = "没有给文件路径"
+            return out
+        if not os.path.isfile(path):
+            out["reason"] = f"文件不存在：{path}（容器内路径；宿主放 <MP配置目录>/cola-sites.json）"
+            return out
+        try:
+            if os.path.getsize(path) > self.IYUU_FILE_MAX_BYTES:
+                out["reason"] = f"文件太大（上限 {self.IYUU_FILE_MAX_BYTES // 1024 // 1024} MB）"
+                return out
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except Exception as err:
+            out["reason"] = f"读文件失败：{err}"
+            return out
+        result = self._iyuu_import(text)
+        result["source_file"] = path
+        result["source"] = "file"
+        return result
 
     def _other_sites(self) -> List[Dict[str, str]]:
         """行文本为准，IYUU 导入补充（sites_mode=manual 时完全不看导入）。
@@ -1520,8 +1964,9 @@ class ColaCrossSeed(_PluginBase):
         每个站点在自己的那一行里单独配置：域名、passkey、sid、rsskey、channel、enabled。
         IYUU 导入只用来补齐「你没写但 IYUU 认识」的站；同一个域名以行文本为准。
         """
-        line_sites = self._line_sites()
-        iyuu_sites = [] if (self._sites_mode or "merge") == "manual" else self._iyuu_sites()
+        mode = self._sites_mode or "merge"
+        line_sites = [] if mode == "iyuu_only" else self._line_sites()
+        iyuu_sites = [] if mode == "manual" else self._iyuu_sites()
         # 行文本优先；同一个域名下，行里没写的 passkey / sid / rsskey 从 IYUU 导入里补齐 ——
         # 这样「观众只写 passkey + rsskey」也能顺带拿到 IYUU 的 sid，两套通道同时可用。
         by_host: Dict[str, Dict[str, str]] = {}
@@ -1535,7 +1980,9 @@ class ColaCrossSeed(_PluginBase):
                 by_host[host] = dict(site)
                 order.append(host)
                 continue
-            for field in ("passkey", "sid", "rsskey", "uid", "download_page", "x_api_key"):
+            for field in ("passkey", "sid", "rsskey", "uid", "downhash", "cookie",
+                          "download_page", "x_api_key", "rss_url", "proxy",
+                          "max_per_site", "interval"):
                 if not existing.get(field) and site.get(field):
                     existing[field] = site[field]
         sites: List[Dict[str, str]] = []
@@ -1546,6 +1993,16 @@ class ColaCrossSeed(_PluginBase):
             if not site.get("passkey"):
                 logger.warn(f"站点 {host} 没有 passkey，已跳过")
                 continue
+            # IYUU 的「辅种数量」是每站上限：记下来给 _site_budget_left 用
+            try:
+                per_site = int(site.get("max_per_site") or 0)
+            except Exception:
+                per_site = 0
+            if 0 < per_site <= 200:
+                self._site_limits[site.get("url") or host] = per_site
+            gap = _as_float(site.get("interval"))
+            if gap:
+                self._site_intervals[site.get("url") or host] = min(gap, 30.0)
             sites.append(site)
         return sites
 
@@ -1617,7 +2074,8 @@ class ColaCrossSeed(_PluginBase):
             if not (hasattr(instance, "get_completed_torrents") and hasattr(instance, "add_torrent")):
                 continue
             label = f"MP-{name}"
-            out.append(_MPClient(label, instance.get_completed_torrents, instance.add_torrent))
+            out.append(_MPClient(label, instance.get_completed_torrents, instance.add_torrent,
+                                 getattr(instance, "delete_torrent", None)))
             logger.info(f"MoviePilot 下载器已接入：{label}（{getattr(info, 'type', '?')}）")
         return out
 
@@ -1638,7 +2096,8 @@ class ColaCrossSeed(_PluginBase):
                     if qb.is_inactive():
                         logger.info("MoviePilot 的 qBittorrent 未启用")
                     else:
-                        out.append(_MPClient("MP-QB", qb.get_completed_torrents, qb.add_torrent))
+                        out.append(_MPClient("MP-QB", qb.get_completed_torrents, qb.add_torrent,
+                                             getattr(qb, "delete_torrent", None)))
                 except Exception as err:
                     logger.warn(f"读取 MoviePilot qBittorrent 失败：{err}")
                 try:
@@ -1647,7 +2106,8 @@ class ColaCrossSeed(_PluginBase):
                     if tr.is_inactive():
                         logger.info("MoviePilot 的 Transmission 未启用")
                     else:
-                        out.append(_MPClient("MP-TR", tr.get_completed_torrents, tr.add_torrent))
+                        out.append(_MPClient("MP-TR", tr.get_completed_torrents, tr.add_torrent,
+                                             getattr(tr, "delete_torrent", None)))
                 except Exception as err:
                     logger.warn(f"读取 MoviePilot Transmission 失败：{err}")
         line_clients = self._parse_client_lines(line_text)
@@ -1667,6 +2127,282 @@ class ColaCrossSeed(_PluginBase):
                                                      item.get("username", ""), item.get("password", "")))
             except Exception as err:
                 logger.error(f"clients_json 解析失败：{err}")
+        return out
+
+    def _collect_speed_limits(self, clients: List[_Client]) -> List[Dict[str, Any]]:
+        """采集每台客户端**当前**的限速设置（不管插件有没有配、有没有接管）。"""
+        rows: List[Dict[str, Any]] = []
+        for client in clients:
+            row: Dict[str, Any] = {"client": client.name,
+                                   "kind": "tr" if isinstance(client, TransmissionClient) else "qb",
+                                   "dl_kib": None, "up_kib": None,
+                                   "dl_enabled": None, "up_enabled": None, "readable": False}
+            try:
+                data = client.get_speed_limits() or {}
+            except Exception as err:
+                row["error"] = f"{type(err).__name__}: {err}"
+                data = {}
+            if data:
+                for key in ("dl_kib", "up_kib", "dl_enabled", "up_enabled"):
+                    if key in data:
+                        row[key] = data[key]
+                row["readable"] = True
+            rows.append(row)
+        return rows
+
+    def seed_group_rotate(self, **kwargs) -> Dict[str, Any]:
+        """手动触发一次动态轮换（体积达标后才有效）。"""
+        clients = self._sg_clients()
+        state = self.seed_group_status()
+        return self._sg_rotate(clients, state, self._sg_candidates())
+
+    def _sg_rotate(self, clients: List[_Client], state: Dict[str, Any],
+                   pool_all: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """体积已达标时的动态保种：删「做种人数最多」的，补「做种人数最少」的。
+
+        只在达标后执行（没达标就只补满，不轮换）；每次各 N 颗（默认 5）。
+        「做种人数」取站点侧的 seeders（跟池子一起拉回来的）。
+        """
+        out: Dict[str, Any] = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                               "dropped": 0, "added": 0, "failed": 0,
+                               "dropped_names": [], "added_names": [], "reason": ""}
+        if not self._seedgroup_rotate:
+            out["reason"] = "动态保种已关闭"
+            return out
+        if not clients:
+            out["reason"] = "没有可用的下载器"
+            return out
+        limit = max(1, min(50, int(self._seedgroup_rotate_count or 5)))
+        existing, _, _ = self._sg_current(clients)
+        items = self._sg_items()
+        by_tid = {str(x.get("torrent_id")): x for x in pool_all if x.get("torrent_id") is not None}
+
+        droppable: List[Tuple[int, str, Dict[str, Any]]] = []
+        for info_hash, record in items.items():
+            if info_hash not in existing:
+                continue
+            row = by_tid.get(str((record or {}).get("torrent_id") or ""))
+            if not row:
+                continue                      # 池子里查不到的（已下架/换池）交给 prune，不在轮换里动
+            droppable.append((int(row.get("seeders") or 0), info_hash, record))
+        # 做种人数最多的先删
+        droppable.sort(key=lambda item: (-item[0], item[1]))
+        drops = droppable[:limit]
+        if not drops:
+            out["reason"] = "没有可轮换的已保种子（池子里查不到它们的做种人数）"
+            return out
+
+        kept_tids = {str((rec or {}).get("torrent_id")) for _, _, rec in drops}
+        skips = self._sg_skips()
+        pending = [x for x in pool_all
+                   if str(x.get("info_hash") or "").lower() not in existing
+                   and str(x.get("torrent_id")) not in kept_tids
+                   and _seed_group_key(x) not in skips]
+        # 做种人数最少的最该补
+        pending.sort(key=lambda x: (int(x.get("seeders") or 0), str(x.get("torrent_id") or "")))
+        adds = pending[:len(drops)]
+
+        client = clients[0]
+        for seeders, info_hash, record in drops:
+            name = str((record or {}).get("name") or info_hash[:12])
+            try:
+                deleted = client.delete([info_hash], delete_files=self._seedgroup_rotate_files)
+            except Exception as err:
+                logger.warn(f"动态保种：删除 {name} 异常：{err}")
+                deleted = False
+            if deleted:
+                out["dropped"] += 1
+                out["dropped_names"].append(f"{name}（{seeders} 做种）")
+                items.pop(info_hash, None)
+            else:
+                out["failed"] += 1
+
+        for item in adds:
+            if self._event.is_set():
+                break
+            data = self._sg_download(item)
+            if not data:
+                out["failed"] += 1
+                continue
+            info_hash = _torrent_info_hash(data) or str(item.get("info_hash") or "")
+            result = client.add(data, self._seedgroup_save_path, self._seedgroup_skip_check,
+                                label=SEED_GROUP_TAG, hash_hint=info_hash)
+            if result in ("ok", "dup"):
+                out["added"] += 1
+                out["added_names"].append(f"{str(item.get('name') or '')[:48]}"
+                                          f"（{int(item.get('seeders') or 0)} 做种）")
+                self._sg_remember_item(info_hash, item)
+            else:
+                out["failed"] += 1
+                self._sg_mark_skip(item, "rotate-fail")
+            time.sleep(self.SG_DOWNLOAD_GAP)
+
+        self.save_data("seedgroup_items", items)
+        self.save_data("seedgroup_rotate", out)
+        logger.info(f"动态保种：删 {out['dropped']} 补 {out['added']}（失败 {out['failed']}）")
+        return out
+
+    def _sg_prune_if_enabled(self, state: Dict[str, Any]) -> None:
+        """下架清理：达标那轮也要跑（UI 承诺的是「每轮回站点核对」）。"""
+        if not self._seedgroup_prune:
+            return
+        try:
+            pruned = self._sg_prune()
+            state["pruned"] = pruned.get("removed", 0)
+            state["prune_checked"] = pruned.get("checked", 0)
+            state["prune_failed"] = pruned.get("failed", 0)
+            self.save_data("seedgroup_state", state)
+        except Exception as err:
+            logger.warn(f"保种组清理异常（不影响本轮同步）：{type(err).__name__}: {err}")
+
+    def _maybe_report(self, clients: List[_Client], state: Dict[str, Any]) -> None:
+        """上报不抛异常：限速采集/发送失败不能影响保种本身。"""
+        try:
+            report = self._report_seedgroup(clients, state)
+            state["report_ok"] = report.get("ok")
+            state["report_reason"] = report.get("reason")
+            state["report_skipped"] = report.get("skipped")
+            self.save_data("seedgroup_state", state)
+        except Exception as err:
+            logger.warn(f"保种组限速上报异常：{type(err).__name__}: {err}")
+
+    def _report_seedgroup(self, clients: List[_Client], state: Dict[str, Any]) -> Dict[str, Any]:
+        """把「保种组用户的客户端限速情况」汇报给站点（只统计开了保种组的用户）。
+
+        · 未开保种组 / 关掉上报 / 没配上地址 → 直接跳过，不采集也不发送；
+        · 不论成功失败，快照都会写进插件数据，面板能看到；
+        · 站点接口不在线（404/连不上）只记日志，不影响保种。
+        """
+        out: Dict[str, Any] = {"ok": False, "skipped": False, "reason": "", "clients": []}
+        if not self._seedgroup_enabled:
+            out.update({"skipped": True, "reason": "保种组未启用（不采集）"})
+            return out
+        if not self._seedgroup_report:
+            out.update({"skipped": True, "reason": "上报开关已关闭"})
+            return out
+        limits = self._collect_speed_limits(clients)
+        out["clients"] = limits
+        url = (self._seedgroup_report_url or "").strip()
+        if not url:
+            out.update({"skipped": True, "reason": "没有配置上报地址"})
+            return out
+        record = self._sg_unlock_record()
+        payload = {
+            "plugin": "ColaCrossSeed", "version": self.plugin_version,
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "uid": record.get("uid") or 0, "username": record.get("username") or "",
+            "groups": record.get("groups") or [],
+            "tier": state.get("tier") or self._seedgroup_tier,
+            "scope": self._seedgroup_scope,
+            "target_gib": state.get("target_gib"),
+            "covered_gib": state.get("covered_gib"),
+            "shortfall_gib": state.get("shortfall_gib"),
+            "prune_removed": state.get("pruned"),
+            # 站点按这个字段累计「当月达标时长」：covered >= target 才算达标
+            "on_target": bool(state.get("covered_gib") or 0) and bool(state.get("target_gib") or 0)
+                         and float(state.get("covered_gib") or 0) >= float(state.get("target_gib") or 0),
+            # 客户端里这批种子最老的那颗已经做了多久（交叉验证「保种时长」不是编的）
+            "seeded_secs": self._sg_oldest_seeded_secs(clients),
+            "enforced": {"dl_kib": self._limit_dl_kib, "up_kib": self._limit_up_kib},
+            "clients": limits,
+        }
+        headers = {"Content-Type": "application/json"}
+        if self._seedgroup_report_token:
+            headers["X-Report-Token"] = self._seedgroup_report_token
+        status = 0
+        try:
+            rsp = _curl("POST", url, headers=headers, json_body=payload, timeout=REQUEST_TIMEOUT)
+            status = 0 if rsp is None else rsp.status_code
+        except Exception as err:
+            out["reason"] = f"{type(err).__name__}: {err}"
+        out["status"] = status
+        out["ok"] = status in (200, 201, 202, 204)
+        if not out["ok"] and not out["reason"]:
+            out["reason"] = f"站点返回 HTTP {status}（接口未上线或地址不对）"
+        self.save_data("seedgroup_report_last", {
+            "at": payload["at"], "ok": out["ok"], "status": status,
+            "reason": out["reason"], "clients": limits, "url": url,
+        })
+        logger.info(f"保种组限速上报：{'成功' if out['ok'] else '失败(' + out['reason'] + ')'}，"
+                    f"{len(limits)} 台客户端")
+        return out
+
+    def _speed_limit_map(self) -> Dict[str, Tuple[int, int]]:
+        """解析「每客户端限速」：每行 `客户端名或地址,下载KiB/s,上传KiB/s`。
+
+        匹配用「包含」：写 `198.72`、`198.72.127.68:8081`、`MP-qb` 都能命中对应客户端。
+        下载/上传任一 > 0 才算配置了这台。
+        """
+        out: Dict[str, Tuple[int, int]] = {}
+        for line in (self._limit_lines or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in re.split(r"[,，]", line)]
+            if len(parts) < 2 or not parts[0]:
+                continue
+            try:
+                dl = max(0, int(float(parts[1] or 0)))
+            except Exception:
+                dl = 0
+            up = 0
+            if len(parts) >= 3:
+                try:
+                    up = max(0, int(float(parts[2] or 0)))
+                except Exception:
+                    up = 0
+            if dl or up:
+                out[parts[0].lower()] = (dl, up)
+        return out
+
+    def _limit_for(self, name: str, overrides: Dict[str, Tuple[int, int]]) -> Tuple[int, int, str]:
+        """这台客户端该用哪组限速：命中覆盖行就用它，否则用全局默认。"""
+        lowered = (name or "").lower()
+        if lowered in overrides:                      # 精确匹配优先
+            pair = overrides[lowered]
+            return pair[0], pair[1], lowered
+        for key in sorted(overrides, key=len, reverse=True):   # 再按 key 长度降序，宽 key 不会抢精确 key
+            if key and key in lowered:
+                pair = overrides[key]
+                return pair[0], pair[1], key
+        return int(self._limit_dl_kib or 0), int(self._limit_up_kib or 0), ""
+
+    def _apply_speed_limits(self, clients: Optional[List[_Client]] = None) -> Dict[str, Any]:
+        """强行接管下载/上传限速。
+
+        语义（老板 2026-11-15 定）：**填了才接管，没填就一点不碰**。
+          · 下载、上传各填一个 KiB/s；留空或 0 = 这一项完全不干预客户端原有设置；
+          · 每次任务开始都会重新下发一次（幂等），所以有人在客户端里手改限速，下一轮会被改回来。
+        """
+        overrides = self._speed_limit_map()
+        defaults = (int(self._limit_dl_kib or 0), int(self._limit_up_kib or 0))
+        out: Dict[str, Any] = {"applied": 0, "failed": 0, "skipped": 0,
+                               "dl_kib": defaults[0], "up_kib": defaults[1],
+                               "clients": [], "skipped_all": False}
+        if not overrides and defaults[0] <= 0 and defaults[1] <= 0:
+            out["skipped_all"] = True
+            return out
+        for client in (clients if clients is not None else self._clients()):
+            dl, up, hit = self._limit_for(client.name, overrides)
+            row = {"client": client.name, "dl_kib": dl, "up_kib": up, "source": hit or "default"}
+            if dl <= 0 and up <= 0:
+                # 这台没配（全局也没配）→ 不接管它，保持客户端原样
+                row["result"] = "skip"
+                out["skipped"] += 1
+                out["clients"].append(row)
+                continue
+            try:
+                ok = client.set_speed_limits(dl, up)
+            except Exception as err:
+                logger.warn(f"设置限速失败（{client.name}）：{err}")
+                ok = False
+            row["result"] = "ok" if ok else "fail"
+            out["applied" if ok else "failed"] += 1
+            out["clients"].append(row)
+        logger.info(f"限速接管：成功 {out['applied']} 台、失败 {out['failed']} 台、"
+                    f"未配置跳过 {out['skipped']} 台；明细 "
+                    + "；".join(f"{r['client']}={r['dl_kib'] or '-'}/{r['up_kib'] or '-'}"
+                               f"({r['source']})" for r in out["clients"]))
         return out
 
     # ---------------- 节奏与去重 ----------------
@@ -1728,6 +2464,10 @@ class ColaCrossSeed(_PluginBase):
         remembered = self._take_tags(hash_hint) if hash_hint else ""
         result = client.add(data, save_path, self._skip_check, label, hash_hint,
                             category=category, auto_tmm=auto_tmm)
+        # 站点自己声明的间隔（IYUU 的「辅种间隔」）：只加两颗之间等，别的什么都不影响
+        gap = self._site_intervals.get(site_key) if site_key else 0.0
+        if gap:
+            time.sleep(min(float(gap), 30.0))
         if remembered and result in ("ok", "dup"):
             # 先把种子放回去，再把删之前记下的标签补上（addTags 只追加不覆盖）
             if client.add_tags(hash_hint, remembered):
@@ -1804,7 +2544,12 @@ class ColaCrossSeed(_PluginBase):
         return max(0, self._max_per_hour - len(self._add_times()))
 
     def _site_budget_left(self, site_key: str) -> int:
-        return max(0, self._max_per_site - self._site_counter.get(site_key, 0))
+        cap = self._site_limits.get(site_key) or self._max_per_site
+        try:
+            cap = max(1, min(200, int(cap)))
+        except Exception:
+            cap = self._max_per_site
+        return max(0, cap - self._site_counter.get(site_key, 0))
 
     def _site_open(self, site_key: str) -> bool:
         """熔断：这个站本轮失败太多次就先跳过，别让慢站拖住整轮。"""
@@ -2544,7 +3289,7 @@ class ColaCrossSeed(_PluginBase):
         # 事件是类级 Event：reload/停止会把上一实例的 set 带过来，这里先清掉，
         # 否则本次任务会在第一个 torrent 就 break（表现为 matched=0、耗时 1 秒）。
         self._event.clear()
-        if not self._enabled:
+        if not (self._enabled and self._crossseed_enabled):
             return
         if not self._session_token:
             logger.warn("可乐PT 未登录，跳过本次辅种")
@@ -2553,6 +3298,7 @@ class ColaCrossSeed(_PluginBase):
         if not clients:
             logger.warn("没有可用的下载器")
             return
+        # 限速只针对保种组（老板 2026-11-15）：辅种不接管、不改任何客户端限速设置
         # 自愈：上一轮加进去但文件对不上的（state=missingFiles），清掉，别在 qB 里留垃圾
         for client in clients:
             missing = client.tagged_missing(MANDATORY_TAG)
@@ -2578,6 +3324,8 @@ class ColaCrossSeed(_PluginBase):
         unknown_sids: set = set()
         by_site: Dict[str, Dict[str, int]] = {}
         self._site_counter = {}   # 每轮重置：单站上限按轮算
+        self._site_limits = {}    # 每轮重置：站点自己声明的上限（IYUU limit.count）
+        self._site_intervals = {} # 每轮重置：站点自己声明的间隔（IYUU limit.sleep）
         self._site_fails = {}     # 每轮重置：站点失败计数（熔断用）
         done = set(self._done())
         dead = set(self._dead_hashes())   # 文件确实缺失、已被自愈清掉的，不再重试
@@ -2844,14 +3592,12 @@ class ColaCrossSeed(_PluginBase):
         out: List[_Client] = []
         if lines:
             out = self._parse_client_lines(lines)
-        if not out and self._seedgroup_use_mp_clients:
-            saved = (self._use_mp_clients, self._clients_lines)
-            try:
-                # 只走 MP 那一支：把自定义行清空，避免把辅种的下载器混进来
-                self._use_mp_clients, self._clients_lines = True, ""
-                out = self._clients()
-            finally:
-                self._use_mp_clients, self._clients_lines = saved
+            if not out:
+                logger.warn("保种组：选了「自定义下载器」但那一行是空的/格式不对，本轮不用任何下载器")
+                return []
+        elif self._seedgroup_use_mp_clients:
+            # 用参数走 MP 那一支，不临时改实例属性（保种组与辅种是两个独立 service，会并发）
+            out = self._clients(use_mp=True, lines="")
         if not out:
             out = self._clients()
         target = (self._seedgroup_target_client or "").strip()
@@ -2860,6 +3606,7 @@ class ColaCrossSeed(_PluginBase):
             if named:
                 return named
             logger.warn(f"保种组指定的下载器 `{target}` 不存在，改用第一台")
+            return out[:1]
         return out
 
     def _sg_headers(self) -> Dict[str, str]:
@@ -2927,9 +3674,13 @@ class ColaCrossSeed(_PluginBase):
                              f"（当前 {', '.join(titles) or '没有任何组'}），保种组不可解锁")
         return out
 
-    def seed_group_unlock(self) -> Dict[str, Any]:
-        """手动解锁：校验工作组资格，通过才把解锁记录写进插件数据。"""
-        ident = self.seed_group_identity()
+    def seed_group_unlock(self, ident: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """手动解锁：校验工作组资格，通过才把解锁记录写进插件数据。
+
+        `ident` 可以传入已经算好的 `seed_group_identity()` 结果，省掉一轮 /me + profile 请求。
+        """
+        if not isinstance(ident, dict):
+            ident = self.seed_group_identity()
         now = int(time.time())
         if not ident.get("ok"):
             record = {"ok": False, "at": now, "until": 0, "reason": ident.get("reason", ""),
@@ -2955,14 +3706,25 @@ class ColaCrossSeed(_PluginBase):
         return record if isinstance(record, dict) else {}
 
     def _sg_unlocked(self, refresh: bool = True) -> Tuple[bool, Dict[str, Any]]:
-        """解锁是否有效：缓存 24 小时；过期或从未解锁就现场重新校验一次。"""
+        """解锁是否有效：缓存 24 小时，且必须还是同一个账号（换号后旧记录不再沿用）。
+
+        缓存不代表「不再校验资格」：命中也只省掉一次 /me + profile，每轮任务仍会走这里。
+        """
         record = self._sg_unlock_record()
         try:
             until = int(record.get("until") or 0)
         except Exception:
             until = 0
         if record.get("ok") and until > int(time.time()):
-            return True, record
+            if not refresh:
+                return True, record
+            ident = self.seed_group_identity()
+            same_user = bool(ident.get("ok")) and int(ident.get("uid") or 0) == int(record.get("uid") or 0)
+            if same_user and ident.get("staff"):
+                return True, record
+            # 换了账号、或已经离开工作组：作废缓存，按现场结果重写记录
+            record = self.seed_group_unlock(ident)
+            return bool(record.get("ok")), record
         if not refresh:
             return False, record
         record = self.seed_group_unlock()
@@ -2974,11 +3736,17 @@ class ColaCrossSeed(_PluginBase):
 
     def _seedgroup_panel(self) -> Dict[str, Any]:
         """插件页顶部的「可乐保种组」面板：档位 / 覆盖体积 / 缺口 / 工作组资格。"""
-        tier = self._seedgroup_tier if self._seedgroup_tier in SEED_GROUP_TIERS else "2T"
-        target = float(seed_group_target_gib(tier))
+        tier = seed_group_tier_key(self._seedgroup_tier)
+        dynamic = tier == SEED_GROUP_ALL_TIER
+        target = float(seed_group_target_gib(tier, self._seedgroup_custom_gib))
         state = self.seed_group_status()
         unlock = self._sg_unlock_record()
-        staff = bool(unlock.get("ok"))
+        # 解锁记录 24 小时过期：过期的不能还显示「已解锁」
+        try:
+            still_valid = int(unlock.get("until") or 0) > int(time.time())
+        except Exception:
+            still_valid = False
+        staff = bool(unlock.get("ok")) and still_valid
         try:
             if state.get("target_gib"):
                 target = float(state["target_gib"])
@@ -2986,8 +3754,12 @@ class ColaCrossSeed(_PluginBase):
             pass
         covered = float(state.get("covered_gib") or state.get("current_gib") or 0.0)
         pct = 0 if target <= 0 else max(0, min(100, int(round(covered / target * 100))))
-        lines = [f"档位：{SEED_GROUP_TIER_LABELS.get(tier, tier)}；目标 {target:.0f} GiB；"
-                 f"实际覆盖 {covered:.1f} GiB（{pct}%）"]
+        if dynamic:
+            lines = [f"档位：{SEED_GROUP_TIER_LABELS.get(tier, tier)}；"
+                     f"目标 {target:.0f} GiB（上次同步按池子总量算）；实际覆盖 {covered:.1f} GiB"]
+        else:
+            lines = [f"档位：{SEED_GROUP_TIER_LABELS.get(tier, tier)}；目标 {target:.0f} GiB；"
+                     f"实际覆盖 {covered:.1f} GiB（{pct}%）"]
         if state.get("at"):
             lines.append(f"上次同步 {state['at']}：新增 {state.get('added', 0)} 条"
                          f"（+{state.get('added_gib', 0)} GiB），重复 {state.get('duplicate', 0)}，"
@@ -3004,7 +3776,7 @@ class ColaCrossSeed(_PluginBase):
             lines.append("资格：" + str(unlock.get("reason")
                                         or "账号不在工作组，保种组不可解锁（强制锁定）"))
         if not self._seedgroup_enabled:
-            lines.append("状态：未启用 —— 勾选「启用可乐保种组」并保存，会自动校验工作组资格")
+            lines.append("状态：未启用 —— 勾选顶部「启用保种组（功能二）」并保存，会自动校验工作组资格")
         elif not staff:
             lines.append("状态：已锁定 —— 非工作组账号无法解锁这一块，辅种不受影响")
         elif float(state.get("shortfall_gib") or 0) > 0:
@@ -3012,6 +3784,20 @@ class ColaCrossSeed(_PluginBase):
                          + str(state.get("reason") or "等下一轮同步补齐"))
         else:
             lines.append("状态：已解锁且达到档位下限（只超不少）")
+        # 资源池走的是哪条通道：填了 API Key 走机器面清单，没填就用会话面浏览接口。
+        # 审查指出「静默降级到网页面」会让用户无法自证，这里把它显式打出来。
+        rotate = self.get_data("seedgroup_rotate") or {}
+        if rotate:
+            lines.append(f"动态保种：{rotate.get('at', '')} 删 {rotate.get('dropped', 0)} 补 "
+                         f"{rotate.get('added', 0)}（失败 {rotate.get('failed', 0)}）"
+                         + (f" — {rotate.get('reason')}" if rotate.get("reason") else ""))
+        report = self.get_data("seedgroup_report_last") or {}
+        if report:
+            ok = "成功" if report.get("ok") else f"失败({report.get('reason') or report.get('status')})"
+            lines.append(f"限速上报（强制）：{report.get('at', '')} → {ok}；客户端 {len(report.get('clients') or [])} 台")
+        key_state = "已配置" if (self._seedgroup_api_key or "").strip() else "未配置"
+        pool_source = str(self.get_data("seedgroup_pool_source") or "未拉取")
+        lines.append(f"资源池通道：{pool_source}（站点 API Key：{key_state}）")
         return {
             "component": "VCard",
             "props": {"class": "mb-4", "variant": "outlined"},
@@ -3057,11 +3843,17 @@ class ColaCrossSeed(_PluginBase):
             })
         return items, int(body.get("total") or 0), "api-key"
 
-    def _sg_official_browse_page(self, page: int) -> Tuple[List[Dict[str, Any]], int, str]:
-        """会话面回退：/api/v1/media?official=true&view=torrents，抽每个作品的官方版本。"""
-        rsp = self._cola("GET", "/api/v1/media",
-                         params={"official": "true", "view": "torrents", "page": page,
-                                 "page_size": self.SG_BROWSE_PAGE_SIZE, "version_limit": 20})
+    def _sg_official_browse_page(self, page: int, official_only: bool = True) \
+            -> Tuple[List[Dict[str, Any]], int, str]:
+        """会话面通道：/api/v1/media?official=true&view=torrents —— 全站官方种。
+
+        `official_only` 只为兼容旧调用；保种范围在 _sg_candidates 里定，**永远只取官方种**。
+        """
+        params: Dict[str, Any] = {"view": "torrents", "page": page,
+                                  "page_size": self.SG_BROWSE_PAGE_SIZE, "version_limit": 20}
+        if official_only:
+            params["official"] = "true"
+        rsp = self._cola("GET", "/api/v1/media", params=params)
         if rsp is None or rsp.status_code != 200:
             return [], 0, ""
         body = rsp.json() or {}
@@ -3070,47 +3862,76 @@ class ColaCrossSeed(_PluginBase):
             if not isinstance(group, dict):
                 continue
             for version in group.get("versions") or []:
-                if not isinstance(version, dict) or not version.get("official"):
+                if not isinstance(version, dict):
+                    continue
+                if official_only and not version.get("official"):
+                    continue
+                status = str(version.get("status") or "approved")
+                if status != "approved":
                     continue
                 items.append({
                     "torrent_id": version.get("id"),
                     "info_hash": "",
                     "name": str(version.get("release_name") or ""),
                     "size": version.get("size_bytes") or 0,
+                    "seeders": int(version.get("seeders") or 0),
                     "official": True,
                 })
         return items, int(body.get("total") or 0), "session"
 
     def _sg_candidates(self) -> List[Dict[str, Any]]:
-        """把官方资源池拉全：优先机器面清单，没有 API Key 就走会话面浏览接口。"""
-        probes = []
+        """把官方资源池拉全：优先机器面清单，没有 API Key 就走会话面浏览接口。
+
+        两条通道的分页单位不一样，必须分开判终止条件：
+          · 机器面 `/official/torrents`：total 是**种子数**，一页 100 条；
+          · 会话面 `/media?official=true`：total 是**作品数**，一页 50 个作品，
+            每个作品的官方版本数不定 —— 拿种子数跟作品数比会提前收工（实测只拿到 247 条）。
+        """
+        # 范围只决定「用哪条通道」，不决定「要不要官方」：保种只保官方种（老板 2026-11-15 明确）
+        official_only = True
         if (self._seedgroup_api_key or "").strip():
-            probes.append(self._sg_official_machine_page)
-        probes.append(self._sg_official_browse_page)
-        for probe in probes:
-            merged: List[Dict[str, Any]] = []
-            seen: set = set()
-            total = 0
-            for page in range(1, self.SG_MAX_PAGES + 1):
-                batch, total, _src = probe(page)
-                if not batch:
-                    break
-                for item in batch:
-                    key = str(item.get("torrent_id") or item.get("info_hash") or "")
-                    if not key or key in seen:
-                        continue
-                    seen.add(key)
-                    merged.append(item)
-                if total and len(merged) >= total:
-                    break
-                if len(batch) < self.SG_BROWSE_PAGE_SIZE and probe is not self._sg_official_browse_page:
-                    if len(batch) < OFFICIAL_PAGE_LIMIT:
-                        break
-            if merged:
-                source = "api-key" if probe is self._sg_official_machine_page else "session"
+            items, total, source = self._sg_collect(self._sg_official_machine_page, True)
+            if items:
                 self.save_data("seedgroup_pool_source", source)
-                return merged
+                return items
+        probe = lambda page: self._sg_official_browse_page(page, official_only)  # noqa: E731
+        items, total, source = self._sg_collect(probe, False)
+        if items:
+            self.save_data("seedgroup_pool_source", "session-official")
+            return items
         return []
+
+    def _sg_collect(self, probe, machine: bool) -> Tuple[List[Dict[str, Any]], int, str]:
+        """逐页收一种通道的结果，按该通道自己的分页语义停。
+
+        终止只看 total（服务器说了算），不看「这一页收了几条」：
+          · 机器面 total 是种子数，收到 total 条就停；
+          · 会话面 total 是作品数，翻完 ceil(total / 每页作品数) 页就停；
+          · 只有 total 缺失（服务端没给）时才用「空页」兜底。
+        以前用 `len(batch) < 100` 判断，服务端把每页调成 40 条就只收到第一页。
+        """
+        merged: List[Dict[str, Any]] = []
+        seen: set = set()
+        total = 0
+        source = ""
+        for page in range(1, self.SG_MAX_PAGES + 1):
+            batch, total, source = probe(page)
+            for item in batch or []:
+                key = _seed_group_key(item)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+            if total:
+                if machine:
+                    if len(merged) >= total:
+                        break
+                elif page >= -(-total // self.SG_BROWSE_PAGE_SIZE):
+                    break
+            elif not batch:
+                # 服务端没给 total：只能靠空页判断到底
+                break
+        return merged, total, source
 
     def _sg_download(self, item: Dict[str, Any]) -> bytes:
         """拿种子字节：优先直链，否则按 torrent_id 走站点两步授权。"""
@@ -3158,12 +3979,165 @@ class ColaCrossSeed(_PluginBase):
                 blind += 1
         return hashes, round(total, 3), blind
 
+    SG_DOWNLOAD_GAP = 0.7        # 每颗之间停一下：站点下载限流 120 次/分，一颗要 2 个请求
+    SG_SKIP_TTL = 7 * 86400      # 「加不进去」的种子记 7 天，别再每轮白下载一遍
+
+    def _sg_skips(self) -> Dict[str, Any]:
+        """读的时候也清一遍过期：没有新写入时，过期条目不能永久生效。"""
+        data = self.get_data("seedgroup_skip") or {}
+        if not isinstance(data, dict):
+            return {}
+        now = int(time.time())
+        fresh = {k: v for k, v in data.items()
+                 if isinstance(v, dict) and now - int(v.get("at") or 0) < self.SG_SKIP_TTL}
+        if len(fresh) != len(data):
+            self.save_data("seedgroup_skip", fresh)
+        return fresh
+
+    def _sg_mark_skip(self, item: Dict[str, Any], reason: str) -> None:
+        key = _seed_group_key(item)
+        if not key:
+            return
+        now = int(time.time())
+        skips = {k: v for k, v in self._sg_skips().items()
+                 if isinstance(v, dict) and now - int(v.get("at") or 0) < self.SG_SKIP_TTL}
+        skips[key] = {"at": now, "reason": reason}
+        self.save_data("seedgroup_skip", skips)
+
+    def _sg_items(self) -> Dict[str, Any]:
+        data = self.get_data("seedgroup_items") or {}
+        return data if isinstance(data, dict) else {}
+
+    def _sg_remember_item(self, info_hash: str, item: Dict[str, Any]) -> None:
+        """记住「本地这颗种子对应站点哪个 torrent_id」——下架清理要靠它对账。"""
+        key = str(info_hash or "").lower().strip()
+        if not key:
+            return
+        items = self._sg_items()
+        items[key] = {"torrent_id": item.get("torrent_id"), "name": str(item.get("name") or ""),
+                      "size_gib": float(item.get("size_gib") or 0),
+                      "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        if len(items) > 20000:     # 大档位会有几千颗小种子，上限给足，避免映射被淘汰后清不掉
+            items = dict(sorted(items.items(), key=lambda kv: str((kv[1] or {}).get("at") or ""))[-20000:])
+        self.save_data("seedgroup_items", items)
+
+    def seed_group_prune(self, **kwargs) -> Dict[str, Any]:
+        """把「站点已下架 / 撤掉官方标记」的种子从本地删掉（colabot1 的 prune 那一步）。"""
+        return self._sg_prune()
+
+    def _sg_oldest_seeded_secs(self, clients: List[_Client]) -> int:
+        """保种组这批种子里，最早加进来的那颗在客户端里做了多久（秒）。"""
+        oldest = 0
+        for client in clients:
+            try:
+                rows = client.list_completed() or []
+            except Exception:
+                continue
+            for row in rows:
+                tags = row.get("tags") or row.get("tag") or ""
+                if isinstance(tags, (list, tuple)):
+                    tags = ",".join(str(t) for t in tags)
+                if SEED_GROUP_TAG not in str(tags):
+                    continue
+                added = row.get("added_on") or row.get("addedOn") or 0
+                try:
+                    added = int(added)
+                except Exception:
+                    continue
+                if added > 0:
+                    age = int(time.time()) - added
+                    if age > oldest:
+                        oldest = age
+        return oldest
+
+    def _sg_prune(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"checked": 0, "removed": 0, "kept": 0, "unmapped": 0,
+                               "failed": 0,
+                               "reason": "", "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        if not self._seedgroup_enabled:
+            out["reason"] = "保种组未启用"
+            return out
+        if (self._seedgroup_prune_mode or "seed") == "off":
+            # 手动端点也要守这个开关：配了「不清理」就不该删任何东西
+            out["reason"] = "下架清理已关闭（seedgroup_prune_mode=off）"
+            return out
+        clients = self._sg_clients()
+        if not clients:
+            out["reason"] = "没有可用的下载器"
+            return out
+        items = self._sg_items()
+        for client in clients:
+            try:
+                torrents = client.list_completed()
+            except Exception as err:
+                logger.warn(f"保种组清理：读 {client.name} 种子失败：{err}")
+                continue
+            for torrent in torrents or []:
+                if SEED_GROUP_TAG not in str(torrent.get("tags") or ""):
+                    continue
+                info_hash = str(torrent.get("hash") or "").lower()
+                if not info_hash:
+                    continue
+                out["checked"] += 1
+                record = items.get(info_hash) or {}
+                torrent_id = record.get("torrent_id") or torrent.get("torrent_id")
+                if not torrent_id:
+                    # 没有 torrent_id 就不知道站点上还是不是官方，宁可不删
+                    out["unmapped"] += 1
+                    continue
+                try:
+                    tid = int(torrent_id)
+                except Exception:
+                    out["unmapped"] += 1
+                    logger.warn(f"保种组清理：torrent_id 不是数字（{torrent_id!r}），跳过 {info_hash[:12]}")
+                    continue
+                detail = self._cola("GET", f"/api/v1/torrents/{tid}")
+                if detail is None:
+                    continue
+                drop = False
+                if detail.status_code == 404:
+                    drop = True                     # 站点上已经没有了
+                elif detail.status_code == 200:
+                    body = detail.json() or {}
+                    status = str(body.get("status") or "")
+                    official = body.get("official")
+                    # 只认**明确**的否定：status 缺失/结构漂移（网关 200 页面、{data:...}）一律保留，
+                    # 不能因为「读不到 status」就把种子删了。
+                    if status in ("withdrawn", "rejected", "deleted"):
+                        drop = True
+                    elif status and status != "approved":
+                        drop = True
+                    elif official is False:
+                        drop = True
+                if not drop:
+                    out["kept"] += 1
+                    continue
+                try:
+                    deleted = client.delete([info_hash], delete_files=self._seedgroup_prune_files)
+                except Exception as err:
+                    logger.warn(f"保种组清理：删除 {info_hash[:12]} 异常：{err}")
+                    deleted = False
+                if not deleted:
+                    # 删除没成功就不能记账、更不能丢映射（否则下次再也删不到）
+                    out["failed"] += 1
+                    logger.warn(f"保种组清理：{client.name} 删除 {info_hash[:12]} 未成功，保留映射")
+                    continue
+                out["removed"] += 1
+                items.pop(info_hash, None)
+                logger.info(f"保种组清理：{client.name} 删除 {info_hash[:12]}"
+                            f"（torrent_id={torrent_id}，文件{'一并删除' if self._seedgroup_prune_files else '保留'}）")
+        self.save_data("seedgroup_items", items)
+        self.save_data("seedgroup_prune", out)
+        logger.info(f"保种组清理完成：检查 {out['checked']}，删除 {out['removed']}，保留 {out['kept']}，"
+                    f"失败 {out['failed']}，无映射跳过 {out['unmapped']}")
+        return out
+
     def seed_group_probe(self) -> Dict[str, Any]:
         """探针：工作组资格 + 解锁状态 + 资源池可达性（面板与 /seedgroup/probe 共用）。"""
         ident = self.seed_group_identity()
         unlocked, record = self._sg_unlocked(refresh=False)
         pool = self._sg_candidates()
-        tier = self._seedgroup_tier if self._seedgroup_tier in SEED_GROUP_TIERS else "2T"
+        tier = seed_group_tier_key(self._seedgroup_tier)
         return {
             "ok": bool(ident.get("ok")),
             "activated": bool(ident.get("staff")) and unlocked,
@@ -3172,7 +4146,7 @@ class ColaCrossSeed(_PluginBase):
             "unlocked": unlocked,
             "reason": ident.get("reason") or ("" if unlocked else "尚未解锁"),
             "tier": tier,
-            "quota_gib": float(seed_group_target_gib(tier)),
+            "quota_gib": float(seed_group_target_gib(tier, self._seedgroup_custom_gib)),
             "pool_count": len(pool),
             "pool_gib": round(sum(_seed_group_size_gib(x.get("size")) for x in pool), 1),
             "pool_source": str(self.get_data("seedgroup_pool_source") or ""),
@@ -3195,8 +4169,9 @@ class ColaCrossSeed(_PluginBase):
     def _seed_group_sync(self):
         if not self._seedgroup_enabled:
             return
-        tier = self._seedgroup_tier if self._seedgroup_tier in SEED_GROUP_TIERS else "2T"
-        target = float(seed_group_target_gib(tier))
+        tier = seed_group_tier_key(self._seedgroup_tier)
+        dynamic = tier == SEED_GROUP_ALL_TIER
+        target = 0.0 if dynamic else float(seed_group_target_gib(tier, self._seedgroup_custom_gib))
         clients = self._sg_clients()
         state: Dict[str, Any] = {
             "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3209,12 +4184,14 @@ class ColaCrossSeed(_PluginBase):
             state["reason"] = "插件还没登录可乐PT：先在插件页取验证码登录"
             self.save_data("seedgroup_state", state)
             logger.warn("保种组：未登录可乐PT，跳过本轮")
+            self._maybe_report(clients, state)
             return
         if not clients:
             state["reason"] = "没有可用的下载器"
             self.save_data("seedgroup_state", state)
             logger.warn("保种组：没有可用的下载器")
             return
+        self._apply_speed_limits(clients)
         # 强制闸：非工作组账号连解锁都拿不到，这里直接停，不走资源池
         unlocked, record = self._sg_unlocked()
         state.update({"unlocked": unlocked, "staff_groups": record.get("groups") or []})
@@ -3222,25 +4199,62 @@ class ColaCrossSeed(_PluginBase):
             state["reason"] = str(record.get("reason") or "账号不在工作组，保种组无法解锁")
             self.save_data("seedgroup_state", state)
             logger.warn(f"保种组已锁定：{state['reason']}")
+            self._maybe_report(clients, state)
             return
         existing, current_gib, blind = self._sg_current(clients)
         state["current_gib"] = current_gib
+        skips = self._sg_skips()
+        pool_all = self._sg_candidates()
+        state["pool_count"] = len(pool_all)
+        state["skipped"] = len(skips)
+        # 池子一条都取不到：不能算达标（以前 target 会被算成 current，面板直接写「已达标」）
+        if not pool_all:
+            state["reason"] = "官方资源池取不到（API Key 无效或浏览接口没返回官方版本）"
+            state["shortfall_gib"] = max(0.0, round(target - current_gib, 3)) if target > 0 else 0.0
+            self.save_data("seedgroup_state", state)
+            logger.warn(f"保种组：资源池为空，缺口 {state['shortfall_gib']} GiB")
+            self._maybe_report(clients, state)
+            return
+        # 「全站官种」的目标用**未过滤**的池子算：跳过表里的条目只是「这轮先不加」，
+        # 不能因为它们让目标缩水，否则会显示「已达标」而其实还有没保的官方种。
+        if dynamic:
+            pool_total = round(sum(_seed_group_size_gib(x.get("size")) for x in pool_all), 3)
+            target = round(max(current_gib, pool_total), 3)
+            state["target_gib"] = target
+        candidates = [x for x in pool_all
+                      if str(x.get("info_hash") or "").lower() not in existing
+                      and _seed_group_key(x) not in skips]
+        state["pool_pending"] = len(candidates)
         need = round(target - current_gib, 3)
         state["need_gib"] = max(0.0, need)
         if need <= 0:
+            # 稳态：该保的都保了。下架清理仍要跑（UI 写的是「每轮回站点核对」）。
             state.update({"activated": True, "covered_gib": current_gib, "shortfall_gib": 0.0})
+            if skips:
+                state["reason"] = f"{len(skips)} 条在 7 天跳过表里，本轮不重试"
             self.save_data("seedgroup_state", state)
             logger.info(f"保种组已达标：档位 {tier} / 目标 {target} GiB / 现有 {current_gib} GiB")
+            try:
+                rotated = self._sg_rotate(clients, state, pool_all)
+                state["rotate_dropped"] = rotated.get("dropped", 0)
+                state["rotate_added"] = rotated.get("added", 0)
+                state["rotate_reason"] = rotated.get("reason", "")
+                self.save_data("seedgroup_state", state)
+            except Exception as err:
+                logger.warn(f"动态保种异常（不影响本轮）：{type(err).__name__}: {err}")
+            self._sg_prune_if_enabled(state)
+            self._maybe_report(clients, state)
             return
-        candidates = [x for x in self._sg_candidates()
-                      if str(x.get("info_hash") or "").lower() not in existing]
-        state["pool_count"] = len(candidates)
         if not candidates:
+            # 还有缺口，但池子里剩下的全都「已在客户端」或在跳过表：如实说清是哪种
             state["activated"] = True
-            state["reason"] = "官方资源池取不到（API Key 无效或浏览接口没返回官方版本）"
-            state["shortfall_gib"] = need
+            state["shortfall_gib"] = max(0.0, need)
+            state["reason"] = (f"池中 {len(pool_all)} 条全部已在客户端或处于 7 天跳过表"
+                               f"（跳过 {len(skips)} 条），本轮没有可加的")
             self.save_data("seedgroup_state", state)
-            logger.warn(f"保种组：资源池为空，缺口 {need} GiB")
+            logger.warn(f"保种组：{state['reason']}，缺口 {state['shortfall_gib']} GiB")
+            self._sg_prune_if_enabled(state)
+            self._maybe_report(clients, state)
             return
         picked, planned_gib, shortfall = seed_group_plan(candidates, need)
         client = clients[0]
@@ -3249,33 +4263,70 @@ class ColaCrossSeed(_PluginBase):
         for item in picked:
             if self._event.is_set():
                 break
+            if added or failed:
+                time.sleep(self.SG_DOWNLOAD_GAP)
             data = self._sg_download(item)
             if not data:
                 failed += 1
+                self._sg_mark_skip(item, "download")
                 continue
-            result = client.add(data, self._seedgroup_save_path, self._seedgroup_skip_check,
-                                label=SEED_GROUP_TAG,
-                                hash_hint=str(item.get("info_hash") or ""))
-            if result in ("ok", "dup"):
-                added += 1 if result == "ok" else 0
-                duplicate += 1 if result == "dup" else 0
+            # 两条资源池通道都可能不带 info_hash：以真正拿到的 .torrent 为准算一遍，
+            # 客户端里已经有了就直接记「重复」，不要塞进去让 qB 回 Fails 再算失败。
+            info_hash = _torrent_info_hash(data) or str(item.get("info_hash") or "")
+            if info_hash and client.has(info_hash):
+                # 客户端里已经有这颗：补上「可乐保种组」标签，否则 _sg_current 永远算不到它的体积，
+                # 固定档位会长期显示缺口。补完记进映射，下一轮就能统计到。
+                duplicate += 1
+                self._sg_remember_item(info_hash, item)
+                try:
+                    client.add_tags(info_hash, SEED_GROUP_TAG)
+                except Exception as err:
+                    logger.warn(f"保种组：给已有种子补标签失败（{info_hash[:12]}）：{err}")
+                continue
+            try:
+                result = client.add(data, self._seedgroup_save_path, self._seedgroup_skip_check,
+                                    label=SEED_GROUP_TAG, hash_hint=info_hash)
+            except Exception as err:
+                # 单条加种炸了不能拖垮整轮：记下来，下一轮换别的种子
+                logger.warn(f"保种组加种异常（{item.get('torrent_id')}）：{err}")
+                failed += 1
+                self._sg_mark_skip(item, "error")
+                continue
+            if result == "ok":
+                added += 1
                 added_gib += float(item.get("size_gib") or 0)
+                self._sg_remember_item(info_hash, item)
+            elif result == "dup":
+                duplicate += 1
+                self._sg_mark_skip(item, "dup")
+                self._sg_remember_item(info_hash, item)
             else:
                 failed += 1
-        covered = round(current_gib + added_gib, 3)
+                self._sg_mark_skip(item, "fail")
+        # 覆盖体积以「客户端实测」为准（刚加进去的种子立刻可见），
+        # 不再用「计划值 + dup 的体积」估，避免缺口报 0 的假达标。
+        try:
+            _, measured_gib, _ = self._sg_current(clients)
+        except Exception:
+            measured_gib = 0.0
+        covered = round(max(measured_gib, current_gib + added_gib), 3)
         state.update({"activated": True, "picked": len(picked), "planned_gib": planned_gib,
                       "added": added, "duplicate": duplicate, "failed": failed,
                       "added_gib": round(added_gib, 3), "covered_gib": covered,
                       "shortfall_gib": max(0.0, round(target - covered, 3))})
         if state["shortfall_gib"] > 0 and not state["reason"]:
-            state["reason"] = (f"资源池不足或添加失败：还差 {state['shortfall_gib']} GiB"
-                               f"（计划缺口 {shortfall} GiB）")
+            state["reason"] = (f"实际覆盖还差 {state['shortfall_gib']} GiB"
+                               f"（池子可挑 {round(planned_gib, 1)} GiB，失败 {failed} 条）")
         if blind:
             state["reason"] = (state["reason"] + "；" if state["reason"] else "") + \
                               f"{blind} 个下载器不返回标签，体积统计可能偏低"
         self.save_data("seedgroup_state", state)
         logger.info(f"保种组完成：档位 {tier} 目标 {target} GiB，新增 {added} 条 (+{round(added_gib, 1)} GiB)，"
                     f"覆盖 {covered} GiB，缺口 {state['shortfall_gib']} GiB，失败 {failed}")
+        # 站点下架 / 撤掉官方标记的，跟着从本地删（colabot1 的 prune）
+        self._sg_prune_if_enabled(state)
+        # 只统计开了保种组的用户：把每台客户端此刻的限速设置汇报给站点
+        self._maybe_report(clients, state)
         if self._notify and (added or failed):
             self.post_message(
                 mtype=NotificationType.SiteMessage,
@@ -3288,33 +4339,26 @@ class ColaCrossSeed(_PluginBase):
             )
 
     def get_state(self) -> bool:
-        return bool(self._enabled and self._session_token)
+        # 两个功能任一开启都算「插件在工作」：只开保种组时也要显示为运行中
+        return bool(self._enabled and (self._crossseed_enabled or self._seedgroup_enabled)
+                    and self._session_token)
 
     def get_service(self) -> List[Dict[str, Any]]:
         services: List[Dict[str, Any]] = []
-        if self._enabled and self._cron:
-            try:
-                trigger = CronTrigger.from_crontab(self._cron) if len(str(self._cron).split()) == 5 else self._cron
-            except Exception:
-                trigger = "0 */1 * * *"
+        if self._enabled and self._crossseed_enabled and self._cron:
             services.append({
                 "id": "ColaCrossSeed",
                 "name": "可乐PT自动辅种",
-                "trigger": trigger,
+                "trigger": _cron_trigger(self._cron, "0 */1 * * *"),
                 "func": self.auto_seed,
                 "kwargs": {},
             })
-        if self._seedgroup_enabled and self._seedgroup_cron:
+        if self._enabled and self._seedgroup_enabled and self._seedgroup_cron:
             # 保种组是独立任务：MP「任务」页里能单独看它跑没跑、单独设周期
-            try:
-                sg_trigger = (CronTrigger.from_crontab(self._seedgroup_cron)
-                              if len(str(self._seedgroup_cron).split()) == 5 else self._seedgroup_cron)
-            except Exception:
-                sg_trigger = "0 */6 * * *"
             services.append({
                 "id": "ColaCrossSeedSeedGroup",
                 "name": "可乐保种组",
-                "trigger": sg_trigger,
+                "trigger": _cron_trigger(self._seedgroup_cron, "0 */6 * * *"),
                 "func": self.seed_group_sync,
                 "kwargs": {},
             })
@@ -3352,6 +4396,19 @@ class ColaCrossSeed(_PluginBase):
         # ---- 可乐保种组面板：导航区第一块，档位与缺口一眼可见 ----
         blocks.insert(0, self._seedgroup_panel())
         sites = self._other_sites()
+        # IYUU 一键导入的账目：粘一次 JSON 之后，这里就是「到底生效了哪些」的唯一凭据
+        iyuu_imported = [] if (self._sites_mode or "merge") == "manual" else self._iyuu_sites()
+        if iyuu_imported:
+            uid_n = sum(1 for x in iyuu_imported if x.get("uid"))
+            hash_n = sum(1 for x in iyuu_imported if x.get("downhash"))
+            cookie_n = sum(1 for x in iyuu_imported if x.get("cookie"))
+            blocks.append({
+                "component": "div",
+                "text": (f"IYUU 导入：{len(iyuu_imported)} 个启用站点"
+                         f"（带 uid {uid_n} / downhash {hash_n} / Cookie {cookie_n}；"
+                         f"站点来源 {self._sites_mode or 'merge'}）"),
+                "props": {"style": "white-space: pre-wrap; line-height: 1.7"},
+            })
         if sites:
             per = (last.get("by_site") or {}) if isinstance(last, dict) else {}
             rows = []
@@ -3451,6 +4508,34 @@ class ColaCrossSeed(_PluginBase):
                 "description": "按当前档位把官方资源池补齐到体积下限（只超不少），缺口会如实报出",
             },
             {
+                "path": "/sites/import",
+                "endpoint": self.iyuu_import,
+                "methods": ["POST"],
+                "summary": "一键导入 IYUU 站点配置",
+                "description": "请求体传 IYUU 导出的 JSON（json/payload/sites 任一键），自动展开成站点；返回 total/enabled/usable/skipped",
+            },
+            {
+                "path": "/sites/import-file",
+                "endpoint": self.iyuu_import_file,
+                "methods": ["POST"],
+                "summary": "从本地文件导入 IYUU 配置",
+                "description": "请求体传 {\"path\": \"/config/cola-sites.json\"}（容器内路径）；不传则用设置里的「IYUU 配置文件路径」",
+            },
+            {
+                "path": "/seedgroup/rotate",
+                "endpoint": self.seed_group_rotate,
+                "methods": ["POST"],
+                "summary": "立即做一次动态轮换",
+                "description": "体积达标后，删做种人数最多的 N 颗、补做种人数最少的 N 颗（默认 5）",
+            },
+            {
+                "path": "/seedgroup/prune",
+                "endpoint": self.seed_group_prune,
+                "methods": ["POST"],
+                "summary": "清理站点已下架的保种",
+                "description": "逐个回站点核对 status/official，把已下架或撤掉官方标记的种子从下载器里删掉（可选同时删文件）",
+            },
+            {
                 "path": "/seedgroup/identity",
                 "endpoint": self.seed_group_identity,
                 "methods": ["GET", "POST"],
@@ -3466,30 +4551,133 @@ class ColaCrossSeed(_PluginBase):
             },
         ]
 
+    @staticmethod
+    def _form_section(title: str, text: str) -> Dict[str, Any]:
+        """设置页的分区标题：一条 tonal 提示条，比裸标题更容易一眼分段。"""
+        return {"component": "VRow", "content": [
+            {"component": "VCol", "props": {"cols": 12}, "content": [
+                {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
+                                                  "density": "compact", "title": title, "text": text}}]},
+        ]}
+
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """设置页排版：总开关 → 账号 → 下载器 → 站点 → 辅种行为 → 保种组。
+
+        只重排、不改字段名：每个 `model` 都对应 init_plugin 读的那个键，defaults 与之一一对应。
+        """
         return [
             {
                 "component": "VForm",
                 "content": [
+                    # ── 总开关（放最上面，开关一关下面都不跑）──
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "notify", "label": "发送通知"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "use_mp_clients", "label": "使用 MoviePilot 已配置下载器"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                            {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件（总开关）"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                            {"component": "VSwitch", "props": {"model": "crossseed_enabled",
+                             "label": "启用辅种（功能一）"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                            {"component": "VSwitch", "props": {"model": "seedgroup_enabled",
+                             "label": "启用保种组（功能二）"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                            {"component": "VSwitch", "props": {"model": "notify", "label": "任务结果通知"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VAlert", "props": {
+                                "type": "info", "variant": "tonal", "density": "compact",
+                                "text": "两个功能互不影响，各有各的开关与运行间隔；"
+                                        "「启用插件」是总开关，关掉后两个都不跑。"
+                                        "异常与重新登录提醒始终发送，不受「任务结果通知」影响。"}}]},
+                    ]},
+
+                    # ── ① 账号 ──
+                    self._form_section("① 可乐PT 账号",
+                                       "第一次使用先打开插件页取验证码，填到「验证码」保存即完成登录；"
+                                       "会话过期插件会发站内通知，重新取一次即可。"),
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VTextField", "props": {"model": "username", "label": "用户名"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VTextField", "props": {"model": "password", "label": "密码", "type": "password"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "username", "label": "可乐PT 用户名"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "password", "label": "可乐PT 密码", "type": "password"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "captcha_code", "label": "验证码（先在插件页面看图片）"}}]},
+                            {"component": "VTextField", "props": {"model": "captcha_code",
+                             "label": "验证码（先在插件页看图片）"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                             {"component": "VTextField", "props": {"model": "otp_code", "label": "两步验证码（可选）"}}]},
+                    ]},
+
+                    # ── ② 下载器 ──
+                    self._form_section("② 下载器",
+                                       "勾「使用 MoviePilot 已配置下载器」就用 MP 里的那几台；"
+                                       "否则在下面按行填地址与账号。"),
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VSwitch", "props": {"model": "use_mp_clients",
+                             "label": "使用 MP 已配置下载器"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VSwitch", "props": {"model": "skip_check", "label": "辅种：跳过校验"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VTextField", "props": {"model": "target_client",
+                             "label": "辅种加到哪台（留空=自动）",
+                             "placeholder": "优先正在做种的那台"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VTextarea", "props": {"model": "clients_lines", "rows": 3, "persistent-hint": True,
+                             "label": "辅种自定义下载器（每行一台）",
+                             "hint": "地址,用户名,密码；Transmission 写成 tr,地址,用户名,密码。会与上面的 MP 下载器一起使用（并集）",
+                             "placeholder": "192.168.1.100:8080,admin,密码\ntr,192.168.1.101:9091,admin,密码"}}]},
+                    ]},
+
+                    # ── ③ 站点来源 ──
+                    self._form_section("③ 站点来源（IYUU 一键导入）",
+                                       "把 IYUU 导出的站点 JSON 整个粘到下面「IYUU 站点 JSON」里保存即可生效，"
+                                       "不必再手写站点行；passkey / uid / downhash / Cookie 会一起带走。"),
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VSelect", "props": {"model": "sites_mode", "label": "站点来源", "items": [
+                                {"title": "只用 IYUU 导入（推荐：粘一次 JSON 就生效）", "value": "iyuu_only"},
+                                {"title": "IYUU 导入 + 手写行补充（默认）", "value": "merge"},
+                                {"title": "只用手写的行（不看 IYUU 导入）", "value": "manual"}]}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VTextField", "props": {"model": "iyuu_token",
+                             "label": "IYUU Token（可选，填了走云端匹配）", "placeholder": "IYUU..."}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VTextField", "props": {"model": "iyuu_json_file",
+                             "label": "IYUU 配置文件路径（容器内，填了就以文件为准）",
+                             "persistent-hint": True,
+                             "hint": "把导出的 JSON 放到宿主的 MP 配置目录下（容器内 /config/…），保存即导入",
+                             "placeholder": "/config/cola-sites.json"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VTextarea", "props": {"model": "iyuu_json", "rows": 5,
+                             "label": "IYUU 站点 JSON（把导出内容整个粘贴进来，保存即生效）",
+                             "placeholder": "[{\"site\":\"keepfrds\",\"nickname\":\"朋友\",\"base_url\":\"pt.keepfrds.com\",\"sid\":1,\"disabled\":0,\"options\":{\"passkey\":\"...\",\"uid\":\"...\"}}]"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VTextarea", "props": {"model": "sites_lines", "rows": 3,
+                             "label": "其他站（可选，手写补充）", "persistent-hint": True,
+                             "hint": "每行 域名,passkey；可带 sid= rsskey= channel= uid= downhash= cookie= proxy=",
+                             "placeholder": "https://pt.example.com,abcdef123456\n观众,https://audiences.me,passkey=...,rsskey=...,channel=rss"}}]},
+                    ]},
+
+                    # ── ④ 辅种行为 ──
+                    self._form_section("④ 辅种（功能一）",
+                                       "开关在页面最上面「启用辅种」；这里设的是它的运行间隔与行为。"
+                                       "控制辅多少、补到哪个方向、以及标签怎么带。"),
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VTextField", "props": {"model": "cron",
+                             "label": "辅种运行间隔（cron，5 段）", "persistent-hint": True,
+                             "hint": "例如 0 */1 * * * = 每小时；写错会静默按每小时跑",
+                             "placeholder": "0 */1 * * *"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
@@ -3497,139 +4685,165 @@ class ColaCrossSeed(_PluginBase):
                                 {"title": "双向", "value": "both"}, {"title": "只补可乐", "value": "cola_only"},
                                 {"title": "只补其他站", "value": "other_only"}]}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "max_per_hour", "label": "每小时上限（0 = 不限）", "type": "number", "hint": "填 0 表示不限制总量"}},
-                            {"component": "VTextField", "props": {"model": "max_per_site", "label": "单个站点最多补种数", "type": "number", "hint": "每个站每轮最多补多少颗，默认 20"}}]},
+                            {"component": "VTextField", "props": {"model": "max_per_hour",
+                             "label": "每小时上限（0 = 不限）", "type": "number"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "skip_check", "label": "跳过校验（默认校验）"}}]},
+                            {"component": "VTextField", "props": {"model": "max_per_site",
+                             "label": "单个站点每轮上限", "type": "number", "min": 1, "persistent-hint": True,
+                             "hint": "默认 20；填非数字会连同「每小时上限」一起重置"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "add_label", "label": "辅种标签（可留空；分类会跟随原种子，不再塞进标签）",
-                             "placeholder": "cross-seed"}}]},
+                            {"component": "VTextField", "props": {"model": "add_label",
+                             "label": "辅种标签（可留空）", "placeholder": "cross-seed"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "extra_tags",
-                             "label": "额外标签（逗号分隔，例如站点名）", "placeholder": "可乐PT,辅种"}}]},
+                             "label": "额外标签（逗号分隔）", "placeholder": "可乐PT,辅种"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "inherit_tags",
-                             "label": "继承原种子的标签（站点标签、已整理等）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "target_client",
-                             "label": "辅种加到哪个下载器（留空=自动，填 MP 里下载器的名字）",
-                             "placeholder": "留空：优先正在做种的那台"}}]},
+                            {"component": "VSwitch", "props": {"model": "inherit_tags", "label": "继承原种子标签"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "fallback_skip_check", "label": "校验失败时降级为跳过校验重试"}}]},
+                            {"component": "VSwitch", "props": {"model": "fallback_skip_check",
+                             "label": "校验失败降级为跳过校验重试"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "retry_failed", "label": "失败的种子下一轮先重试"}}]},
+                            {"component": "VSwitch", "props": {"model": "retry_failed", "label": "失败下轮先重试"}}]},
                     ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "cron", "label": "执行周期（cron）", "placeholder": "0 */1 * * *"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VTextarea", "props": {"model": "clients_lines", "rows": 4,
-                             "label": "下载器（每行一个：地址,用户名,密码；TR 写成 tr,地址,用户名,密码）",
-                             "placeholder": "192.168.1.100:8080,admin,密码\ntr,192.168.1.101:9091,admin,密码"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VSelect", "props": {"model": "sites_mode", "label": "站点来源", "items": [
-                                {"title": "行文本 + IYUU 导入（默认）", "value": "merge"},
-                                {"title": "只用手写的行（不看 IYUU 导入）", "value": "manual"}]}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VTextarea", "props": {"model": "sites_lines", "rows": 4,
-                             "label": "其他站（每行一个：域名,passkey；可写 名称,域名,passkey,rsskey=…,sid=…,channel=pieces|rss|iyuu|auto,rss_url=…,rss_interval=秒；channel 只决定探测哪条通道，IYUU 只要填了 sid 就生效；RSS 两次拉取之间的强制下限默认 120 秒，观众/彩虹岛 固定 ≥120 秒）",
-                             "placeholder": "https://pt.example.com,abcdef123456\n观众,https://audiences.me,PASSKEY,RSSKEY"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "iyuu_token", "label": "IYUU Token（可选，填了就用 IYUU 云端辅种匹配）",
-                             "placeholder": "IYUU..."}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VTextarea", "props": {"model": "iyuu_json", "rows": 4,
-                             "label": "直接导入 IYUU 站点配置（把 IYUU 导出的 JSON 整个粘贴进来，自动取启用的站点）",
-                             "placeholder": "[{\"site\":\"keepfrds\",\"nickname\":\"朋友\",\"base_url\":\"pt.keepfrds.com\",\"options\":{\"passkey\":\"...\"}}]"}}]},
-                    ]},
+
+                    # ── ⑤ 可乐保种组 ──
+                    self._form_section("⑤ 保种组（功能二，仅工作组可解锁）",
+                                       "开关在页面顶部「启用保种组（功能二）」。按档位把站点官方资源池搬进下载器，"
+                                       "体积只能超不能少；解锁资格只认站点工作组（登录后读本人资料里的工作组头衔），"
+                                       "没有工作组的账号保存时会被强制关掉这一块，并写明原因。"),
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VAlert", "props": {
-                                "type": "info", "variant": "tonal", "density": "compact",
-                                "title": "可乐保种组（仅工作组可解锁）",
-                                "text": "按档位（2T / 5T / 10T / 20T+）把站点官方资源池搬进下载器，体积只能超不能少。"
-                                        "解锁资格只认站点工作组：账号密码登录后读本人资料里的工作组头衔，"
-                                        "没有工作组的账号保存时会被强制关掉这一块，辅种不受影响。"}}]},
+                                "type": "warning", "variant": "tonal", "density": "compact",
+                                "title": "用 MP 下载器保种，整理方式请用硬链接",
+                                "text": "MP 的整理会改名、移动文件；源文件被移走之后做种的种子会变红、保种中断。"
+                                        "建议在 MP「设置 → 目录/整理」里把整理方式设为硬链接（硬链接不占双份空间），"
+                                        "或改用下面的「自定义下载器」专门保种。"}}]},
                     ]},
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                            {"component": "VSwitch", "props": {"model": "seedgroup_enabled", "label": "启用可乐保种组"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSelect", "props": {"model": "seedgroup_tier", "label": "保种档位", "items": [
-                                {"title": SEED_GROUP_TIER_LABELS[k], "value": k} for k in SEED_GROUP_TIERS]}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
-                            {"component": "VTextField", "props": {"model": "seedgroup_cron", "label": "保种组执行周期（cron）",
+                            {"component": "VSelect", "props": {"model": "seedgroup_tier", "label": "保种档位", "items": [
+                                {"title": SEED_GROUP_TIER_LABELS[k], "value": k}
+                                for k in (list(SEED_GROUP_TIERS)
+                                          + [SEED_GROUP_CUSTOM_TIER, SEED_GROUP_ALL_TIER])]}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VTextField", "props": {"model": "seedgroup_cron",
+                             "label": "保种运行间隔（cron，5 段）", "persistent-hint": True,
+                             "hint": "例如 0 */6 * * * = 每 6 小时；写错会静默按每 6 小时跑",
                              "placeholder": "0 */6 * * *"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "seedgroup_api_key",
-                             "label": "站点 API Key（可选，X-API-Key；填了走官方清单接口，不填走浏览接口）",
-                             "type": "password"}}]},
+                            {"component": "VTextField", "props": {"model": "seedgroup_custom_gib",
+                             "label": "自定义体积（100M / 100G / 1T / 1P）",
+                             "persistent-hint": True,
+                             "hint": "仅选「自定义档」时生效；不带单位按 GiB"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "seedgroup_staff_prefix",
-                             "label": "解锁所需的工作组名称前缀", "placeholder": "工作组"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "seedgroup_allow_admin",
-                             "label": "管理员账号也放行"}}]},
+                            {"component": "VSelect", "props": {"model": "seedgroup_client_mode", "label": "保种下载器", "items": [
+                                {"title": "用 MP 已配置下载器", "value": "mp"},
+                                {"title": "用下面填的自定义下载器", "value": "custom"}]}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "seedgroup_use_mp_clients",
-                             "label": "用 MoviePilot 已配置下载器（种子交给 MP 刮削整理）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "seedgroup_target_client",
-                             "label": "保种加到哪台下载器（留空=第一台）",
+                             "label": "保种加到哪台（留空=第一台）",
                              "placeholder": "MP-qb / QB-1 / TR-1"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "seedgroup_save_path",
-                             "label": "保种组保存路径（留空=下载器默认目录）"}}]},
+                             "label": "保存路径（留空=下载器默认）"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VSwitch", "props": {"model": "seedgroup_skip_check",
+                             "label": "保种组：跳过校验"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VSelect", "props": {"model": "seedgroup_prune_mode", "label": "下架清理（每轮回站点核对 status/official）", "items": [
+                                {"title": "只删种子，保留文件（默认）", "value": "seed"},
+                                {"title": "种子和文件一起删", "value": "files"},
+                                {"title": "不清理", "value": "off"}]}}]},
+                    ]},
+                    self._form_section("⑤-2 保种限速（只作用于保种组）",
+                                       "留空 = 完全不碰下载器原有设置；填了才强行接管，每轮保种同步都会重新下发。"
+                                       "辅种不走这里，也不受这里影响。"),
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VTextField", "props": {"model": "limit_dl_kib",
+                             "label": "保种下载限速（KiB/s）", "type": "number", "min": 0,
+                             "persistent-hint": True,
+                             "hint": "留空/0 = 不接管下载"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VTextField", "props": {"model": "limit_up_kib",
+                             "label": "保种上传限速（KiB/s）", "type": "number", "min": 0,
+                             "persistent-hint": True,
+                             "hint": "留空/0 = 不接管上传"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VTextarea", "props": {"model": "limit_lines", "rows": 3,
+                             "persistent-hint": True,
+                             "label": "每客户端单独限速（每行：客户端名或地址,下载KiB/s,上传KiB/s）",
+                             "hint": "包含匹配：写 198.72 或 MP-qb 都能命中；没列出的客户端用上面的保种全局值",
+                             "placeholder": "198.72.127.68:8081,1024,2048\nMP-qb,0,3000"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VSwitch", "props": {"model": "seedgroup_rotate",
+                             "label": "动态保种（达标后轮换）"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VTextField", "props": {"model": "seedgroup_rotate_count",
+                             "label": "每轮删/补数量", "type": "number", "min": 1,
+                             "persistent-hint": True,
+                             "hint": "删做种人数最多的那几颗，补做种人数最少的同数量"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VSwitch", "props": {"model": "seedgroup_rotate_files",
+                             "label": "轮换时连文件一起删"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VTextarea", "props": {"model": "seedgroup_clients_lines", "rows": 3,
-                             "label": "保种组自定义下载器（可选；每行 地址,用户名,密码，TR 写 tr,地址,用户名,密码；填了就不走 MP 那台）",
+                             "persistent-hint": True,
+                             "label": "保种组自定义下载器（仅「用下面填的自定义下载器」时生效）",
+                             "hint": "每行 地址,用户名,密码；TR 写 tr,地址,用户名,密码",
                              "placeholder": "192.168.1.100:8080,admin,密码\ntr,192.168.1.101:9091,admin,密码"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "seedgroup_skip_check", "label": "跳过校验"}}]},
                     ]},
                 ],
             }
         ], {
-            "enabled": False, "notify": True, "cron": "0 */1 * * *",
+            "enabled": False, "crossseed_enabled": True, "notify": True, "cron": "0 */1 * * *",
             "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
             "skip_check": False, "max_per_hour": 0, "max_per_site": 20, "direction": "both",
-            "use_mp_clients": True, "clients_json": "", "clients_lines": "", "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "", "sites_mode": "merge",
+            "use_mp_clients": True, "clients_json": "", "clients_lines": "",
+            "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "", "sites_mode": "merge",
             "add_label": "", "extra_tags": "", "inherit_tags": True, "target_client": "",
             "fallback_skip_check": True, "retry_failed": True,
-            "seedgroup_enabled": False, "seedgroup_tier": "2T", "seedgroup_api_key": "",
-            "seedgroup_staff_prefix": SEED_GROUP_STAFF_PREFIX, "seedgroup_allow_admin": True,
-            "seedgroup_use_mp_clients": True, "seedgroup_clients_lines": "", "seedgroup_target_client": "",
+            "limit_dl_kib": 0, "limit_up_kib": 0, "limit_lines": "",
+            "seedgroup_enabled": False, "seedgroup_tier": "2T",
+            "seedgroup_custom_gib": 2048, "seedgroup_scope": "site",
             "seedgroup_cron": "0 */6 * * *", "seedgroup_save_path": "", "seedgroup_skip_check": True,
+            "iyuu_json_file": "",
+            "seedgroup_client_mode": "mp", "seedgroup_prune_mode": "seed",
+            "seedgroup_rotate": True, "seedgroup_rotate_count": 5, "seedgroup_rotate_files": True,
+            "seedgroup_report": True, "seedgroup_report_url": SEED_GROUP_REPORT_URL,
+            "seedgroup_report_token": "",
+            "seedgroup_prune": True, "seedgroup_prune_files": False,
+            "seedgroup_api_key": "", "seedgroup_staff_prefix": SEED_GROUP_STAFF_PREFIX,
+            "seedgroup_allow_admin": True, "seedgroup_use_mp_clients": True,
+            "seedgroup_clients_lines": "", "seedgroup_target_client": "",
         }
 
 
 class _MPClient(_Client):
     """把 MoviePilot 的下载器模块包成统一接口。"""
 
-    def __init__(self, name: str, list_func, add_func):
+    def __init__(self, name: str, list_func, add_func, delete_func=None):
         self.name = name
         self._list = list_func
         self._add = add_func
+        self._delete = delete_func
 
     def list_completed(self) -> List[Dict[str, Any]]:
         out = []
