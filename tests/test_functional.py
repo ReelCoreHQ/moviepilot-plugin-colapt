@@ -731,5 +731,182 @@ class SiteReportTest(unittest.TestCase):
         self.assertTrue(lines[1].startswith("✅"))
 
 
+class SeedGroupTierTest(unittest.TestCase):
+    def test_tiers_are_gib_floor(self):
+        self.assertEqual(mod.seed_group_target_gib("2T"), 2048)
+        self.assertEqual(mod.seed_group_target_gib("5T"), 5120)
+        self.assertEqual(mod.seed_group_target_gib("10T"), 10240)
+        self.assertEqual(mod.seed_group_target_gib("20T+"), 20480)
+
+    def test_unknown_tier_falls_back_to_smallest(self):
+        # 写错档位不能退化成「不保种」：一律按 2T 下限走
+        self.assertEqual(mod.seed_group_target_gib("100T"), 2048)
+        self.assertEqual(mod.seed_group_target_gib(""), 2048)
+        self.assertEqual(mod.seed_group_target_gib(None), 2048)
+
+    def test_size_bytes_and_gib(self):
+        self.assertAlmostEqual(mod._seed_group_size_gib(2 * mod.GIB), 2.0)
+        self.assertAlmostEqual(mod._seed_group_size_gib(3.5), 3.5)      # 已经是 GiB
+        self.assertEqual(mod._seed_group_size_gib(0), 0.0)
+        self.assertEqual(mod._seed_group_size_gib("bad"), 0.0)
+
+
+class SeedGroupPlanTest(unittest.TestCase):
+    def test_never_below_target(self):
+        items = [{"info_hash": f"h{i}", "size": i * mod.GIB} for i in (60, 50, 40, 30)]
+        picked, total, shortfall = mod.seed_group_plan(items, 100)
+        self.assertGreaterEqual(total, 100)
+        self.assertEqual(shortfall, 0)
+        self.assertEqual(sum(x["size_gib"] for x in picked), total)
+
+    def test_best_fit_fills_exactly(self):
+        items = [{"info_hash": "a", "size": 60 * mod.GIB},
+                 {"info_hash": "b", "size": 50 * mod.GIB},
+                 {"info_hash": "c", "size": 40 * mod.GIB}]
+        picked, total, shortfall = mod.seed_group_plan(items, 100)
+        self.assertEqual(total, 100)
+        self.assertEqual([x["info_hash"] for x in picked], ["a", "c"])
+        self.assertEqual(shortfall, 0)
+
+    def test_overflow_single_too_big(self):
+        # 一颗就超过档位：照样收下（只超不少）
+        picked, total, shortfall = mod.seed_group_plan(
+            [{"info_hash": "big", "size": 300 * mod.GIB}], 100)
+        self.assertEqual(len(picked), 1)
+        self.assertEqual(total, 300)
+        self.assertEqual(shortfall, 0)
+
+    def test_shortfall_reported_when_pool_too_small(self):
+        items = [{"info_hash": "a", "size": 40 * mod.GIB},
+                 {"info_hash": "b", "size": 60 * mod.GIB}]
+        picked, total, shortfall = mod.seed_group_plan(items, 1000)
+        self.assertEqual(len(picked), 2)
+        self.assertEqual(total, 100)
+        self.assertEqual(shortfall, 900)
+
+    def test_official_first(self):
+        items = [{"info_hash": "plain", "size": 60 * mod.GIB, "official": False},
+                 {"info_hash": "official", "size": 50 * mod.GIB, "official": True}]
+        picked, _, _ = mod.seed_group_plan(items, 50)
+        self.assertEqual(picked[0]["info_hash"], "official")
+
+    def test_empty_pool(self):
+        picked, total, shortfall = mod.seed_group_plan([], 2048)
+        self.assertEqual((picked, total, shortfall), ([], 0.0, 2048.0))
+
+
+class SeedGroupPluginTest(unittest.TestCase):
+    def _plugin(self, **attrs):
+        plugin = support.make_plugin(mod, **attrs)
+        plugin._session_token = "token"
+        plugin._seedgroup_enabled = True
+        plugin._seedgroup_tier = "2T"
+        plugin._seedgroup_cron = "0 */6 * * *"
+        plugin._seedgroup_api_token = ""
+        plugin._seedgroup_save_path = ""
+        plugin._seedgroup_skip_check = True
+        return plugin
+
+    def test_panel_shows_group_and_tier(self):
+        plugin = self._plugin()
+        panel = plugin._seedgroup_panel()
+        blob = json.dumps(panel, ensure_ascii=False)
+        self.assertIn("可乐保种组", blob)
+        self.assertIn("2048", blob)
+        self.assertIn("未激活", blob)       # 没跑过同步 → 默认未激活
+
+    def test_panel_reports_shortfall(self):
+        plugin = self._plugin()
+        plugin.save_data("seedgroup_state", {"at": "2026-11-15 01:00:00", "tier": "2T",
+                                             "target_gib": 2048, "current_gib": 1024,
+                                             "covered_gib": 1024, "shortfall_gib": 1024,
+                                             "activated": True, "added": 3})
+        blob = json.dumps(plugin._seedgroup_panel(), ensure_ascii=False)
+        self.assertIn("还没到档位", blob)
+        self.assertIn("1024", blob)
+
+    def test_probe_locked_when_api_missing(self):
+        plugin = self._plugin()
+        plugin._sg_api = lambda *a, **k: mod._HttpResult(404, b"", "404 page not found")
+        probe = plugin.seed_group_probe()
+        self.assertFalse(probe["ok"])
+        self.assertFalse(probe["activated"])
+        self.assertIn("尚未开放", probe["reason"])
+
+    def test_probe_activated_reads_quota(self):
+        plugin = self._plugin()
+        body = json.dumps({"api_version": "1", "enabled": True, "tier": "5T",
+                           "quota_gib": 5120, "used_gib": 1200}).encode()
+        plugin._sg_api = lambda *a, **k: mod._HttpResult(200, body, body.decode())
+        probe = plugin.seed_group_probe()
+        self.assertTrue(probe["activated"])
+        self.assertEqual(probe["tier"], "5T")
+        self.assertEqual(probe["quota_gib"], 5120)
+
+    def test_service_registers_seed_group_job(self):
+        plugin = self._plugin()
+        names = [s["name"] for s in plugin.get_service()]
+        self.assertIn("可乐保种组", names)
+
+    def test_service_empty_when_disabled(self):
+        plugin = self._plugin()
+        plugin._seedgroup_enabled = False
+        plugin._enabled = False
+        self.assertEqual(plugin.get_service(), [])
+
+    def test_sync_locked_does_not_add(self):
+        plugin = self._plugin()
+        client = support.FakeClient()
+        plugin._clients = lambda: [client]
+        plugin.seed_group_probe = lambda: {"ok": False, "activated": False,
+                                           "reason": "站点尚未开放保种组权限 API",
+                                           "tier": "2T", "quota_gib": 2048, "api_version": ""}
+        plugin._sg_candidates = lambda: [{"torrent_id": 1, "info_hash": "a", "size": mod.GIB}]
+        plugin._sg_download = lambda item: support.make_torrent()
+        plugin._seed_group_sync()
+        self.assertEqual(client.added, [])
+        state = plugin.get_data("seedgroup_state")
+        self.assertFalse(state["activated"])
+        self.assertIn("尚未开放", state["reason"])
+
+    def test_sync_fills_to_tier_and_reports_covered(self):
+        plugin = self._plugin()
+        client = support.FakeClient()
+        plugin._clients = lambda: [client]
+        plugin.seed_group_probe = lambda: {"ok": True, "activated": True, "reason": "",
+                                           "tier": "2T", "quota_gib": 2048, "api_version": "1"}
+        plugin._sg_candidates = lambda: [
+            {"torrent_id": 11, "info_hash": "a" * 40, "size": 1500 * mod.GIB},
+            {"torrent_id": 12, "info_hash": "b" * 40, "size": 600 * mod.GIB},
+            {"torrent_id": 13, "info_hash": "c" * 40, "size": 100 * mod.GIB},
+        ]
+        plugin._sg_download = lambda item: support.make_torrent(name=f"t{item['torrent_id']}.mkv")
+        plugin._seed_group_sync()
+        self.assertEqual(len(client.added), 2)          # 1500 + 600 = 2100 ≥ 2048
+        self.assertTrue(all(mod.SEED_GROUP_TAG in a["label"] for a in client.added))
+        state = plugin.get_data("seedgroup_state")
+        self.assertEqual(state["added"], 2)
+        self.assertGreaterEqual(state["covered_gib"], 2048)
+        self.assertEqual(state["shortfall_gib"], 0)
+
+    def test_sync_counts_existing_tagged_volume(self):
+        plugin = self._plugin()
+        client = support.FakeClient()
+        client.list_completed = lambda: [
+            {"hash": "e" * 40, "name": "old", "size": 2048 * mod.GIB,
+             "tags": f"{mod.MANDATORY_TAG},{mod.SEED_GROUP_TAG}", "state": "uploading"},
+        ]
+        plugin._clients = lambda: [client]
+        plugin.seed_group_probe = lambda: {"ok": True, "activated": True, "reason": "",
+                                           "tier": "2T", "quota_gib": 2048, "api_version": "1"}
+        plugin._sg_candidates = lambda: [
+            {"torrent_id": 21, "info_hash": "f" * 40, "size": 300 * mod.GIB}]
+        plugin._sg_download = lambda item: support.make_torrent()
+        plugin._seed_group_sync()
+        # 已经够了：一颗都不该再加
+        self.assertEqual(client.added, [])
+        self.assertGreaterEqual(plugin.get_data("seedgroup_state")["covered_gib"], 2048)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

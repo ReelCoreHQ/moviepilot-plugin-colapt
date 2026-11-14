@@ -62,6 +62,28 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 | 校验失败降级 | 默认开。校验态下失败最常见的原因是文件不完全一致（多一个 nfo/字幕），开启后自动用「跳过校验」重试一次 |
 | 失败下一轮重试 | 默认开。真正失败的种子进队列（最多 40 条），下一轮优先重试，插件页能看到待重试清单 |
 | 执行周期 | cron，默认每小时 |
+| **可乐保种组** | 见下节；站点开放保种组权限 API 后填 Token 即可启用 |
+
+## 可乐保种组
+
+辅种是「我已有 → 去站点找同一颗」；保种组反过来：**站点给授权成员一个资源池，成员按档位把它搬进下载器长期做种**。
+
+| 项 | 说明 |
+|---|---|
+| 档位 | `2T` / `5T` / `10T` / `20T+`，对应体积下限 2048 / 5120 / 10240 / 20480 GiB |
+| 体积规则 | **只能超、不能少**：每轮从池子里按「官方优先 + 放得下的最大颗」填，最后允许多吃一颗把档位顶过去；池子不够时面板如实报缺口，不虚报达标 |
+| 与已有种子去重 | 按 `info_hash`；客户端里已经带着「可乐保种组」标签的种子体积计入已覆盖 |
+| 任务 | 独立任务 `可乐保种组`（自己的 cron，默认 6 小时），在 MoviePilot「任务」里单独可见、可手动跑 |
+| 激活条件 | 站点签发的 **保种组 API Token**（请求头 `X-Seed-Group-Token`）。站点还没开放该接口时整块锁定，面板写明原因，**不影响辅种** |
+| 接口契约 | 见 [docs/seed-group-api.md](./docs/seed-group-api.md)（v1，已预留：`profile` + `torrents`） |
+
+插件页顶部就是「可乐保种组」面板：档位、目标体积、实际覆盖、进度条、上次同步的新增/重复/失败与缺口。
+
+接口：
+
+- `POST /api/v1/plugin/ColaCrossSeed/seedgroup/sync` 立即同步一次；
+- `GET  /api/v1/plugin/ColaCrossSeed/seedgroup/status` 看档位与缺口；
+- `GET  /api/v1/plugin/ColaCrossSeed/seedgroup/probe` 探测站点是否已开放保种组权限。
 
 ## 插件页与接口
 
