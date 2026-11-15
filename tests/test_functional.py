@@ -1633,7 +1633,7 @@ class FormLayoutTest(unittest.TestCase):
                     "use_mp_clients", "clients_lines", "cron",
                     "seedgroup_enabled", "seedgroup_tier", "seedgroup_custom_gib",
                     "seedgroup_cron", "seedgroup_client_mode", "seedgroup_clients_lines",
-                    "seedgroup_rotate", "seedgroup_rotate_count"):
+                    "seedgroup_rotate_count", "seedgroup_rotate_files"):
             self.assertIn(key, models, key)
 
     def test_removed_fields_stay_out_of_ui(self):

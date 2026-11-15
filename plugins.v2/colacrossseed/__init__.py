@@ -1012,7 +1012,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.50"
+    plugin_version = "0.10.51"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1077,7 +1077,7 @@ class ColaCrossSeed(_PluginBase):
     _seedgroup_skip_check = True
     # 下架清理：off=不清 / seed=只删种子（默认）/ files=连文件一起删
     # 动态保种：体积达标后，删「做种人数最多」的、补「做种人数最少」的
-    _seedgroup_rotate = True
+    _seedgroup_rotate = True      # 强制开启（站长要求）：达到档位后必须轮换，不给关
     _seedgroup_rotate_count = 5
     _seedgroup_rotate_files = True      # 轮换通常要腾空间，默认连文件一起删
     _seedgroup_prune_mode = "seed"
@@ -1157,7 +1157,8 @@ class ColaCrossSeed(_PluginBase):
             self._seedgroup_cron = str(config.get("seedgroup_cron") or "0 */6 * * *").strip()
             self._seedgroup_save_path = str(config.get("seedgroup_save_path") or "").strip()
             self._seedgroup_skip_check = bool(config.get("seedgroup_skip_check", True))
-            self._seedgroup_rotate = bool(config.get("seedgroup_rotate", True))
+            # 动态保种强制开启：配置里写 false 也按 true 处理（老板 2026-11-15）
+            self._seedgroup_rotate = True
             try:
                 self._seedgroup_rotate_count = max(1, min(50, int(config.get("seedgroup_rotate_count", 5) or 5)))
             except Exception:
@@ -4796,17 +4797,14 @@ class ColaCrossSeed(_PluginBase):
                              "placeholder": "198.72.127.68:8081,1024,2048\nMP-qb,0,3000"}}]},
                     ]},
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "seedgroup_rotate",
-                             "label": "动态保种（达标后轮换）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                             {"component": "VTextField", "props": {"model": "seedgroup_rotate_count",
-                             "label": "每轮删/补数量", "type": "number", "min": 1,
+                             "label": "动态保种：每轮删/补数量（强制开启）", "type": "number", "min": 1,
                              "persistent-hint": True,
-                             "hint": "删做种人数最多的那几颗，补做种人数最少的同数量"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                             "hint": "达到档位后自动轮换：删做种人数最多的那几颗，补做种人数最少的同数量"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                             {"component": "VSwitch", "props": {"model": "seedgroup_rotate_files",
-                             "label": "轮换时连文件一起删"}}]},
+                             "label": "轮换时连文件一起删（不勾只删种子、保留文件）"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
