@@ -1487,8 +1487,9 @@ class SpeedReportTest(unittest.TestCase):
         self.assertEqual(client["client"], "198.72.127.68:8081")
         self.assertEqual(client["dl_kib"], 1024)
         self.assertEqual(client["up_kib"], 2048)
-        self.assertEqual(captured["body"]["uid"], 18)
-        self.assertEqual(captured["body"]["username"], "goblin")
+        # 身份由会话决定，payload 不再自带 uid（站点契约 additionalProperties:false）
+        self.assertNotIn("uid", captured["body"])
+        self.assertNotIn("username", captured["body"])   # 同上：身份来自会话
         self.assertIn("enforced", captured["body"])
 
     def test_failure_is_recorded_not_raised(self):

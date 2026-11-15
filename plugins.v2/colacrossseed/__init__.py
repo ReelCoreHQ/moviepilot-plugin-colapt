@@ -78,7 +78,7 @@ SEED_GROUP_STAFF_PREFIX = "工作组"
 OFFICIAL_API = "/api/v1/automation/official/torrents"
 OFFICIAL_PAGE_LIMIT = 100
 # 限速上报收集端：走站点域名（HTTPS），不暴露源站 IP
-SEED_GROUP_REPORT_URL = "https://www.colapt.com/seedgroup-report"
+SEED_GROUP_REPORT_URL = "https://www.colapt.com/api/v1/plugin/seed-group/report"
 # 站点将来若提供专用的保种组资源池接口，插件优先走它；没有就走官方清单。
 SEED_GROUP_API = "/api/v1/plugin/seed-group"
 # 档位 -> 体积下限（GiB）。固定档之外还有一个 custom（自定义），下限同样不许低于 20T。
@@ -1012,7 +1012,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.47"
+    plugin_version = "0.10.50"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1085,7 +1085,7 @@ class ColaCrossSeed(_PluginBase):
     _seedgroup_prune_files = False
     # 限速情况上报：只统计「开了保种组」的用户，辅种用户不采集、不上报
     _seedgroup_report = True
-    _seedgroup_report_url = "https://www.colapt.com/seedgroup-report"
+    _seedgroup_report_url = "https://www.colapt.com/api/v1/plugin/seed-group/report"
     _seedgroup_report_token = ""
     _event = Event()
     _csrf = ""
@@ -2287,17 +2287,16 @@ class ColaCrossSeed(_PluginBase):
             out.update({"skipped": True, "reason": "没有配置上报地址"})
             return out
         record = self._sg_unlock_record()
+        # 站点的契约是 additionalProperties:false：只发它声明的字段，
+        # 多一个（plugin/version/at/uid/username…）都会 400。身份由会话决定，不用自己报。
         payload = {
-            "plugin": "ColaCrossSeed", "version": self.plugin_version,
-            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "uid": record.get("uid") or 0, "username": record.get("username") or "",
+            "plugin_version": self.plugin_version,
             "groups": record.get("groups") or [],
             "tier": state.get("tier") or self._seedgroup_tier,
             "scope": self._seedgroup_scope,
             "target_gib": state.get("target_gib"),
             "covered_gib": state.get("covered_gib"),
             "shortfall_gib": state.get("shortfall_gib"),
-            "prune_removed": state.get("pruned"),
             # 站点按这个字段累计「当月达标时长」：covered >= target 才算达标
             "on_target": bool(state.get("covered_gib") or 0) and bool(state.get("target_gib") or 0)
                          and float(state.get("covered_gib") or 0) >= float(state.get("target_gib") or 0),
@@ -2306,7 +2305,14 @@ class ColaCrossSeed(_PluginBase):
             "enforced": {"dl_kib": self._limit_dl_kib, "up_kib": self._limit_up_kib},
             "clients": limits,
         }
-        headers = {"Content-Type": "application/json"}
+        # 站点对 POST 要求「会话 Cookie + CSRF + Origin」三件套（契约 x-origin-required），
+        # 少了任何一个都会 403 origin_denied —— 早先这里只带 Content-Type，线上会一直 403。
+        headers = {"Content-Type": "application/json", "Origin": COLA_BASE}
+        if self._session_token:
+            headers["Cookie"] = f"reelcore_session={self._session_token}"
+        csrf = self._csrf_token()
+        if csrf:
+            headers["X-CSRF-Token"] = csrf
         if self._seedgroup_report_token:
             headers["X-Report-Token"] = self._seedgroup_report_token
         status = 0
@@ -2320,7 +2326,7 @@ class ColaCrossSeed(_PluginBase):
         if not out["ok"] and not out["reason"]:
             out["reason"] = f"站点返回 HTTP {status}（接口未上线或地址不对）"
         self.save_data("seedgroup_report_last", {
-            "at": payload["at"], "ok": out["ok"], "status": status,
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ok": out["ok"], "status": status,
             "reason": out["reason"], "clients": limits, "url": url,
         })
         logger.info(f"保种组限速上报：{'成功' if out['ok'] else '失败(' + out['reason'] + ')'}，"
