@@ -1,14 +1,15 @@
 {
   "ColaCrossSeed": {
     "name": "可乐PT辅种",
-    "description": "参考 ReseedPuppy / IYUU 辅种插件：扫客户端已有资源，与可乐PT 对照，存在就自动拉可乐种子辅种；另含「可乐保种组」——按 2T/5T/10T/20T+ 档位把站点保种池搬进下载器（体积只能超不能少，需站点签发的保种组 API Token 激活）。",
+    "description": "参考 ReseedPuppy / IYUU 辅种插件：扫客户端已有资源，与可乐PT 对照，存在就自动拉可乐种子辅种；另含「可乐保种组」——按 2T/5T/10T/15T/20T/自定义/全站官种七档把站点官方种搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。",
     "labels": "做种,辅种",
-    "version": "0.10.51",
+    "version": "0.10.52",
     "icon": "https://www.colapt.com/plugin-icons/colacrossseed.png?v=20261115",
     "author": "ColaPT",
     "level": 1,
     "v2": true,
     "history": {
+      "v0.10.52": "限速快照对齐站点契约：读不到的客户端不再塞 error 字段、数值记 0（readable=false），最多 32 台 —— 否则站点 additionalProperties:false 会把整份上报判 400。",
       "v0.10.51": "动态保种改为强制开启：达到档位后必须轮换，设置页不再提供开关；「轮换时连文件一起删」仍交给用户自己决定（不勾只删种子、保留文件）。",
       "v0.10.50": "上报 payload 对齐站点契约：站点 `SeedGroupReportInput` 是 additionalProperties:false，之前多发了 plugin/version/at/uid/username/prune_removed，线上返回 400。现在只发契约声明的字段（身份由会话决定）。",
       "v0.10.49": "上报地址改到站点接口：`https://www.colapt.com/api/v1/plugin/seed-group/report`（此前仍是 nginx 反代到 18099 的临时收集端，数据只落 JSONL、进不了站点表）。",
