@@ -1487,8 +1487,9 @@ class SpeedReportTest(unittest.TestCase):
         self.assertEqual(client["client"], "198.72.127.68:8081")
         self.assertEqual(client["dl_kib"], 1024)
         self.assertEqual(client["up_kib"], 2048)
-        self.assertEqual(captured["body"]["uid"], 18)
-        self.assertEqual(captured["body"]["username"], "goblin")
+        # 身份由会话决定，payload 不再自带 uid（站点契约 additionalProperties:false）
+        self.assertNotIn("uid", captured["body"])
+        self.assertNotIn("username", captured["body"])   # 同上：身份来自会话
         self.assertIn("enforced", captured["body"])
 
     def test_failure_is_recorded_not_raised(self):
@@ -1632,7 +1633,7 @@ class FormLayoutTest(unittest.TestCase):
                     "use_mp_clients", "clients_lines", "cron",
                     "seedgroup_enabled", "seedgroup_tier", "seedgroup_custom_gib",
                     "seedgroup_cron", "seedgroup_client_mode", "seedgroup_clients_lines",
-                    "seedgroup_rotate", "seedgroup_rotate_count"):
+                    "seedgroup_rotate_count", "seedgroup_rotate_files"):
             self.assertIn(key, models, key)
 
     def test_removed_fields_stay_out_of_ui(self):
