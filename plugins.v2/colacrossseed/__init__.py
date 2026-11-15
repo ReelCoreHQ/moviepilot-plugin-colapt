@@ -1012,7 +1012,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.51"
+    plugin_version = "0.10.52"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -2132,21 +2132,28 @@ class ColaCrossSeed(_PluginBase):
 
     def _collect_speed_limits(self, clients: List[_Client]) -> List[Dict[str, Any]]:
         """采集每台客户端**当前**的限速设置（不管插件有没有配、有没有接管）。"""
+        # 站点契约的 SeedGroupClientLimit 是 additionalProperties:false、整数、1–32 条：
+        # 读不到的客户端只把 readable 置 false、数值记 0（「不限速」），**不塞 error 之类的额外字段**，
+        # 否则一台读不到会让整份上报 400 —— 那就成了「没上报」，而不是「照实上报没限速」。
         rows: List[Dict[str, Any]] = []
-        for client in clients:
-            row: Dict[str, Any] = {"client": client.name,
+        for client in clients[:32]:
+            row: Dict[str, Any] = {"client": str(client.name)[:128],
                                    "kind": "tr" if isinstance(client, TransmissionClient) else "qb",
-                                   "dl_kib": None, "up_kib": None,
-                                   "dl_enabled": None, "up_enabled": None, "readable": False}
+                                   "dl_kib": 0, "up_kib": 0,
+                                   "dl_enabled": False, "up_enabled": False, "readable": False}
             try:
                 data = client.get_speed_limits() or {}
             except Exception as err:
-                row["error"] = f"{type(err).__name__}: {err}"
+                logger.warn(f"读取限速失败（{client.name}）：{type(err).__name__}: {err}")
                 data = {}
             if data:
-                for key in ("dl_kib", "up_kib", "dl_enabled", "up_enabled"):
-                    if key in data:
-                        row[key] = data[key]
+                for key in ("dl_kib", "up_kib"):
+                    try:
+                        row[key] = max(0, int(data.get(key) or 0))
+                    except Exception:
+                        row[key] = 0
+                for key in ("dl_enabled", "up_enabled"):
+                    row[key] = bool(data.get(key))
                 row["readable"] = True
             rows.append(row)
         return rows

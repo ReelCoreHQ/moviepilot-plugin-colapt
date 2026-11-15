@@ -1526,7 +1526,8 @@ class SpeedReportTest(unittest.TestCase):
             mod._curl = original
         row = captured["body"]["clients"][0]
         self.assertFalse(row["readable"])
-        self.assertIsNone(row["dl_kib"])
+        self.assertEqual(row["dl_kib"], 0)      # 契约要整数：读不到记 0（= 不限），靠 readable 区分
+        self.assertNotIn("error", row)          # 多一个字段整份上报就 400
 
 
 class SeedGroupModeTest(unittest.TestCase):
