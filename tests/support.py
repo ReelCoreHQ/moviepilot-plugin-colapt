@@ -154,9 +154,14 @@ class FakeClient:
         self.trackers = []
         self.deleted = []
         self.speed_limits = None
+        # 进种限流用：客户端里「正在下载」的条数（默认 0 = 队列空，永远有额度）
+        self.inflight_count = 0
 
     def list_completed(self):
         return []
+
+    def inflight(self):
+        return self.inflight_count
 
     def has(self, info_hash):
         return info_hash in self._has

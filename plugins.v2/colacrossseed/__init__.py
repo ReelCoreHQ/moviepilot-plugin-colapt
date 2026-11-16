@@ -608,6 +608,14 @@ class _Client:
     def list_completed(self) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
+    def inflight(self) -> int:
+        """客户端里「正在下载」的种子数（未完成）。
+
+        保种组用它做进种限流：满了就不再往客户端塞新种，等这一批下完再补。
+        不知道时返回 -1 —— 调用方据此「不限制」，绝不因为读不到就把保种卡死。
+        """
+        return -1
+
     def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
             hash_hint: str = "", category: str = "", auto_tmm: bool = False) -> str:
         """添加一颗种子，返回 "ok" / "dup"（客户端里已经有了）/ "fail"。
@@ -719,6 +727,19 @@ class QBittorrentClient(_Client):
         except Exception as err:
             logger.warn(f"qBittorrent ({self.name}) 设置限速异常：{err}")
         return False
+
+    def inflight(self) -> int:
+        try:
+            rsp = self._session.get(
+                f"{self.url}/api/v2/torrents/info",
+                params={"filter": "downloading"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            rsp.raise_for_status()
+            return len(rsp.json() or [])
+        except Exception as err:
+            logger.warn(f"qBittorrent ({self.name}) 读取下载队列失败：{err}")
+            return -1
 
     def list_completed(self) -> List[Dict[str, Any]]:
         try:
@@ -956,6 +977,16 @@ class TransmissionClient(_Client):
                 return None
         return None
 
+    def inflight(self) -> int:
+        rsp = self._rpc({
+            "method": "torrent-get",
+            "arguments": {"fields": ["hashString", "percentDone"]},
+        })
+        if not rsp:
+            return -1
+        return sum(1 for item in (rsp.get("arguments") or {}).get("torrents") or []
+                   if (item.get("percentDone") or 0) < 1)
+
     def list_completed(self) -> List[Dict[str, Any]]:
         rsp = self._rpc({
             "method": "torrent-get",
@@ -1012,7 +1043,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.52"
+    plugin_version = "0.10.53"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1073,6 +1104,9 @@ class ColaCrossSeed(_PluginBase):
     _seedgroup_clients_lines = ""
     _seedgroup_target_client = ""
     _seedgroup_cron = "0 */6 * * *"
+    # 进种限流：客户端里「正在下载」的种子数不允许超过这个值，满了本轮就不再进种。
+    # 目的：让覆盖慢慢追平目标，而不是一次性把几百颗塞进客户端抢带宽。
+    _seedgroup_max_downloading = 5
     _seedgroup_save_path = ""
     _seedgroup_skip_check = True
     # 下架清理：off=不清 / seed=只删种子（默认）/ files=连文件一起删
@@ -1133,6 +1167,10 @@ class ColaCrossSeed(_PluginBase):
             self._seedgroup_enabled = bool(config.get("seedgroup_enabled", False))
             # 档位归一化：老值 20T+ → 20T；未知值退回 2T；custom 走自定义数值
             self._seedgroup_tier = seed_group_tier_key(config.get("seedgroup_tier") or "2T")
+            try:
+                self._seedgroup_max_downloading = max(0, min(int(config.get("seedgroup_max_downloading") or 5), 200))
+            except Exception:
+                self._seedgroup_max_downloading = 5
             # 范围已从 UI 撤掉：统一「全站官种」；老配置里的 pool 也归一成 site（机器面通道只看有没有 Key）
             self._seedgroup_scope = "site"
             # 支持 100M / 100G / 1T / 1P（parse_size_gib 也接受纯数字）
@@ -1265,6 +1303,7 @@ class ColaCrossSeed(_PluginBase):
             "limit_lines": self._limit_lines,
             "seedgroup_enabled": self._seedgroup_enabled,
             "seedgroup_tier": self._seedgroup_tier,
+            "seedgroup_max_downloading": self._seedgroup_max_downloading,
             "seedgroup_scope": self._seedgroup_scope,
             "seedgroup_custom_gib": self._seedgroup_custom_gib,
             "seedgroup_api_key": self._seedgroup_api_key,
@@ -3778,6 +3817,12 @@ class ColaCrossSeed(_PluginBase):
             lines.append(f"上次同步 {state['at']}：新增 {state.get('added', 0)} 条"
                          f"（+{state.get('added_gib', 0)} GiB），重复 {state.get('duplicate', 0)}，"
                          f"失败 {state.get('failed', 0)}，缺口 {state.get('shortfall_gib', 0)} GiB")
+            if state.get("downloading") is not None:
+                quota = state.get("download_quota")
+                lines.append(f"进种限流：客户端正在下载 {state.get('downloading', 0)} 个，"
+                             f"本轮额度 {'不限' if quota == 'unlimited' else quota}"
+                             + (f"（因额度只挑了 {state.get('quota_trimmed')} 条没加）"
+                                if state.get("quota_trimmed") else ""))
         if staff:
             groups = "/".join(unlock.get("groups") or []) or "管理员"
             when = ""
@@ -4270,7 +4315,35 @@ class ColaCrossSeed(_PluginBase):
             self._sg_prune_if_enabled(state)
             self._maybe_report(clients, state)
             return
+        # 进种限流（2026-11-16 老板要求）：客户端里「正在下载」的种子数不许超过上限。
+        # 目的不是省带宽，而是让覆盖**稳步追平**目标 —— 「全站官种」的目标每天在涨，
+        # 一次性把几百颗塞进客户端只会互相抢带宽、谁也下不完，看起来像永远追不上。
+        limit = int(self._seedgroup_max_downloading or 0)
+        inflight = 0
+        for c in clients:
+            n = c.inflight()
+            if n >= 0:
+                inflight += n
+        quota = -1 if limit <= 0 else max(0, limit - inflight)
+        state["downloading"] = inflight
+        state["download_quota"] = quota if quota >= 0 else "unlimited"
+        if quota == 0:
+            state["activated"] = True
+            state["shortfall_gib"] = max(0.0, need)
+            state["pool_pending"] = len(candidates)
+            state["reason"] = (f"下载队列已满（{inflight}/{limit}），本轮不进种；"
+                               f"等这一批下完再继续补，还差 {state['shortfall_gib']:.1f} GiB")
+            self.save_data("seedgroup_state", state)
+            logger.info(f"保种组：{state['reason']}")
+            self._maybe_report(clients, state)
+            return
         picked, planned_gib, shortfall = seed_group_plan(candidates, need)
+        if quota > 0 and len(picked) > quota:
+            # 只加额度允许的条数：按 seed_group_plan 的顺序（官方优先、体积大到小）取前 N 条
+            state["quota_trimmed"] = len(picked) - quota
+            picked = picked[:quota]
+            planned_gib = round(sum(_seed_group_size_gib(x.get("size")) for x in picked), 3)
+            shortfall = round(max(0.0, need - planned_gib), 3)
         client = clients[0]
         added = duplicate = failed = 0
         added_gib = 0.0
@@ -4748,7 +4821,12 @@ class ColaCrossSeed(_PluginBase):
                             {"component": "VTextField", "props": {"model": "seedgroup_cron",
                              "label": "保种运行间隔（cron，5 段）", "persistent-hint": True,
                              "hint": "例如 0 */6 * * * = 每 6 小时；写错会静默按每 6 小时跑",
-                             "placeholder": "0 */6 * * *"}}]},
+                             "placeholder": "0 */6 * * *"}},
+                            {"component": "VTextField", "props": {"model": "seedgroup_max_downloading",
+                             "label": "进种限流：同时下载不超过 N 个", "type": "number",
+                             "persistent-hint": True,
+                             "hint": "客户端里「正在下载」的种子达到这个数就不再进种，等下完再补；0 = 不限制。"
+                                     "默认 5：让覆盖稳步追平，而不是一次塞几百颗互相抢带宽"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
@@ -4834,7 +4912,8 @@ class ColaCrossSeed(_PluginBase):
             "limit_dl_kib": 0, "limit_up_kib": 0, "limit_lines": "",
             "seedgroup_enabled": False, "seedgroup_tier": "2T",
             "seedgroup_custom_gib": 2048, "seedgroup_scope": "site",
-            "seedgroup_cron": "0 */6 * * *", "seedgroup_save_path": "", "seedgroup_skip_check": True,
+            "seedgroup_cron": "0 */6 * * *", "seedgroup_max_downloading": 5,
+            "seedgroup_save_path": "", "seedgroup_skip_check": True,
             "iyuu_json_file": "",
             "seedgroup_client_mode": "mp", "seedgroup_prune_mode": "seed",
             "seedgroup_rotate": True, "seedgroup_rotate_count": 5, "seedgroup_rotate_files": True,
