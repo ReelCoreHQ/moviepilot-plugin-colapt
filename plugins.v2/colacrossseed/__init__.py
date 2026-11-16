@@ -650,6 +650,14 @@ class _Client:
         """从客户端移除种子（默认不删文件）。"""
         return False
 
+    def recheck(self, hashes: List[str]) -> int:
+        """让客户端对这些种子「强制重新校验」，返回提交成功的条数。
+
+        用途：「跳过校验」时代加进来的保种种子，文件其实不在磁盘上，qB 停在 missingFiles、
+        进度 0、永不下载。重新校验后它会发现数据不完整，自动进入下载。
+        """
+        return 0
+
     def tags_for(self, hashes: List[str]) -> Dict[str, str]:
         """返回 {info_hash: "tag1, tag2"}；用于自愈删除前把用户/MP 打的标签记下来。"""
         return {}
@@ -768,6 +776,21 @@ class QBittorrentClient(_Client):
         except Exception as err:
             logger.error(f"qBittorrent ({self.name}) 读取种子失败：{err}")
             return []
+
+    def recheck(self, hashes: List[str]) -> int:
+        if not hashes:
+            return 0
+        try:
+            rsp = self._session.post(
+                f"{self.url}/api/v2/torrents/recheck",
+                data={"hashes": "|".join(hashes)},
+                timeout=REQUEST_TIMEOUT,
+            )
+            rsp.raise_for_status()
+            return len(hashes)
+        except Exception as err:
+            logger.warn(f"qBittorrent ({self.name}) 强制校验失败：{err}")
+            return 0
 
     def has(self, info_hash: str) -> bool:
         if not info_hash:
@@ -977,6 +1000,12 @@ class TransmissionClient(_Client):
                 return None
         return None
 
+    def recheck(self, hashes: List[str]) -> int:
+        if not hashes:
+            return 0
+        rsp = self._rpc({"method": "torrent-verify", "arguments": {"ids": hashes}})
+        return len(hashes) if rsp else 0
+
     def inflight(self) -> int:
         rsp = self._rpc({
             "method": "torrent-get",
@@ -1043,7 +1072,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.54"
+    plugin_version = "0.10.55"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1104,6 +1133,8 @@ class ColaCrossSeed(_PluginBase):
     _seedgroup_clients_lines = ""
     _seedgroup_target_client = ""
     _seedgroup_cron = "0 */6 * * *"
+    # 每轮最多对多少颗「丢失文件」的保种种子提交强制校验（recheck 很吃磁盘 IO）
+    SG_RECHECK_PER_ROUND = 20
     # 进种限流：客户端里「正在下载」的种子数不允许超过这个值，满了本轮就不再进种。
     # 目的：让覆盖慢慢追平目标，而不是一次性把几百颗塞进客户端抢带宽。
     _seedgroup_max_downloading = 5
@@ -3823,7 +3854,9 @@ class ColaCrossSeed(_PluginBase):
             if state.get("missing_files"):
                 lines.append(f"⚠️ {state['missing_files']} 颗带「{SEED_GROUP_TAG}」标签但丢失文件："
                              f"它们在客户端里进度 0%、永远不会下动，也不计入覆盖。"
-                             f"多半是开了「保种组：跳过校验」——关掉后在客户端里对这批种子「强制重新校验」即可")
+                             f"多半是开了「保种组：跳过校验」；"
+                             + (f"本轮已对 {state['rechecked']} 颗提交强制校验，校验完会自动开始下载"
+                                if state.get("rechecked") else "下一轮会自动对它们提交强制校验"))
             if state.get("downloading") is not None:
                 quota = state.get("download_quota")
                 lines.append(f"进种限流：客户端正在下载 {state.get('downloading', 0)} 个，"
@@ -4269,14 +4302,26 @@ class ColaCrossSeed(_PluginBase):
             return
         existing, current_gib, blind = self._sg_current(clients)
         # 丢失文件自检：带标签却 missingFiles 的种子既不计入覆盖、也永远不会下动。
-        missing = 0
+        missing_total = 0
+        rechecked = 0
         for c in clients:
             try:
-                missing += len(c.tagged_missing(SEED_GROUP_TAG) or [])
+                own = c.tagged_missing(SEED_GROUP_TAG) or []
             except Exception:
                 continue
-        if missing:
-            state["missing_files"] = missing
+            if not own:
+                continue
+            missing_total += len(own)
+            # 自动救：这些种子是「跳过校验」时代加进来的，文件不在磁盘上，客户端停在 missingFiles。
+            # 强制重新校验后它会发现数据不完整、自己进入下载。每轮限 SG_RECHECK_PER_ROUND 颗。
+            done = c.recheck(own[:self.SG_RECHECK_PER_ROUND])
+            if done:
+                rechecked += done
+        if missing_total:
+            state["missing_files"] = missing_total
+        if rechecked:
+            state["rechecked"] = rechecked
+            logger.info(f"保种组：{rechecked} 颗丢失文件的种子已提交强制校验，校验完会自动开始下载")
         state["current_gib"] = current_gib
         skips = self._sg_skips()
         pool_all = self._sg_candidates()
