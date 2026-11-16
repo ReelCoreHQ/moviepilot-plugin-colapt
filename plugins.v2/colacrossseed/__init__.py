@@ -1043,7 +1043,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.53"
+    plugin_version = "0.10.54"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1108,7 +1108,10 @@ class ColaCrossSeed(_PluginBase):
     # 目的：让覆盖慢慢追平目标，而不是一次性把几百颗塞进客户端抢带宽。
     _seedgroup_max_downloading = 5
     _seedgroup_save_path = ""
-    _seedgroup_skip_check = True
+    # 保种组默认**必须校验**：这些种子是从站点新下载的，文件还不在磁盘上。
+    # 开着「跳过校验」qB 会认为文件已完整，立刻变 missingFiles（丢失文件）、进度 0%、永不下载 ——
+    # 2026-11-16 实测就是这条把保种卡成「覆盖不涨」。跳过校验只留给「文件已在磁盘、种子丢了」的恢复。
+    _seedgroup_skip_check = False
     # 下架清理：off=不清 / seed=只删种子（默认）/ files=连文件一起删
     # 动态保种：体积达标后，删「做种人数最多」的、补「做种人数最少」的
     _seedgroup_rotate = True      # 强制开启（站长要求）：达到档位后必须轮换，不给关
@@ -1194,7 +1197,7 @@ class ColaCrossSeed(_PluginBase):
             self._seedgroup_target_client = str(config.get("seedgroup_target_client") or "").strip()
             self._seedgroup_cron = str(config.get("seedgroup_cron") or "0 */6 * * *").strip()
             self._seedgroup_save_path = str(config.get("seedgroup_save_path") or "").strip()
-            self._seedgroup_skip_check = bool(config.get("seedgroup_skip_check", True))
+            self._seedgroup_skip_check = bool(config.get("seedgroup_skip_check", False))
             # 动态保种强制开启：配置里写 false 也按 true 处理（老板 2026-11-15）
             self._seedgroup_rotate = True
             try:
@@ -3817,6 +3820,10 @@ class ColaCrossSeed(_PluginBase):
             lines.append(f"上次同步 {state['at']}：新增 {state.get('added', 0)} 条"
                          f"（+{state.get('added_gib', 0)} GiB），重复 {state.get('duplicate', 0)}，"
                          f"失败 {state.get('failed', 0)}，缺口 {state.get('shortfall_gib', 0)} GiB")
+            if state.get("missing_files"):
+                lines.append(f"⚠️ {state['missing_files']} 颗带「{SEED_GROUP_TAG}」标签但丢失文件："
+                             f"它们在客户端里进度 0%、永远不会下动，也不计入覆盖。"
+                             f"多半是开了「保种组：跳过校验」——关掉后在客户端里对这批种子「强制重新校验」即可")
             if state.get("downloading") is not None:
                 quota = state.get("download_quota")
                 lines.append(f"进种限流：客户端正在下载 {state.get('downloading', 0)} 个，"
@@ -4261,6 +4268,15 @@ class ColaCrossSeed(_PluginBase):
             self._maybe_report(clients, state)
             return
         existing, current_gib, blind = self._sg_current(clients)
+        # 丢失文件自检：带标签却 missingFiles 的种子既不计入覆盖、也永远不会下动。
+        missing = 0
+        for c in clients:
+            try:
+                missing += len(c.tagged_missing(SEED_GROUP_TAG) or [])
+            except Exception:
+                continue
+        if missing:
+            state["missing_files"] = missing
         state["current_gib"] = current_gib
         skips = self._sg_skips()
         pool_all = self._sg_candidates()
@@ -4849,7 +4865,11 @@ class ColaCrossSeed(_PluginBase):
                              "label": "保存路径（留空=下载器默认）"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VSwitch", "props": {"model": "seedgroup_skip_check",
-                             "label": "保种组：跳过校验"}}]},
+                             "label": "保种组：跳过校验（新下载不要开）",
+                             "persistent-hint": True,
+                             "hint": "只在「文件已经在磁盘上、只是种子丢了」的恢复场景打开。"
+                                     "保种是从站点新下载的，开着它 qB 会以为文件已完整，"
+                                     "全部变成「丢失文件」、进度 0%、永远下不动"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
@@ -4913,7 +4933,7 @@ class ColaCrossSeed(_PluginBase):
             "seedgroup_enabled": False, "seedgroup_tier": "2T",
             "seedgroup_custom_gib": 2048, "seedgroup_scope": "site",
             "seedgroup_cron": "0 */6 * * *", "seedgroup_max_downloading": 5,
-            "seedgroup_save_path": "", "seedgroup_skip_check": True,
+            "seedgroup_save_path": "", "seedgroup_skip_check": False,
             "iyuu_json_file": "",
             "seedgroup_client_mode": "mp", "seedgroup_prune_mode": "seed",
             "seedgroup_rotate": True, "seedgroup_rotate_count": 5, "seedgroup_rotate_files": True,
