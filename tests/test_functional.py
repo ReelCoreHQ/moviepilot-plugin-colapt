@@ -838,6 +838,70 @@ class SeedGroupPaginationTest(unittest.TestCase):
         self.assertEqual([x["torrent_id"] for x in items], [1, 2])
 
 
+class SeedGroupDownloadQuotaTest(unittest.TestCase):
+    """进种限流（2026-11-16）：客户端「正在下载」达到上限就停止进种，低于就按剩余额度补。"""
+
+    def _plugin(self, inflight, limit=5):
+        plugin = support.make_plugin(mod)
+        plugin._session_token = "tok"
+        plugin._seedgroup_enabled = True
+        plugin._seedgroup_tier = "2T"
+        plugin._seedgroup_custom_gib = 2048
+        plugin._seedgroup_cron = "0 */6 * * *"
+        plugin._seedgroup_api_key = ""
+        plugin._seedgroup_staff_prefix = "工作组"
+        plugin._seedgroup_allow_admin = True
+        plugin._seedgroup_max_downloading = limit
+        plugin.update_config = lambda cfg: None
+        plugin.post_message = lambda **k: None
+        client = support.FakeClient()
+        client.inflight_count = inflight
+        plugin._sg_clients = lambda: [client]
+        plugin._sg_unlocked = lambda: (True, {"ok": True, "groups": ["工作组-组长"], "reason": ""})
+        plugin._sg_current = lambda clients: (set(), 0.0, 0)
+        plugin._sg_skips = lambda: set()
+        plugin._sg_candidates = lambda: [
+            {"torrent_id": i, "info_hash": f"{i:040x}", "size": 500 * mod.GIB, "official": True}
+            for i in range(1, 21)]
+        plugin._sg_download = lambda item: support.make_torrent(name=f"t{item['torrent_id']}.mkv",
+                                                                source=f"s{item['torrent_id']}")
+        plugin._maybe_report = lambda clients, state: None
+        plugin._sg_prune_if_enabled = lambda state: None
+        return plugin, client
+
+    def test_queue_full_stops_ingesting(self):
+        plugin, client = self._plugin(inflight=5, limit=5)
+        plugin.seed_group_sync()
+        state = plugin.get_data("seedgroup_state") or {}
+        self.assertEqual(state.get("downloading"), 5)
+        self.assertEqual(state.get("download_quota"), 0)
+        self.assertEqual(client.added, [], "队列满时一颗都不该加")
+        self.assertIn("下载队列已满", str(state.get("reason") or ""))
+        self.assertGreater(state.get("shortfall_gib", 0), 0)
+
+    def test_partial_quota_adds_only_remaining(self):
+        plugin, client = self._plugin(inflight=3, limit=5)
+        plugin.seed_group_sync()
+        state = plugin.get_data("seedgroup_state") or {}
+        self.assertEqual(state.get("downloading"), 3)
+        self.assertEqual(state.get("download_quota"), 2)
+        self.assertEqual(len(client.added), 2, "只剩 2 个额度就只加 2 颗")
+        self.assertEqual(state.get("quota_trimmed"), 3, "按目标本该挑 5 颗，额度只给 2 颗，砍掉 3 颗留到下一轮")
+
+    def test_zero_limit_means_unlimited(self):
+        plugin, client = self._plugin(inflight=50, limit=0)
+        plugin.seed_group_sync()
+        state = plugin.get_data("seedgroup_state") or {}
+        self.assertEqual(state.get("download_quota"), "unlimited")
+        self.assertGreater(len(client.added), 0, "0 = 不限制，门槛不该卡住")
+
+    def test_unreadable_inflight_does_not_block(self):
+        plugin, client = self._plugin(inflight=-1, limit=5)
+        plugin.seed_group_sync()
+        state = plugin.get_data("seedgroup_state") or {}
+        self.assertGreater(len(client.added), 0, "读不到队列时不能把保种卡死")
+
+
 class SeedGroupSyncRobustnessTest(unittest.TestCase):
     def _plugin(self):
         plugin = support.make_plugin(mod)
