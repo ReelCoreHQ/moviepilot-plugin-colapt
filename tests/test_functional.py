@@ -762,15 +762,13 @@ class InitOrderTest(unittest.TestCase):
         plugin.init_plugin({"enabled": True, "seedgroup_enabled": True})
         self.assertTrue(plugin._seedgroup_enabled, "网络失败不是没资格，不该静默关功能")
 
-    def test_non_staff_forces_switch_off(self):
+    def test_non_staff_keeps_switch_on(self):
+        """2026-11-18 老板定：任何站点用户都能保种，只有工作组成员才汇报。"""
         plugin = self._plugin()
-        written = {}
-        plugin.update_config = lambda cfg: written.update(cfg)
         plugin.seed_group_identity = lambda: self._ident(ok=True, staff=False, reason="不在工作组")
         plugin.init_plugin({"enabled": True, "seedgroup_enabled": True, "limit_dl_kib": 40})
-        self.assertFalse(plugin._seedgroup_enabled)
-        self.assertFalse(written.get("seedgroup_enabled"))
-        self.assertEqual(written.get("limit_dl_kib"), 40)
+        self.assertTrue(plugin._seedgroup_enabled, "没头衔不该把功能关掉")
+        self.assertEqual(plugin._limit_dl_kib, 40)
 
     def test_staff_keeps_switch_on(self):
         plugin = self._plugin()
@@ -2007,7 +2005,7 @@ class SeedGroupPluginTest(unittest.TestCase):
         plugin.save_data("seedgroup_unlock", {"ok": True, "at": 1, "until": 2,
                                              "groups": ["工作组-保种"]})
         blob = json.dumps(plugin._seedgroup_panel(), ensure_ascii=False)
-        self.assertIn("强制锁定", blob)
+        self.assertIn("数据不汇报", blob)
         self.assertNotIn("资格：工作组", blob)
 
     def test_panel_shows_locked_reason(self):
@@ -2015,7 +2013,7 @@ class SeedGroupPluginTest(unittest.TestCase):
         plugin.save_data("seedgroup_unlock", {"ok": False, "at": 0, "until": 0,
                                              "reason": "账号不在工作组：组名需以「工作组」开头"})
         blob = json.dumps(plugin._seedgroup_panel(), ensure_ascii=False)
-        self.assertIn("无法解锁", blob)
+        self.assertIn("数据不汇报", blob)
 
     def test_service_registers_seed_group_job(self):
         plugin = self._plugin()
@@ -2055,20 +2053,22 @@ class SeedGroupPluginTest(unittest.TestCase):
         plugin._enabled = False
         self.assertEqual(plugin.get_service(), [])
 
-    def test_sync_locked_does_not_add(self):
+    def test_sync_without_staff_still_adds_but_does_not_report(self):
+        """没头衔照常拉官种，只是不汇报（2026-11-18 老板定）。"""
         plugin = self._plugin()
         client = support.FakeClient()
         plugin._sg_clients = lambda: [client]
+        reported = []
+        plugin._maybe_report = lambda clients, state: reported.append(dict(state))
         plugin._cola = self._fake_cola(
             me={"id": 8, "username": "member", "roles": ["member"]},
             profile={"groups": ["VIP"]})
         plugin._sg_candidates = lambda: [{"torrent_id": 1, "info_hash": "a", "size": mod.GIB}]
         plugin._sg_download = lambda item: support.make_torrent()
         plugin._seed_group_sync()
-        self.assertEqual(client.added, [])
+        self.assertTrue(client.added, "非工作组成员也应该进种")
         state = plugin.get_data("seedgroup_state")
-        self.assertFalse(state["unlocked"])
-        self.assertIn("不在工作组", state["reason"])
+        self.assertFalse(state.get("staff"))
 
     def test_sync_fills_to_tier_and_reports_covered(self):
         plugin = self._plugin()
