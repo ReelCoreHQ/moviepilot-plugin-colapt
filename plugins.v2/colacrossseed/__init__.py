@@ -98,29 +98,13 @@ SEED_GROUP_TIER_LABELS: Dict[str, str] = {
     SEED_GROUP_CUSTOM_TIER: "自定义档（100M / 100G / 1T / 1P）",
     SEED_GROUP_ALL_TIER: "全站官种（有多少保多少）",
 }
-
-
-def seed_group_tier_key(tier: str) -> str:
-    """把配置里的档位归一化：大小写不敏感，老值 20T+ → 20T，未知值 → 2T。"""
-    key = str(tier or "").strip()
-    key = SEED_GROUP_TIER_ALIASES.get(key, key)
-    if key.upper() == SEED_GROUP_CUSTOM_TIER.upper():
-        return SEED_GROUP_CUSTOM_TIER
-    if key.upper() in (SEED_GROUP_ALL_TIER.upper(), "SITE", "ALL-OFFICIAL"):
-        return SEED_GROUP_ALL_TIER
-    for name in SEED_GROUP_TIERS:
-        if key.upper() == name.upper():
-            return name
-    return "2T"
-
-
 SIZE_UNITS_GIB = {"M": 1.0 / 1024, "G": 1.0, "T": 1024.0, "P": 1024.0 * 1024}
 
 
 def parse_size_gib(value: Any) -> float:
     """把「100M / 100G / 1T / 1P / 2048」解析成 GiB。
 
-    不带单位的数字按 GiB 理解（老配置 seedgroup_custom_gib=2048 仍成立）；
+    不带单位的数字按 GiB 理解（例如 2048）；
     单位大小写、B/iB 后缀都容忍。解析不出来返回 0。
     """
     text = str(value or "").strip().upper().replace("IB", "").replace("B", "").strip()
@@ -135,34 +119,6 @@ def parse_size_gib(value: Any) -> float:
         return 0.0
     unit = match.group(2) or "G"
     return max(0.0, number * SIZE_UNITS_GIB.get(unit, 1.0))
-
-
-def seed_group_target_gib(tier: str, custom_gib: Any = None) -> int:
-    """档位 → 体积下限（GiB）。
-
-    · 固定档查表；未知档退回 2T，绝不返回 0；
-    · 自定义档支持带单位（100M / 100G / 1T / 1P），不带单位按 GiB；只有 0 会被抬到 1 GiB。
-    """
-    key = seed_group_tier_key(tier)
-    if key == SEED_GROUP_ALL_TIER:
-        return 0          # 0 = 动态：由资源池总量决定（调用方自己算）
-    if key == SEED_GROUP_CUSTOM_TIER:
-        value = int(round(parse_size_gib(custom_gib)))
-        # 只要求「大于 0」；上限 1 PiB 只是防手滑
-        return max(SEED_GROUP_CUSTOM_MIN_GIB, min(value, SEED_GROUP_CUSTOM_MAX_GIB))
-    return SEED_GROUP_TIERS[key]
-
-
-def _seed_group_key(item: Dict[str, Any]) -> str:
-    """条目唯一键：torrent_id 优先（0 也是合法值），否则退回 info_hash。"""
-    if not isinstance(item, dict):
-        return ""
-    tid = item.get("torrent_id")
-    if tid is not None and str(tid).strip() != "":
-        return str(tid).strip()
-    return str(item.get("info_hash") or "").strip()
-
-
 def _as_float(value: Any) -> float:
     try:
         return max(0.0, float(str(value).strip()))
@@ -202,84 +158,6 @@ def _as_int(value: Any) -> int:
         return int(str(value).strip())
     except Exception:
         return 0
-
-
-def _seed_group_size_gib(size: Any) -> float:
-    """站点返回的 size 是字节；也容忍已经是 GiB 的数字（< 1e6 当 GiB 看）。"""
-    try:
-        value = float(size or 0)
-    except Exception:
-        return 0.0
-    if value <= 0:
-        return 0.0
-    # 1e6 太低：800 KB 的种子（800000 字节）会被算成 800000 GiB，直接顶穿 target。
-    return value if value < 1e5 else value / GIB
-
-
-def _sg_on_target(covered: Any, target: Any, tolerance: float = 0.005) -> bool:
-    """覆盖是否算「达标」——站点用它累计当月保种时长。
-
-    留 0.5%（最少 1 GiB）容差：covered 来自客户端 size 累加，target 来自站点 size_bytes/GIB，
-    两者天然差几个 MB；严格 >= 会让「其实已经全保完」的账号一直报 0，
-    面板上就是「保种时长 0.0 天 / 应达 13.5 天」永远不动、退休进度也一直 0%。
-    """
-    try:
-        c = float(covered or 0)
-        t = float(target or 0)
-    except (TypeError, ValueError):
-        return False
-    if c <= 0 or t <= 0:
-        return False
-    return c >= t - max(t * tolerance, 1.0)
-
-
-def seed_group_plan(items: List[Dict[str, Any]], target_gib: float) \
-        -> Tuple[List[Dict[str, Any]], float, float]:
-    """按档位挑种子：只超不少。
-
-    规则：
-      1. 官方标记排前面，同优先按体积从大到小（条数少、覆盖快）；
-      2. 若有一颗能一次性盖住剩余空间，就挑其中**最小**的那颗（超额最少）——
-         体积只超不少，但也不能为了凑数白塞几百 G；
-      3. 否则在放得下的里面挑最大的（best-fit decreasing），继续填；
-      4. 池子耗尽仍未到档位：返回缺口，调用方必须把缺口报出来，不能假装达标。
-
-    :return: (挑中的条目, 累计体积 GiB, 缺口 GiB)
-    """
-    pool: List[Dict[str, Any]] = []
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        size = _seed_group_size_gib(item.get("size"))
-        if size <= 0:
-            continue
-        entry = dict(item)
-        entry["size_gib"] = size
-        pool.append(entry)
-    pool.sort(key=lambda x: (0 if x.get("official") else 1, -x["size_gib"],
-                             str(x.get("info_hash") or "")))
-    picked: List[Dict[str, Any]] = []
-    total = 0.0
-    remaining = float(target_gib)
-    while remaining > 1e-9 and pool:
-        # ① 有能一颗盖住剩余空间的：挑其中最小的（超额最少），收工
-        cover = [x for x in pool if x["size_gib"] >= remaining - 1e-9]
-        if cover:
-            choice = min(cover, key=lambda x: (x["size_gib"], 0 if x.get("official") else 1))
-            picked.append(choice)
-            total += choice["size_gib"]
-            break
-        # ② 没有能一次性盖住的：在放得下的里面挑最大的（条数少）
-        fit = [x for x in pool if x["size_gib"] <= remaining + 1e-9]
-        choice = fit[0]          # 排序已保证这是「放得下的里面最大的」
-        picked.append(choice)
-        pool.remove(choice)
-        total += choice["size_gib"]
-        remaining = float(target_gib) - total
-    shortfall = max(0.0, round(float(target_gib) - total, 3))
-    return picked, round(total, 3), shortfall
-
-
 def _cron_trigger(expr: Any, fallback: str):
     """把 5 段 cron 表达式变成「触发器对象」，永远不把字符串交给 MoviePilot。
 
@@ -1178,7 +1056,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.11.0"
+    plugin_version = "0.11.1"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1224,45 +1102,19 @@ class ColaCrossSeed(_PluginBase):
     # 每客户端覆盖：每行 `客户端名或地址,下载KiB/s,上传KiB/s`（命中就覆盖全局，未命中用全局）
     _limit_lines = ""
     # ---- 可乐保种组（只有工作组账号能解锁；见 docs/seed-group-api.md）----
-    _seedgroup_enabled = False
-    _seedgroup_tier = "2T"
     # 保种范围：site = 全站官方种（默认）；pool = 站点保种组专用池（未开放时回落到全站官方种）
-    _seedgroup_scope = "site"
-    _seedgroup_custom_gib = 2048
-    _seedgroup_api_key = ""      # 可选：站点机器面 API Key（X-API-Key，拉官方清单更快）
-    _seedgroup_staff_prefix = SEED_GROUP_STAFF_PREFIX
-    _seedgroup_allow_admin = True
     # 保种组自己的下载器：默认用 MP 已配置的那台（MP 会按自己的规则刮削/整理），
     # 也可以单独填 qB/TR（只给保种组用，不影响辅种的客户端）
-    _seedgroup_client_mode = "mp"      # mp = 用 MP 已配置下载器；custom = 用下面那行
-    _seedgroup_use_mp_clients = True
-    _seedgroup_clients_lines = ""
-    _seedgroup_target_client = ""
-    _seedgroup_cron = "0 * * * *"
     # 下架核对的最小间隔：它每颗种子发一次 GET，cron 调到每小时之后仍按这个节奏跑
-    SG_PRUNE_MIN_INTERVAL = 6 * 3600
     # 每轮最多对多少颗「丢失文件」的保种种子提交强制校验（recheck 很吃磁盘 IO）
-    SG_RECHECK_PER_ROUND = 20
     # 进种限流：客户端里「正在下载」的种子数不允许超过这个值，满了本轮就不再进种。
     # 目的：让覆盖慢慢追平目标，而不是一次性把几百颗塞进客户端抢带宽。
-    _seedgroup_max_downloading = 5
-    _seedgroup_save_path = ""
     # 保种组默认**必须校验**：这些种子是从站点新下载的，文件还不在磁盘上。
     # 开着「跳过校验」qB 会认为文件已完整，立刻变 missingFiles（丢失文件）、进度 0%、永不下载 ——
     # 2026-11-16 实测就是这条把保种卡成「覆盖不涨」。跳过校验只留给「文件已在磁盘、种子丢了」的恢复。
-    _seedgroup_skip_check = False
     # 下架清理：off=不清 / seed=只删种子（默认）/ files=连文件一起删
     # 动态保种：体积达标后，删「做种人数最多」的、补「做种人数最少」的
-    _seedgroup_rotate = True      # 强制开启（站长要求）：达到档位后必须轮换，不给关
-    _seedgroup_rotate_count = 5
-    _seedgroup_rotate_files = True      # 轮换通常要腾空间，默认连文件一起删
-    _seedgroup_prune_mode = "seed"
-    _seedgroup_prune = True
-    _seedgroup_prune_files = False
     # 限速情况上报：只统计「开了保种组」的用户，辅种用户不采集、不上报
-    _seedgroup_report = True
-    _seedgroup_report_url = "https://www.colapt.com/api/v1/plugin/seed-group/report"
-    _seedgroup_report_token = ""
     _event = Event()
     _csrf = ""
     # host -> 可用的 pieces-hash 路径（憨憨是 /nexusapi/pieces-hash，其余多为 /api/pieces-hash）；"" 表示不支持
@@ -1305,83 +1157,6 @@ class ColaCrossSeed(_PluginBase):
                 self._limit_dl_kib = 0
                 self._limit_up_kib = 0
             self._limit_lines = str(config.get("limit_lines") or "")
-            # 可乐保种组：档位只认白名单里的四个，写错退回最小档（不能退化成「不保种」）
-            self._seedgroup_enabled = bool(config.get("seedgroup_enabled", False))
-            # 档位归一化：老值 20T+ → 20T；未知值退回 2T；custom 走自定义数值
-            self._seedgroup_tier = seed_group_tier_key(config.get("seedgroup_tier") or "2T")
-            try:
-                self._seedgroup_max_downloading = max(0, min(int(config.get("seedgroup_max_downloading") or 5), 200))
-            except Exception:
-                self._seedgroup_max_downloading = 5
-            # 范围已从 UI 撤掉：统一「全站官种」；老配置里的 pool 也归一成 site（机器面通道只看有没有 Key）
-            self._seedgroup_scope = "site"
-            # 支持 100M / 100G / 1T / 1P（parse_size_gib 也接受纯数字）
-            custom = int(round(parse_size_gib(config.get("seedgroup_custom_gib"))))
-            # 自定义档：100M / 100G / 1T / 1P 都行，只有 0 会被抬到 1 GiB
-            self._seedgroup_custom_gib = max(SEED_GROUP_CUSTOM_MIN_GIB, custom)
-            # 旧配置键 seedgroup_api_token 的语义就是这把站点 API Key，读进来兼容
-            self._seedgroup_api_key = str(config.get("seedgroup_api_key")
-                                          or config.get("seedgroup_api_token") or "").strip()
-            self._seedgroup_staff_prefix = (str(config.get("seedgroup_staff_prefix") or "").strip()
-                                            or SEED_GROUP_STAFF_PREFIX)
-            self._seedgroup_allow_admin = bool(config.get("seedgroup_allow_admin", True))
-            mode = str(config.get("seedgroup_client_mode") or "").strip().lower()
-            if mode in ("mp", "custom"):
-                self._seedgroup_client_mode = mode
-            else:
-                self._seedgroup_client_mode = ("mp" if bool(config.get("seedgroup_use_mp_clients", True))
-                                               else "custom")
-            self._seedgroup_use_mp_clients = self._seedgroup_client_mode == "mp"
-            self._seedgroup_clients_lines = str(config.get("seedgroup_clients_lines") or "")
-            self._seedgroup_target_client = str(config.get("seedgroup_target_client") or "").strip()
-            self._seedgroup_cron = str(config.get("seedgroup_cron") or "0 * * * *").strip()
-            self._seedgroup_save_path = str(config.get("seedgroup_save_path") or "").strip()
-            self._seedgroup_skip_check = bool(config.get("seedgroup_skip_check", False))
-            # 动态保种强制开启：配置里写 false 也按 true 处理（老板 2026-11-15）
-            self._seedgroup_rotate = True
-            try:
-                self._seedgroup_rotate_count = max(1, min(50, int(config.get("seedgroup_rotate_count", 5) or 5)))
-            except Exception:
-                self._seedgroup_rotate_count = 5
-            self._seedgroup_rotate_files = bool(config.get("seedgroup_rotate_files", True))
-            prune_mode = str(config.get("seedgroup_prune_mode") or "").strip().lower()
-            if prune_mode not in ("off", "seed", "files"):
-                if not bool(config.get("seedgroup_prune", True)):
-                    prune_mode = "off"
-                elif bool(config.get("seedgroup_prune_files", False)):
-                    prune_mode = "files"
-                else:
-                    prune_mode = "seed"
-            self._seedgroup_prune_mode = prune_mode
-            self._seedgroup_prune = prune_mode != "off"
-            self._seedgroup_prune_files = prune_mode == "files"
-            # 限速上报是强制的（老板 2026-11-15）：不给用户开关，也不把地址/token 暴露在界面上
-            self._seedgroup_report = True
-            self._seedgroup_report_url = str(config.get("seedgroup_report_url")
-                                             or SEED_GROUP_REPORT_URL).strip()
-            self._seedgroup_report_token = str(config.get("seedgroup_report_token") or "").strip()
-            try:
-                self._max_per_hour = max(0, min(2000, int(config.get("max_per_hour", 0) or 0)))
-                self._max_per_site = max(1, min(200, int(config.get("max_per_site", 20) or 20)))
-            except Exception:
-                self._max_per_hour = 0
-                self._max_per_site = 20
-            # 启用保种组时立刻校验工作组资格。
-            # 注意顺序：这段必须在 max_per_hour / max_per_site 赋值之后 —— 它可能 _persist()，
-            # 写在前面会把这两个字段写成类属性默认值（0/20），等于把用户的限速悄悄改成「不限」。
-            if self._seedgroup_enabled:
-                # 未登录时 identity 会返回 ok=False（不是「没资格」），开关原样保留
-                ident = self.seed_group_identity()
-                if not ident.get("ok"):
-                    # 网络/会话问题不是「没资格」：保留开关，下一轮 _sg_unlocked 还会拦
-                    logger.warn(f"保种组资格校验暂时失败（保留开关）：{ident.get('reason')}")
-                elif not ident.get("staff"):
-                    self._seedgroup_enabled = False
-                    self.seed_group_unlock(ident)
-                    logger.warn(f"保种组已强制关闭：{ident.get('reason')}")
-                    self._persist()
-                else:
-                    self.seed_group_unlock(ident)
         # 保存配置时如果填了验证码，立刻换一次 token（一次性，成功/失败都会清掉验证码字段）。
         if self._captcha_code and self._username and self._password and not self._session_token:
             self._login(self._captcha_code)
@@ -1405,7 +1180,7 @@ class ColaCrossSeed(_PluginBase):
             except Exception as err:
                 logger.warn(f"IYUU 文件导入失败：{type(err).__name__}: {err}")
         self._event.clear()
-        if self._enabled and (self._crossseed_enabled or self._seedgroup_enabled):
+        if self._enabled and self._crossseed_enabled:
             # 保存后自动检测一次连通性（后台线程，不卡保存）；结果显示在插件页。
             import threading
             threading.Thread(target=self.run_tests, daemon=True).start()
@@ -1443,30 +1218,6 @@ class ColaCrossSeed(_PluginBase):
             "limit_dl_kib": self._limit_dl_kib,
             "limit_up_kib": self._limit_up_kib,
             "limit_lines": self._limit_lines,
-            "seedgroup_enabled": self._seedgroup_enabled,
-            "seedgroup_tier": self._seedgroup_tier,
-            "seedgroup_max_downloading": self._seedgroup_max_downloading,
-            "seedgroup_scope": self._seedgroup_scope,
-            "seedgroup_custom_gib": self._seedgroup_custom_gib,
-            "seedgroup_api_key": self._seedgroup_api_key,
-            "seedgroup_staff_prefix": self._seedgroup_staff_prefix,
-            "seedgroup_allow_admin": self._seedgroup_allow_admin,
-            "seedgroup_use_mp_clients": self._seedgroup_use_mp_clients,
-            "seedgroup_clients_lines": self._seedgroup_clients_lines,
-            "seedgroup_target_client": self._seedgroup_target_client,
-            "seedgroup_cron": self._seedgroup_cron,
-            "seedgroup_save_path": self._seedgroup_save_path,
-            "seedgroup_skip_check": self._seedgroup_skip_check,
-            "seedgroup_client_mode": self._seedgroup_client_mode,
-            "seedgroup_rotate": self._seedgroup_rotate,
-            "seedgroup_rotate_count": self._seedgroup_rotate_count,
-            "seedgroup_rotate_files": self._seedgroup_rotate_files,
-            "seedgroup_prune_mode": self._seedgroup_prune_mode,
-            "seedgroup_prune": self._seedgroup_prune,
-            "seedgroup_prune_files": self._seedgroup_prune_files,
-            "seedgroup_report": self._seedgroup_report,
-            "seedgroup_report_url": self._seedgroup_report_url,
-            "seedgroup_report_token": self._seedgroup_report_token,
         })
 
     # ---------------- 站点登录 / 匹配 / 下载 ----------------
@@ -2093,7 +1844,6 @@ class ColaCrossSeed(_PluginBase):
             if not (candidates & imported_hosts):
                 out["skipped"].append(host)
         self._iyuu_json = raw
-        self.save_data("seedgroup_skip", {})
         # 默认切 merge：IYUU 的站全部生效，手写的行继续作为补充（行优先）。
         # 想彻底只认 IYUU，把「站点来源」改成「只用 IYUU 导入」即可。
         if (self._sites_mode or "") == "manual":
@@ -3589,12 +3339,9 @@ class ColaCrossSeed(_PluginBase):
     # 没有工作组头衔的账号插件直接拒绝解锁，保存配置时还会把开关强制关掉。
 
     UNLOCK_TTL = 86400          # 工作组资格校验结果的缓存时长（秒）
-    SG_MAX_PAGES = 50
-    SG_BROWSE_PAGE_SIZE = 50
     def get_state(self) -> bool:
-        # 两个功能任一开启都算「插件在工作」：只开保种组时也要显示为运行中
-        return bool(self._enabled and (self._crossseed_enabled or self._seedgroup_enabled)
-                    and self._session_token)
+        # 保种组已经搬到独立插件（ColaSeedGroup），这里只看辅种开关
+        return bool(self._enabled and self._crossseed_enabled and self._session_token)
 
     def get_service(self) -> List[Dict[str, Any]]:
         services: List[Dict[str, Any]] = []
@@ -3770,9 +3517,6 @@ class ColaCrossSeed(_PluginBase):
                             {"component": "VSwitch", "props": {"model": "crossseed_enabled",
                              "label": "启用辅种（功能一）"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                            {"component": "VSwitch", "props": {"model": "seedgroup_enabled",
-                             "label": "启用保种组（功能二）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VSwitch", "props": {"model": "notify", "label": "任务结果通知"}}]},
                     ]},
                     {"component": "VRow", "content": [
@@ -3914,19 +3658,7 @@ class ColaCrossSeed(_PluginBase):
             "add_label": "", "extra_tags": "", "inherit_tags": True, "target_client": "",
             "fallback_skip_check": True, "retry_failed": True,
             "limit_dl_kib": 0, "limit_up_kib": 0, "limit_lines": "",
-            "seedgroup_enabled": False, "seedgroup_tier": "2T",
-            "seedgroup_custom_gib": 2048, "seedgroup_scope": "site",
-            "seedgroup_cron": "0 * * * *", "seedgroup_max_downloading": 5,
-            "seedgroup_save_path": "", "seedgroup_skip_check": False,
             "iyuu_json_file": "",
-            "seedgroup_client_mode": "mp", "seedgroup_prune_mode": "seed",
-            "seedgroup_rotate": True, "seedgroup_rotate_count": 5, "seedgroup_rotate_files": True,
-            "seedgroup_report": True, "seedgroup_report_url": SEED_GROUP_REPORT_URL,
-            "seedgroup_report_token": "",
-            "seedgroup_prune": True, "seedgroup_prune_files": False,
-            "seedgroup_api_key": "", "seedgroup_staff_prefix": SEED_GROUP_STAFF_PREFIX,
-            "seedgroup_allow_admin": True, "seedgroup_use_mp_clients": True,
-            "seedgroup_clients_lines": "", "seedgroup_target_client": "",
         }
 
 
