@@ -216,6 +216,23 @@ def _seed_group_size_gib(size: Any) -> float:
     return value if value < 1e5 else value / GIB
 
 
+def _sg_on_target(covered: Any, target: Any, tolerance: float = 0.005) -> bool:
+    """覆盖是否算「达标」——站点用它累计当月保种时长。
+
+    留 0.5%（最少 1 GiB）容差：covered 来自客户端 size 累加，target 来自站点 size_bytes/GIB，
+    两者天然差几个 MB；严格 >= 会让「其实已经全保完」的账号一直报 0，
+    面板上就是「保种时长 0.0 天 / 应达 13.5 天」永远不动、退休进度也一直 0%。
+    """
+    try:
+        c = float(covered or 0)
+        t = float(target or 0)
+    except (TypeError, ValueError):
+        return False
+    if c <= 0 or t <= 0:
+        return False
+    return c >= t - max(t * tolerance, 1.0)
+
+
 def seed_group_plan(items: List[Dict[str, Any]], target_gib: float) \
         -> Tuple[List[Dict[str, Any]], float, float]:
     """按档位挑种子：只超不少。
@@ -1161,7 +1178,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.58"
+    plugin_version = "0.10.60"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -2486,8 +2503,7 @@ class ColaCrossSeed(_PluginBase):
             "covered_gib": state.get("covered_gib"),
             "shortfall_gib": state.get("shortfall_gib"),
             # 站点按这个字段累计「当月达标时长」：covered >= target 才算达标
-            "on_target": bool(state.get("covered_gib") or 0) and bool(state.get("target_gib") or 0)
-                         and float(state.get("covered_gib") or 0) >= float(state.get("target_gib") or 0),
+            "on_target": _sg_on_target(state.get("covered_gib"), state.get("target_gib")),
             # 客户端里这批种子最老的那颗已经做了多久（交叉验证「保种时长」不是编的）
             "seeded_secs": self._sg_oldest_seeded_secs(clients),
             "enforced": {"dl_kib": self._limit_dl_kib, "up_kib": self._limit_up_kib},
@@ -4365,6 +4381,18 @@ class ColaCrossSeed(_PluginBase):
             self._seed_group_sync()
         except Exception as err:
             logger.error(f"保种组任务异常终止：{type(err).__name__}: {err}")
+            # **每轮必上报**（2026-11-17 老板要求）：站点只在 on_target=1 的相邻上报区间里
+            # 累计保种时长，漏一轮那段时间就白丢；面板读的也是上报表，漏报就停在旧数字。
+            try:
+                self._maybe_report(self._sg_clients(), {
+                    "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "tier": seed_group_tier_key(self._seedgroup_tier),
+                    "target_gib": 0.0, "current_gib": 0.0, "covered_gib": 0.0,
+                    "shortfall_gib": 0.0, "activated": False, "unlocked": False,
+                    "reason": f"{type(err).__name__}: {err}"[:200],
+                })
+            except Exception as report_err:
+                logger.warn(f"保种组异常上报也失败了：{report_err}")
             try:
                 self.post_message(mtype=NotificationType.Plugin,
                                   title="【可乐PT辅种】保种组执行异常",
