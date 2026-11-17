@@ -1179,7 +1179,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.1.0"
+    plugin_version = "0.2.0"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1355,13 +1355,11 @@ class ColaSeedGroup(_PluginBase):
                 if not ident.get("ok"):
                     # 网络/会话问题不是「没资格」：保留开关，下一轮 _sg_unlocked 还会拦
                     logger.warn(f"保种组资格校验暂时失败（保留开关）：{ident.get('reason')}")
-                elif not ident.get("staff"):
-                    self._seedgroup_enabled = False
-                    self.seed_group_unlock(ident)
-                    logger.warn(f"保种组已强制关闭：{ident.get('reason')}")
-                    self._persist()
                 else:
+                    # 2026-11-18：任何站点用户都能保种，只有工作组成员才向站点汇报
                     self.seed_group_unlock(ident)
+                    if not ident.get("staff"):
+                        logger.info("保种组：当前账号没有工作组头衔 —— 照常拉官种，但不向站点汇报")
         # 保存配置时如果填了验证码，立刻换一次 token（一次性，成功/失败都会清掉验证码字段）。
         if self._captcha_code and self._username and self._password and not self._session_token:
             self._login(self._captcha_code)
@@ -1975,8 +1973,17 @@ class ColaSeedGroup(_PluginBase):
             logger.warn(f"保种组清理异常（不影响本轮同步）：{type(err).__name__}: {err}")
 
     def _maybe_report(self, clients: List[_Client], state: Dict[str, Any]) -> None:
-        """上报不抛异常：限速采集/发送失败不能影响保种本身。"""
+        """上报不抛异常：限速采集/发送失败不能影响保种本身。
+
+        **只有站点工作组成员才汇报**（2026-11-18 老板定）：非成员照样拉官种、照样算自己的
+        覆盖与缺口，只是数据不进站点考核表 —— 申请进组后自动开始汇报。
+        """
         try:
+            if not (self._sg_unlock_record() or {}).get("staff"):
+                state["report_skipped"] = "非工作组成员，不上报（进组后自动开始）"
+                self.save_data("seedgroup_state", state)
+                return
+
             report = self._report_seedgroup(clients, state)
             state["report_ok"] = report.get("ok")
             state["report_reason"] = report.get("reason")
@@ -2549,7 +2556,7 @@ class ColaSeedGroup(_PluginBase):
         out["ok"] = True
         if not out["staff"]:
             out["reason"] = (f"账号不在工作组：组名需以「{prefix}」开头"
-                             f"（当前 {', '.join(titles) or '没有任何组'}），保种组不可解锁")
+                             f"（当前 {', '.join(titles) or '没有任何组'}），照常拉官种，但不向站点汇报")
         return out
 
     def seed_group_unlock(self, ident: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -2664,11 +2671,12 @@ class ColaSeedGroup(_PluginBase):
             lines.append(f"资格：工作组（{groups}）；解锁于 {when}")
         else:
             lines.append("资格：" + str(unlock.get("reason")
-                                        or "账号不在工作组，保种组不可解锁（强制锁定）"))
+                                        or "非工作组成员：保种照常，数据不汇报（申请进组后自动开始）"))
         if not self._seedgroup_enabled:
             lines.append("状态：未启用 —— 勾选顶部「启用保种组（功能二）」并保存，会自动校验工作组资格")
         elif not staff:
-            lines.append("状态：已锁定 —— 非工作组账号无法解锁这一块，辅种不受影响")
+            lines.append("状态：保种中（数据不汇报）—— 非工作组成员也能拉官种，"
+                         "只是覆盖/时长不进站点考核表；申请进组后自动开始汇报")
         elif float(state.get("shortfall_gib") or 0) > 0:
             lines.append("状态：已解锁，但体积还没到档位 —— "
                          + str(state.get("reason") or "等下一轮同步补齐"))
@@ -3097,15 +3105,11 @@ class ColaSeedGroup(_PluginBase):
             logger.warn("保种组：没有可用的下载器")
             return
         self._apply_speed_limits(clients)
-        # 强制闸：非工作组账号连解锁都拿不到，这里直接停，不走资源池
+        # 解锁只决定「汇不汇报」，不再挡进种：任何登录站点的用户都能拉官种
         unlocked, record = self._sg_unlocked()
-        state.update({"unlocked": unlocked, "staff_groups": record.get("groups") or []})
-        if not unlocked:
-            state["reason"] = str(record.get("reason") or "账号不在工作组，保种组无法解锁")
-            self.save_data("seedgroup_state", state)
-            logger.warn(f"保种组已锁定：{state['reason']}")
-            self._maybe_report(clients, state)
-            return
+        staff = bool(record.get("staff"))
+        state.update({"unlocked": unlocked, "staff": staff,
+                      "staff_groups": record.get("groups") or []})
         existing, current_gib, blind = self._sg_current(clients)
         # 丢失文件自检：带标签却 missingFiles 的种子既不计入覆盖、也永远不会下动。
         missing_total = 0
