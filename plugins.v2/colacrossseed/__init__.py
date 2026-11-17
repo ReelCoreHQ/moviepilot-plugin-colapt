@@ -1072,7 +1072,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.55"
+    plugin_version = "0.10.56"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1132,7 +1132,9 @@ class ColaCrossSeed(_PluginBase):
     _seedgroup_use_mp_clients = True
     _seedgroup_clients_lines = ""
     _seedgroup_target_client = ""
-    _seedgroup_cron = "0 */6 * * *"
+    _seedgroup_cron = "0 * * * *"
+    # 下架核对的最小间隔：它每颗种子发一次 GET，cron 调到每小时之后仍按这个节奏跑
+    SG_PRUNE_MIN_INTERVAL = 6 * 3600
     # 每轮最多对多少颗「丢失文件」的保种种子提交强制校验（recheck 很吃磁盘 IO）
     SG_RECHECK_PER_ROUND = 20
     # 进种限流：客户端里「正在下载」的种子数不允许超过这个值，满了本轮就不再进种。
@@ -1226,7 +1228,7 @@ class ColaCrossSeed(_PluginBase):
             self._seedgroup_use_mp_clients = self._seedgroup_client_mode == "mp"
             self._seedgroup_clients_lines = str(config.get("seedgroup_clients_lines") or "")
             self._seedgroup_target_client = str(config.get("seedgroup_target_client") or "").strip()
-            self._seedgroup_cron = str(config.get("seedgroup_cron") or "0 */6 * * *").strip()
+            self._seedgroup_cron = str(config.get("seedgroup_cron") or "0 * * * *").strip()
             self._seedgroup_save_path = str(config.get("seedgroup_save_path") or "").strip()
             self._seedgroup_skip_check = bool(config.get("seedgroup_skip_check", False))
             # 动态保种强制开启：配置里写 false 也按 true 处理（老板 2026-11-15）
@@ -2324,14 +2326,28 @@ class ColaCrossSeed(_PluginBase):
         return out
 
     def _sg_prune_if_enabled(self, state: Dict[str, Any]) -> None:
-        """下架清理：达标那轮也要跑（UI 承诺的是「每轮回站点核对」）。"""
+        """下架清理：达标那轮也要跑。
+
+        但核对是**每颗种子一次 GET**（637 颗 = 637 个请求），而 2026-11-17 把 cron 从 6 小时
+        改成 1 小时之后，它不该跟着翻 6 倍。所以这里加时间闸：距上次核对不足
+        SG_PRUNE_MIN_INTERVAL 就跳过，进种照常每小时跑。
+        """
         if not self._seedgroup_prune:
+            return
+        now = int(time.time())
+        try:
+            last = int(self.get_data("seedgroup_prune_at") or 0)
+        except Exception:
+            last = 0
+        if last and now - last < self.SG_PRUNE_MIN_INTERVAL:
+            state["prune_skipped"] = f"距上次核对 {int((now - last) / 60)} 分钟，未到 {self.SG_PRUNE_MIN_INTERVAL // 3600} 小时"
             return
         try:
             pruned = self._sg_prune()
             state["pruned"] = pruned.get("removed", 0)
             state["prune_checked"] = pruned.get("checked", 0)
             state["prune_failed"] = pruned.get("failed", 0)
+            self.save_data("seedgroup_prune_at", int(time.time()))
             self.save_data("seedgroup_state", state)
         except Exception as err:
             logger.warn(f"保种组清理异常（不影响本轮同步）：{type(err).__name__}: {err}")
@@ -4506,7 +4522,7 @@ class ColaCrossSeed(_PluginBase):
             services.append({
                 "id": "ColaCrossSeedSeedGroup",
                 "name": "可乐保种组",
-                "trigger": _cron_trigger(self._seedgroup_cron, "0 */6 * * *"),
+                "trigger": _cron_trigger(self._seedgroup_cron, "0 * * * *"),
                 "func": self.seed_group_sync,
                 "kwargs": {},
             })
@@ -4977,7 +4993,7 @@ class ColaCrossSeed(_PluginBase):
             "limit_dl_kib": 0, "limit_up_kib": 0, "limit_lines": "",
             "seedgroup_enabled": False, "seedgroup_tier": "2T",
             "seedgroup_custom_gib": 2048, "seedgroup_scope": "site",
-            "seedgroup_cron": "0 */6 * * *", "seedgroup_max_downloading": 5,
+            "seedgroup_cron": "0 * * * *", "seedgroup_max_downloading": 5,
             "seedgroup_save_path": "", "seedgroup_skip_check": False,
             "iyuu_json_file": "",
             "seedgroup_client_mode": "mp", "seedgroup_prune_mode": "seed",
