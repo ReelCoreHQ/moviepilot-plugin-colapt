@@ -978,7 +978,11 @@ class QBittorrentClient(_Client):
             data["category"] = category
         # 强制标签：辅种一律带 MANDATORY_TAG，方便在 qB 里一眼筛出来/批量清理；
         # 用户自己填的 add_label 作为第二个标签附上（不填就只带强制标签）。
-        tags = [MANDATORY_TAG] + ([label] if label and label != MANDATORY_TAG else [])
+        if label == SEED_GROUP_TAG:
+            # 保种组的种子只带自己的标签：套上「可乐辅种」会让 qB 里分不清谁加的
+            tags = [SEED_GROUP_TAG]
+        else:
+            tags = [MANDATORY_TAG] + ([label] if label and label != MANDATORY_TAG else [])
         data["tags"] = ",".join(tags)
         try:
             rsp = self._session.post(
@@ -1179,7 +1183,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -2645,6 +2649,17 @@ class ColaSeedGroup(_PluginBase):
         else:
             lines = [f"档位：{SEED_GROUP_TIER_LABELS.get(tier, tier)}；目标 {target:.0f} GiB；"
                      f"实际覆盖 {covered:.1f} GiB（{pct}%）"]
+        # 正在下载的（插件刚塞进去、还没下完的）：直接在面板上列出来，
+        # 免得用户以为「插件没在下东西」—— qB 的「下载」分类里也能看到同一批。
+        try:
+            inflight = int(state.get("downloading") or state.get("inflight") or 0)
+        except Exception:
+            inflight = 0
+        quota = state.get("download_quota")
+        if inflight or quota is not None:
+            lines.append(f"进种状态：客户端正在下载 {inflight} 个"
+                         + (f"，本轮额度 {quota}" if quota is not None else "")
+                         + f"（上限 {self._seedgroup_max_downloading or '不限'}）")
         if state.get("at"):
             lines.append(f"上次同步 {state['at']}：新增 {state.get('added', 0)} 条"
                          f"（+{state.get('added_gib', 0)} GiB），重复 {state.get('duplicate', 0)}，"
