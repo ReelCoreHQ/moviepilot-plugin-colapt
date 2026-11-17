@@ -217,9 +217,16 @@ def make_plugin(module, store=None, cls_name=None, **attrs):
         value = plugin._store.get(key, default)
         return value
 
+    def update_config(cfg):
+        plugin._store.setdefault("__config__", {}).update(cfg or {})
+
+    def update_config(cfg):  # noqa: F811 —— 保种插件的 _persist 会调它
+        plugin._store.setdefault("__config__", {}).update(cfg or {})
+
     def save_data(key, value):
         plugin._store[key] = value
 
+    plugin.update_config = update_config
     plugin.get_data = get_data
     plugin.save_data = save_data
     plugin.post_message = lambda **kwargs: None
