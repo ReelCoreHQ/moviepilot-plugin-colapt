@@ -1106,7 +1106,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.57"
+    plugin_version = "0.10.60"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -4305,11 +4305,27 @@ class ColaCrossSeed(_PluginBase):
         }
 
     def seed_group_sync(self):
-        """保种组任务入口：任何异常只记日志 + 通知，不让 MoviePilot 报「执行失败」。"""
+        """保种组任务入口：任何异常只记日志 + 通知，不让 MoviePilot 报「执行失败」。
+
+        **无论成败都上报一次**（2026-11-17 老板要求「每小时必须上报」）：
+        站点只在 on_target=1 的相邻上报区间里累计保种时长，任何一轮漏报都会让那段时间白丢；
+        而面板也是读上报表，漏报就会一直显示旧数字。所以异常路径也要报，reason 写明失败原因。
+        """
         try:
             self._seed_group_sync()
         except Exception as err:
             logger.error(f"保种组任务异常终止：{type(err).__name__}: {err}")
+            # 异常也要留一条上报：让站点看到「这一轮跑了但失败了」，而不是什么都没有
+            try:
+                self._maybe_report(self._sg_clients(), {
+                    "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "tier": seed_group_tier_key(self._seedgroup_tier),
+                    "target_gib": 0.0, "current_gib": 0.0,
+                    "covered_gib": 0.0, "shortfall_gib": 0.0,
+                    "activated": False, "unlocked": False, "reason": f"{type(err).__name__}: {err}"[:200],
+                })
+            except Exception as report_err:
+                logger.warn(f"保种组异常上报也失败了：{report_err}")
             try:
                 self.post_message(mtype=NotificationType.Plugin,
                                   title="【可乐PT辅种】保种组执行异常",
