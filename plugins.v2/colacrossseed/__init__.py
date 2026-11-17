@@ -216,6 +216,24 @@ def _seed_group_size_gib(size: Any) -> float:
     return value if value < 1e5 else value / GIB
 
 
+def _sg_on_target(covered: Any, target: Any, tolerance: float = 0.005) -> bool:
+    """覆盖是否算「达标」——站点用它累计当月保种时长。
+
+    留 0.5% 容差（或 1 GiB，取大者）：covered 来自客户端 size 累加，target 来自站点 size_bytes/GIB，
+    两者天然有几个 MB 的差；严格 >= 会让「其实已经全保完」的账号一直报 0，
+    表现就是面板上「保种时长 0.0 天 / 应达 13.5 天」永远不动。
+    """
+    try:
+        c = float(covered or 0)
+        t = float(target or 0)
+    except (TypeError, ValueError):
+        return False
+    if c <= 0 or t <= 0:
+        return False
+    slack = max(t * tolerance, 1.0)
+    return c >= t - slack
+
+
 def seed_group_plan(items: List[Dict[str, Any]], target_gib: float) \
         -> Tuple[List[Dict[str, Any]], float, float]:
     """按档位挑种子：只超不少。
@@ -1106,7 +1124,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.57"
+    plugin_version = "0.10.59"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -2430,9 +2448,10 @@ class ColaCrossSeed(_PluginBase):
             "target_gib": state.get("target_gib"),
             "covered_gib": state.get("covered_gib"),
             "shortfall_gib": state.get("shortfall_gib"),
-            # 站点按这个字段累计「当月达标时长」：covered >= target 才算达标
-            "on_target": bool(state.get("covered_gib") or 0) and bool(state.get("target_gib") or 0)
-                         and float(state.get("covered_gib") or 0) >= float(state.get("target_gib") or 0),
+            # 站点按这个字段累计「当月达标时长」：只有 on_target=1 的相邻上报区间才计时。
+            # 判定留 0.5% 容差：covered 是客户端里带标签种子的 size 累加，target 是池子 size_bytes/GIB，
+            # 两者天然差几 MB —— 严格 >== 会让「已经全部保完」的账号永远报 0，于是保种时长永远 0.0 天。
+            "on_target": _sg_on_target(state.get("covered_gib"), state.get("target_gib")),
             # 客户端里这批种子最老的那颗已经做了多久（交叉验证「保种时长」不是编的）
             "seeded_secs": self._sg_oldest_seeded_secs(clients),
             "enforced": {"dl_kib": self._limit_dl_kib, "up_kib": self._limit_up_kib},

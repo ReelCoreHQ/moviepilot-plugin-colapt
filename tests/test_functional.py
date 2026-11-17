@@ -838,6 +838,25 @@ class SeedGroupPaginationTest(unittest.TestCase):
         self.assertEqual([x["torrent_id"] for x in items], [1, 2])
 
 
+class OnTargetToleranceTest(unittest.TestCase):
+    """达标判定要留容差：covered 与 target 天然差几 MB，严格 >= 会让保种时长永远 0。"""
+
+    def test_exact_goal_counts(self):
+        self.assertTrue(mod._sg_on_target(1152.4, 1152.4))
+
+    def test_slightly_under_still_counts(self):
+        # 差 3 GiB（0.26%）：客户端 size 与站点 size_bytes 的正常误差，必须算达标
+        self.assertTrue(mod._sg_on_target(1149.4, 1152.4))
+
+    def test_clearly_short_does_not_count(self):
+        # 差 20 GiB（1.7%）不算达标
+        self.assertFalse(mod._sg_on_target(1132.4, 1152.4))
+
+    def test_missing_values_do_not_count(self):
+        for c, t in ((0, 1152), (None, 1152), (1152, 0), (1152, None)):
+            self.assertFalse(mod._sg_on_target(c, t))
+
+
 class SeedGroupDownloadQuotaTest(unittest.TestCase):
     """进种限流（2026-11-16）：客户端「正在下载」达到上限就停止进种，低于就按剩余额度补。"""
 
