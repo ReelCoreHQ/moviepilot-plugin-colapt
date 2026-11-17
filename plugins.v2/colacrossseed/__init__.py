@@ -212,7 +212,8 @@ def _seed_group_size_gib(size: Any) -> float:
         return 0.0
     if value <= 0:
         return 0.0
-    return value if value < 1e6 else value / GIB
+    # 1e6 太低：800 KB 的种子（800000 字节）会被算成 800000 GiB，直接顶穿 target。
+    return value if value < 1e5 else value / GIB
 
 
 def seed_group_plan(items: List[Dict[str, Any]], target_gib: float) \
@@ -625,6 +626,39 @@ class _Client:
         校验全部失败（issue #23）。
         """
         raise NotImplementedError
+
+    def inflight(self) -> int:
+        """MP 通道：数进度没满的种子（0.10.57 之前落基类返回 -1，限流完全失效）。"""
+        if self._list_all is None:
+            return -1
+        try:
+            rows = self._list_all() or []
+        except Exception:
+            return -1
+        n = 0
+        for t in rows:
+            try:
+                if float(t.get("progress") or 0) < 1:
+                    n += 1
+            except (TypeError, ValueError):
+                continue
+        return n
+
+    def delete(self, hashes: List[str], delete_files: bool = False) -> bool:
+        """MP 通道删除（0.10.57 之前恒 False，下架清理一直空转）。"""
+        if not self._delete or not hashes:
+            return False
+        ok_all = True
+        for h in hashes:
+            try:
+                try:
+                    self._delete(h, delete_files)
+                except TypeError:
+                    self._delete(h)
+            except Exception as err:
+                logger.warn(f"{self.name} 删除失败 {h[:12]}：{err}")
+                ok_all = False
+        return ok_all
 
     def has(self, info_hash: str) -> bool:
         """客户端里是否已有这个 info_hash；不知道时返回 False。"""
@@ -1072,7 +1106,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.56"
+    plugin_version = "0.10.57"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -2151,7 +2185,8 @@ class ColaCrossSeed(_PluginBase):
                 continue
             label = f"MP-{name}"
             out.append(_MPClient(label, instance.get_completed_torrents, instance.add_torrent,
-                                 getattr(instance, "delete_torrent", None)))
+                                 getattr(instance, "delete_torrent", None),
+                                 getattr(instance, "get_torrents", None)))
             logger.info(f"MoviePilot 下载器已接入：{label}（{getattr(info, 'type', '?')}）")
         return out
 
@@ -2173,7 +2208,8 @@ class ColaCrossSeed(_PluginBase):
                         logger.info("MoviePilot 的 qBittorrent 未启用")
                     else:
                         out.append(_MPClient("MP-QB", qb.get_completed_torrents, qb.add_torrent,
-                                             getattr(qb, "delete_torrent", None)))
+                                             getattr(qb, "delete_torrent", None),
+                                             getattr(qb, "get_torrents", None)))
                 except Exception as err:
                     logger.warn(f"读取 MoviePilot qBittorrent 失败：{err}")
                 try:
@@ -3988,7 +4024,7 @@ class ColaCrossSeed(_PluginBase):
                     "torrent_id": version.get("id"),
                     "info_hash": "",
                     "name": str(version.get("release_name") or ""),
-                    "size": version.get("size_bytes") or 0,
+                    "size": version.get("size_bytes") or version.get("size") or 0,
                     "seeders": int(version.get("seeders") or 0),
                     "official": True,
                 })
@@ -5010,10 +5046,11 @@ class ColaCrossSeed(_PluginBase):
 class _MPClient(_Client):
     """把 MoviePilot 的下载器模块包成统一接口。"""
 
-    def __init__(self, name: str, list_func, add_func, delete_func=None):
+    def __init__(self, name: str, list_func, add_func, delete_func=None, list_all_func=None):
         self.name = name
         self._list = list_func
         self._add = add_func
+        self._list_all = list_all_func
         self._delete = delete_func
 
     def list_completed(self) -> List[Dict[str, Any]]:
