@@ -100,5 +100,19 @@
       "v0.1.0": "首个版本：可乐账号密码+图形验证码登录；客户端 hash 反向匹配可乐；多 qB/TR 客户端；默认校验；默认 20 个/小时"
     },
     "plugin_readme": "https://www.colapt.com/wiki/moviepilot-crossseed"
+  },
+  "ColaSeedGroup": {
+    "name": "可乐保种组",
+    "description": "把可乐PT 官方种按档位（2T/5T/10T/15T/20T/自定义/全站官种）搬进下载器长期保种：体积只超不少、进种限流、达标后动态轮换、下架自动清理（可连文件删）、多客户端单独限速，并每轮向站点上报保种情况。需站点工作组头衔解锁。",
+    "labels": "做种,保种",
+    "version": "0.1.0",
+    "icon": "https://www.colapt.com/plugin-icons/colacrossseed.png?v=20261115",
+    "author": "ColaPT",
+    "level": 1,
+    "v2": true,
+    "history": {
+      "v0.1.0": "从「可乐PT辅种」拆出来的独立插件：只做保种组，不含辅种。拆开的好处是保种可以单独更新、单独配下载器，不用跟着辅种的节奏走。功能与 0.10.60 里的保种部分一致（档位/限流/轮换/清理/限速/上报）。"
+    },
+    "plugin_readme": "https://www.colapt.com/wiki/moviepilot-crossseed"
   }
 }
