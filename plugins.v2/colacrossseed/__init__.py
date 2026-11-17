@@ -660,6 +660,61 @@ class _Client:
                 ok_all = False
         return ok_all
 
+    def inflight(self) -> int:
+        """数「进度没满」的种子。之前落基类返回 -1（=不限制），进种限流对 MP 模式完全失效。"""
+        if self._list_all is None:
+            return -1
+        try:
+            rows = self._list_all() or []
+        except Exception:
+            return -1
+        n = 0
+        for t in rows:
+            try:
+                if float(t.get("progress") or 0) < 1:
+                    n += 1
+            except (TypeError, ValueError):
+                continue
+        return n
+
+    def delete(self, hashes: List[str], delete_files: bool = False) -> bool:
+        """删除。之前落基类恒 False —— 下架清理在 MP 模式下一直空转。"""
+        if not self._delete or not hashes:
+            return False
+        ok_all = True
+        for h in hashes:
+            try:
+                try:
+                    self._delete(h, delete_files)
+                except TypeError:
+                    self._delete(h)
+            except Exception as err:
+                logger.warn(f"{self.name} 删除失败 {h[:12]}：{err}")
+                ok_all = False
+        return ok_all
+
+    def add_tags(self, hashes: List[str], tags: List[str]) -> bool:
+        """补标签。MP 各版本方法名不统一，只认构造方注入的；没有就降级 False。"""
+        if not hashes or not tags or not self._tag:
+            return False
+        try:
+            self._tag(hashes, ",".join(tags))
+            return True
+        except Exception as err:
+            logger.warn(f"{self.name} 补标签失败：{err}")
+            return False
+
+    def recheck(self, hashes: List[str]) -> int:
+        """重新校验。同上，注入才生效。"""
+        if not hashes or not self._recheck:
+            return 0
+        try:
+            self._recheck(hashes)
+            return len(hashes)
+        except Exception as err:
+            logger.warn(f"{self.name} 重新校验失败：{err}")
+            return 0
+
     def has(self, info_hash: str) -> bool:
         """客户端里是否已有这个 info_hash；不知道时返回 False。"""
         return False
@@ -1106,7 +1161,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.10.57"
+    plugin_version = "0.10.58"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
