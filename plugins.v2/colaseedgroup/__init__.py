@@ -1,16 +1,18 @@
 """
-可乐PT 自动辅种（MoviePilot 插件）
+可乐保种组（MoviePilot 插件）
 
-逻辑（2026-10-25 定稿）：
-  1. 扫用户配置的 qBittorrent / Transmission（可多个，也可用 MoviePilot 已配置的默认下载器）里**已完成**的种子；
-  2. 把这些种子的 info_hash 批量交给可乐PT 的 /api/v1/plugin/match 做反向匹配：
-       - via=source_info_hash：客户端里有同一份文件（来源是别的站），拉可乐这颗种子回原下载器辅种；
-       - via=info_hash：客户端里已经是可乐这颗种子（跳过）；
-  3. 可选方向二：对 via=info_hash 的可乐种子，下载可乐的 .torrent 算出 pieces_hash，
-     去用户配置的其他 NexusPHP 站点 /api/pieces-hash 查同 pieces 的种子，命中就拉对方种子回来辅种；
-  4. 每小时最多添加 N 个（默认 20，滚动 60 分钟窗口），是否跳过校验由用户设置（默认校验）。
+从「可乐PT 辅种」里拆出来的独立插件，**只做保种组**，不碰辅种。
 
-登录：可乐PT 用户名 + 密码 + 图形验证码（插件页面显示图片，设置里填 4 位数字后保存）。
+它做的事：
+  1. 按档位（2T/5T/10T/15T/20T/自定义/全站官种）从站点官方资源池挑种子，搬进下载器长期保种；
+  2. 体积「只超不少」：先挑官方、再挑放得下的最大颗，最后允许多吃一颗顶过档位；
+  3. 进种限流：客户端里「正在下载」达到上限就停，等这批下完再补，让覆盖稳步追平；
+  4. 达标后动态轮换：删做种人数最多的 N 颗、补最少的 N 颗；
+  5. 每轮回站点核对，下架的种子自动清理（可连文件一起删）；
+  6. 每轮向站点上报（档位/覆盖/缺口/限速/做种时长），站点据此算月度考核与退休进度。
+
+解锁资格只认站点工作组（登录后读本人资料里的工作组头衔），没有工作组的账号保存配置时会被强制关掉。
+辅种请装另一个插件「可乐PT辅种」（ColaCrossSeed），两者可以并存、各配各的下载器。
 """
 import base64
 import hashlib
@@ -1169,7 +1171,6 @@ class ColaSeedGroup(_PluginBase):
     auth_level = 1
 
     _enabled = False            # MP 插件总开关：关掉后两个功能都不跑
-    _crossseed_enabled = True   # 功能一：辅种
     _notify = True
     _cron = "0 */1 * * *"
     _username = ""
@@ -1256,31 +1257,17 @@ class ColaSeedGroup(_PluginBase):
         self.stop_service()
         if config is not None:
             self._enabled = bool(config.get("enabled", False))
-            self._crossseed_enabled = bool(config.get("crossseed_enabled", True))
             self._notify = bool(config.get("notify", True))
-            self._cron = str(config.get("cron") or "0 */1 * * *").strip()
             self._username = str(config.get("username") or "")
             self._password = str(config.get("password") or "")
             self._otp_code = str(config.get("otp_code") or "")
             self._captcha_code = str(config.get("captcha_code") or "")
             self._session_token = str(config.get("session_token") or "")
-            self._skip_check = bool(config.get("skip_check", False))
-            self._direction = str(config.get("direction") or "both")
             self._use_mp_clients = bool(config.get("use_mp_clients", True))
             self._clients_json = str(config.get("clients_json") or "")
-            self._clients_lines = str(config.get("clients_lines") or "")
-            self._sites_json = str(config.get("sites_json") or "")
-            self._sites_lines = str(config.get("sites_lines") or "")
-            self._iyuu_json = str(config.get("iyuu_json") or "")
-            self._iyuu_json_file = str(config.get("iyuu_json_file") or "").strip()
-            self._iyuu_token = str(config.get("iyuu_token") or "")
-            self._sites_mode = str(config.get("sites_mode") or "merge")
             self._add_label = str(config.get("add_label") or "").strip()
-            self._target_client = str(config.get("target_client") or "").strip()
             self._inherit_tags = bool(config.get("inherit_tags", True))
             self._extra_tags = str(config.get("extra_tags") or "").strip()
-            self._fallback_skip_check = bool(config.get("fallback_skip_check", True))
-            self._retry_failed = bool(config.get("retry_failed", True))
             try:
                 self._limit_dl_kib = max(0, min(10 ** 7, int(config.get("limit_dl_kib", 0) or 0)))
                 self._limit_up_kib = max(0, min(10 ** 7, int(config.get("limit_up_kib", 0) or 0)))
@@ -1343,12 +1330,6 @@ class ColaSeedGroup(_PluginBase):
             self._seedgroup_report_url = str(config.get("seedgroup_report_url")
                                              or SEED_GROUP_REPORT_URL).strip()
             self._seedgroup_report_token = str(config.get("seedgroup_report_token") or "").strip()
-            try:
-                self._max_per_hour = max(0, min(2000, int(config.get("max_per_hour", 0) or 0)))
-                self._max_per_site = max(1, min(200, int(config.get("max_per_site", 20) or 20)))
-            except Exception:
-                self._max_per_hour = 0
-                self._max_per_site = 20
             # 启用保种组时立刻校验工作组资格。
             # 注意顺序：这段必须在 max_per_hour / max_per_site 赋值之后 —— 它可能 _persist()，
             # 写在前面会把这两个字段写成类属性默认值（0/20），等于把用户的限速悄悄改成「不限」。
@@ -1370,25 +1351,8 @@ class ColaSeedGroup(_PluginBase):
             self._login(self._captcha_code)
             self._captcha_code = ""
             self._persist()
-        # IYUU 本地文件导入：填了容器内路径就以文件为准（粘进文本框的内容会被覆盖）。
-        # 放在所有字段赋值之后：_iyuu_import 内部会 _persist()。
-        if self._iyuu_json_file:
-            import os
-            try:
-                if os.path.isfile(self._iyuu_json_file):
-                    with open(self._iyuu_json_file, "r", encoding="utf-8", errors="replace") as handle:
-                        file_text = handle.read()
-                    if file_text.strip() and file_text.strip() != (self._iyuu_json or "").strip():
-                        result = self._iyuu_import(file_text)
-                        logger.info(f"IYUU 文件导入：{self._iyuu_json_file} → 可用 {result.get('usable')} 个站")
-                    else:
-                        logger.info(f"IYUU 文件与已存配置一致，跳过导入：{self._iyuu_json_file}")
-                else:
-                    logger.warn(f"IYUU 文件不存在：{self._iyuu_json_file}")
-            except Exception as err:
-                logger.warn(f"IYUU 文件导入失败：{type(err).__name__}: {err}")
         self._event.clear()
-        if self._enabled and (self._crossseed_enabled or self._seedgroup_enabled):
+        if self._enabled and self._seedgroup_enabled:
             # 保存后自动检测一次连通性（后台线程，不卡保存）；结果显示在插件页。
             import threading
             threading.Thread(target=self.run_tests, daemon=True).start()
@@ -1396,33 +1360,17 @@ class ColaSeedGroup(_PluginBase):
     def _persist(self) -> None:
         self.update_config({
             "enabled": self._enabled,
-            "crossseed_enabled": self._crossseed_enabled,
             "notify": self._notify,
-            "cron": self._cron,
             "username": self._username,
             "password": self._password,
             "otp_code": self._otp_code,
             "captcha_code": "",
             "session_token": self._session_token,
-            "skip_check": self._skip_check,
-            "max_per_hour": self._max_per_hour,
-            "max_per_site": self._max_per_site,
-            "direction": self._direction,
             "use_mp_clients": self._use_mp_clients,
             "clients_json": self._clients_json,
-            "clients_lines": self._clients_lines,
-            "sites_json": self._sites_json,
-            "sites_lines": self._sites_lines,
-            "iyuu_json": self._iyuu_json,
-            "iyuu_json_file": self._iyuu_json_file,
-            "iyuu_token": self._iyuu_token,
-            "sites_mode": self._sites_mode,
             "add_label": self._add_label,
-            "target_client": self._target_client,
             "inherit_tags": self._inherit_tags,
             "extra_tags": self._extra_tags,
-            "fallback_skip_check": self._fallback_skip_check,
-            "retry_failed": self._retry_failed,
             "limit_dl_kib": self._limit_dl_kib,
             "limit_up_kib": self._limit_up_kib,
             "limit_lines": self._limit_lines,
@@ -1503,7 +1451,7 @@ class ColaSeedGroup(_PluginBase):
             logger.warn("可乐PT 会话已失效，请重新登录")
             self._session_token = ""
             self._persist()
-            self.post_message(mtype=NotificationType.SiteMessage, title="【可乐PT辅种】需要重新登录",
+            self.post_message(mtype=NotificationType.SiteMessage, title="【可乐保种组】需要重新登录",
                               text="会话已失效：请打开插件页面获取新的验证码，在插件设置里填写后保存。")
             return None
         if rsp.status_code != 200:
@@ -1604,49 +1552,6 @@ class ColaSeedGroup(_PluginBase):
         if rsp is None or rsp.status_code != 200:
             return b""
         return rsp.content if _valid_torrent(rsp.content) else b""
-
-    def _site_lookup(self, site: Dict[str, Any], pieces_hash: str) -> Tuple[Optional[str], str]:
-        host = (site.get("url") or "").split("://", 1)[-1].split("/")[0].lower()
-        cached = self._pieces_paths.get(host, None)
-        if cached == "":
-            return None, "站点不支持 pieces-hash 接口"
-        paths = [cached] if cached else ["/api/pieces-hash", "/nexusapi/pieces-hash"]
-        last = ""
-        for path in paths:
-            url = (site.get("url") or "").rstrip("/") + path
-            try:
-                # Accept: application/json 是必须的：麒麟(hdkyl) 这类 Laravel 站在没有它时
-                # 会把未认证/异常请求 302 回首页，插件拿到的是一张 HTML 页而不是 JSON。
-                rsp = _site_request("POST", url, json={"passkey": site.get("passkey", ""), "pieces_hash": [pieces_hash]},
-                                    headers=_site_headers(site, accept="application/json"),
-                                    proxy=site.get("proxy") or "")
-            except Exception as err:
-                last = str(err)
-                continue
-            if rsp.status_code == 404 or rsp.status_code == 405:
-                last = f"HTTP {rsp.status_code}（无此接口）"
-                continue
-            if rsp.status_code != 200:
-                last = f"HTTP {rsp.status_code}"
-                continue
-            try:
-                data = ((rsp.json() or {}).get("data") or {})
-            except Exception:
-                last = "返回不是 JSON"
-                continue
-            if not isinstance(data, dict):
-                # 有的站点「没命中」时把 data 序列化成 []（PHP 的空数组），按空结果处理
-                if isinstance(data, list) and not data:
-                    data = {}
-                else:
-                    last = "返回格式不匹配"
-                    continue
-            self._pieces_paths[host] = path
-            return data.get(pieces_hash), ""
-        # 只有 404/405 才算“不支持”；超时/500 下次还会重试
-        if last.startswith("HTTP 404") or last.startswith("HTTP 405"):
-            self._pieces_paths[host] = ""
-        return None, last
     def _split_line(line: str) -> List[str]:
         return [p.strip() for p in re.split(r"[,，]", line.strip()) if p.strip()]
 
@@ -1783,75 +1688,6 @@ class ColaSeedGroup(_PluginBase):
                 "downhash": downhash,
             })
         return out
-    def iyuu_import(self, **kwargs) -> Dict[str, Any]:
-        """一键导入 IYUU 导出的站点 JSON（MP 插件 API：POST /ColaCrossSeed/sites/import）。
-
-        参数可以放在 `json` / `payload` / `sites` 任一键里，值是 IYUU 导出的**原始文本**
-        （数组或 {"sites":[...]}），也可以直接传对象。不传参数就重跑一次配置里已存的内容。
-        导入后立刻返回解析摘要；原本「只用手写行」的用户会被改成「IYUU + 手写行补充」，
-        手写的行不会被丢掉。
-        """
-        payload = kwargs.get("json") or kwargs.get("payload") or kwargs.get("sites") or ""
-        return self._iyuu_import(payload)
-    def iyuu_import_file(self, **kwargs) -> Dict[str, Any]:
-        """从**本地文件**导入 IYUU 配置（MP 插件 API：POST /ColaCrossSeed/sites/import-file）。
-
-        插件跑在容器里，路径是容器内路径；默认读 `/config/cola-sites.json`，
-        也就是宿主的 `<MP 配置目录>/cola-sites.json` —— 把文件丢进去、保存配置即生效。
-        """
-        path = str(kwargs.get("path") or self._iyuu_json_file or "/config/cola-sites.json").strip()
-        return self._iyuu_import_from_file(path)
-    def _other_sites(self) -> List[Dict[str, str]]:
-        """行文本为准，IYUU 导入补充（sites_mode=manual 时完全不看导入）。
-
-        每个站点在自己的那一行里单独配置：域名、passkey、sid、rsskey、channel、enabled。
-        IYUU 导入只用来补齐「你没写但 IYUU 认识」的站；同一个域名以行文本为准。
-        """
-        mode = self._sites_mode or "merge"
-        line_sites = [] if mode == "iyuu_only" else self._line_sites()
-        iyuu_sites = [] if mode == "manual" else self._iyuu_sites()
-        # 行文本优先；同一个域名下，行里没写的 passkey / sid / rsskey 从 IYUU 导入里补齐 ——
-        # 这样「观众只写 passkey + rsskey」也能顺带拿到 IYUU 的 sid，两套通道同时可用。
-        by_host: Dict[str, Dict[str, str]] = {}
-        order: List[str] = []
-        for site in line_sites + iyuu_sites:
-            host = site["url"].split("://", 1)[-1].split("/")[0].lower()
-            if not host:
-                continue
-            existing = by_host.get(host)
-            if existing is None:
-                by_host[host] = dict(site)
-                order.append(host)
-                continue
-            for field in ("passkey", "sid", "rsskey", "uid", "downhash", "cookie",
-                          "download_page", "x_api_key", "rss_url", "proxy",
-                          "max_per_site", "interval"):
-                if not existing.get(field) and site.get(field):
-                    existing[field] = site[field]
-        sites: List[Dict[str, str]] = []
-        for host in order:
-            site = by_host[host]
-            if site.get("enabled") is False:
-                continue
-            if not site.get("passkey"):
-                logger.warn(f"站点 {host} 没有 passkey，已跳过")
-                continue
-            # IYUU 的「辅种数量」是每站上限：记下来给 _site_budget_left 用
-            try:
-                per_site = int(site.get("max_per_site") or 0)
-            except Exception:
-                per_site = 0
-            if 0 < per_site <= 200:
-                self._site_limits[site.get("url") or host] = per_site
-            gap = _as_float(site.get("interval"))
-            if gap:
-                self._site_intervals[site.get("url") or host] = min(gap, 30.0)
-            sites.append(site)
-        return sites
-
-    # ---------------- 下载器 ----------------
-
-    @staticmethod
     def _is_seeding(state: str) -> bool:
         """这个状态算不算「正在做种」。qB 用 uploading/stalledUP/forcedUP…，TR 这里统一映射成 uploading。"""
         text = str(state or "").strip().lower()
@@ -2283,119 +2119,6 @@ class ColaSeedGroup(_PluginBase):
     PENDING_LIMIT = 40
     def _save_pending(self, items: List[Dict[str, Any]]) -> None:
         self.save_data("pending", items[-self.PENDING_LIMIT:])
-
-    def _queue_failure(self, client_name: str, key: str, torrent: bytes, save_path: str, label: str) -> None:
-        if not self._retry_failed:
-            return
-        items = self._pending()
-        if any(x.get("key") == key for x in items):
-            return
-        items.append({"key": key, "client": client_name,
-                      "data": base64.b64encode(torrent).decode(),
-                      "save_path": save_path, "label": label})
-        self._save_pending(items)
-
-    def _place(self, client: _Client, data: bytes, torrent: Dict[str, Any], key: str,
-               stats: Dict[str, int], bucket: str, hash_hint: str = "", site_key: str = "") -> None:
-        """把一颗种子放进客户端：成功 / 重复 / 失败降级 / 进失败队列，都在这里决定。
-
-        交叉做种最常见的失败是「文件不完全一致」（多一个 nfo、少一条音轨）：校验态下客户端会
-        校验失败并把种子停住，所以失败时按「跳过校验」再试一次（可关）。真的失败就进队列，
-        下一轮先重试它们，而不是等下一次全量扫描再撞一遍。
-        """
-        save_path = torrent.get("save_path", "")
-        # 标签：合并「原种子已有标签（可关）」+「用户额外指定」+ 原来那个分类/自定义标签，
-        # qB 的 tags 字段接受逗号分隔的多个值。
-        tags: List[str] = []
-        if self._inherit_tags:
-            tags += [t.strip() for t in str(torrent.get("tags") or "").split(",")
-                     if t.strip() and t.strip() != MANDATORY_TAG]
-        tags += [t.strip() for t in str(self._extra_tags or "").split(",") if t.strip()]
-        # 用户显式填的「辅种标签」才是标签；原种子的分类走 category 字段，不进 tags。
-        if self._add_label and self._add_label != MANDATORY_TAG:
-            tags.append(self._add_label)
-        label = ",".join(dict.fromkeys(tags))
-        category = str(torrent.get("category") or "").strip()
-        auto_tmm = bool(torrent.get("auto_tmm"))
-        if site_key and self._site_budget_left(site_key) <= 0:
-            stats["skipped"] = stats.get("skipped", 0) + 1
-            return  # 这个站这一轮已经补满 max_per_site 颗
-        if hash_hint and client.has(hash_hint):
-            # 客户端里已经有这颗：qB 一定会回 Fails.，别浪费一次上传，直接记重复
-            stats["duplicate"] = stats.get("duplicate", 0) + 1
-            self._remember(key)
-            return
-        remembered = self._take_tags(hash_hint) if hash_hint else ""
-        result = client.add(data, save_path, self._skip_check, label, hash_hint,
-                            category=category, auto_tmm=auto_tmm)
-        # 站点自己声明的间隔（IYUU 的「辅种间隔」）：只加两颗之间等，别的什么都不影响
-        gap = self._site_intervals.get(site_key) if site_key else 0.0
-        if gap:
-            time.sleep(min(float(gap), 30.0))
-        if remembered and result in ("ok", "dup"):
-            # 先把种子放回去，再把删之前记下的标签补上（addTags 只追加不覆盖）
-            if client.add_tags(hash_hint, remembered):
-                logger.info(f"{hash_hint[:8]} 重新补种后已恢复原标签：{remembered}")
-        if result == "ok":
-            stats[bucket] += 1
-            self._record_add()
-            self._remember(key)
-            if site_key:
-                self._site_counter[site_key] = self._site_counter.get(site_key, 0) + 1
-            return
-        if result == "dup":
-            stats["duplicate"] = stats.get("duplicate", 0) + 1
-            self._remember(key)
-            # 重复说明客户端里本来就有这颗种子，之前记过的失败可以撤掉
-            self._save_pending([x for x in self._pending() if x.get("key") != key])
-            return
-        if not self._skip_check and self._fallback_skip_check:
-            retry = client.add(data, save_path, True, label, hash_hint)
-            if retry == "ok":
-                logger.info(f"校验未通过，已按「跳过校验」重试成功：{key}")
-                stats[bucket] += 1
-                stats["retried"] = stats.get("retried", 0) + 1
-                self._record_add()
-                self._remember(key)
-                if site_key:
-                    self._site_counter[site_key] = self._site_counter.get(site_key, 0) + 1
-                return
-            if retry == "dup":
-                stats["duplicate"] = stats.get("duplicate", 0) + 1
-                self._remember(key)
-                return
-        stats["failed"] += 1
-        self._queue_failure(client.name, key, data, save_path, label)
-
-    def _retry_pending(self, clients: Dict[str, _Client], done: set, stats: Dict[str, int]) -> None:
-        """先重试上一轮失败的种子（最多 max_per_hour 个，占当轮预算）。"""
-        pending = self._pending()
-        if not pending or not clients:
-            return
-        left = []
-        for item in pending:
-            if self._event.is_set() or self._budget_left() <= 0:
-                left.append(item)
-                continue
-            client = clients.get(item.get("client") or "")
-            if client is None:
-                continue  # 下载器已被删掉，这条失败记录没有意义
-            key = item.get("key") or ""
-            if key in done:
-                continue
-            try:
-                data = base64.b64decode(item.get("data") or "")
-            except Exception:
-                continue
-            torrent = {"save_path": item.get("save_path") or "", "category": item.get("label") or ""}
-            before = stats["added"] + stats["filled"]
-            self._place(client, data, torrent, key, stats, "filled")
-            if stats["added"] + stats["filled"] > before:
-                done.add(key)
-            else:
-                left.append(item)
-        self._save_pending(left)
-
     def _add_times(self) -> List[float]:
         times = self.get_data("add_times") or []
         cutoff = time.time() - 3600
@@ -2447,44 +2170,6 @@ class ColaSeedGroup(_PluginBase):
 
     # 自愈删除时把种子原有的标签记下来：重新补种时原样加回去（issue #11）。
     TAG_MEMORY_LIMIT = 800
-
-    def _tag_memory(self) -> Dict[str, str]:
-        try:
-            data = self.get_data("tag_memory") or {}
-            return {str(k).lower(): str(v) for k, v in data.items() if k and v} if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
-    def _remember_tags(self, mapping: Dict[str, str]) -> None:
-        if not mapping:
-            return
-        memory = self._tag_memory()
-        for info_hash, tags in mapping.items():
-            extra = [t.strip() for t in str(tags or "").split(",")
-                     if t.strip() and t.strip() != MANDATORY_TAG]
-            if not extra:
-                continue
-            merged = [t for t in (memory.get(str(info_hash).lower(), "").split(",") if memory.get(str(info_hash).lower()) else []) if t]
-            for tag in extra:
-                if tag not in merged:
-                    merged.append(tag)
-            memory[str(info_hash).lower()] = ",".join(merged)
-        if len(memory) > self.TAG_MEMORY_LIMIT:
-            keep = list(memory.items())[-self.TAG_MEMORY_LIMIT:]
-            memory = dict(keep)
-        self.save_data("tag_memory", memory)
-
-    def _take_tags(self, info_hash: str) -> str:
-        """取出这颗种子被删前记下的标签（取走即删，避免无限增长）。"""
-        info_hash = str(info_hash or "").lower()
-        if not info_hash:
-            return ""
-        memory = self._tag_memory()
-        tags = memory.pop(info_hash, "")
-        if tags:
-            self.save_data("tag_memory", memory)
-        return tags
-
     def _dead_hashes(self) -> List[str]:
         """文件确实缺失、被自愈清掉的 hash：这些不再重试，避免每小时加了又删。"""
         try:
@@ -2670,40 +2355,6 @@ class ColaSeedGroup(_PluginBase):
             if url and pattern.search(url):
                 return url
         return ""
-
-    def _download_mteam(self, site: Dict[str, str], torrent_id: str) -> bytes:
-        """M-Team：genDlToken 换签名地址 → 该地址会 302 到 CDN（fr1.halomt.com）→ 才拿到种子。
-
-        实测（2026-11-01）：
-          · 必须带浏览器 UA，脚本 UA 会被 302 到 google；
-          · 签名地址自己也是 302，必须跟随重定向（curl 要 -L，requests 默认跟随）；
-          · 重定向到 CDN 后要 Accept: application/x-bittorrent，否则可能回一整页 HTML（约 47KB）。
-        """
-        api_key = site.get("x_api_key") or ""
-        if not api_key:
-            return b""
-        base = (site.get("url") or "").rstrip("/")
-        headers = {"x-api-key": api_key, "Accept": "application/json",
-                   "Content-Type": "application/x-www-form-urlencoded", "User-Agent": UA}
-        dl_headers = {"User-Agent": UA, "Accept": "application/x-bittorrent, */*",
-                      "Referer": base + "/"}
-        for attempt in range(2):
-            rsp = _site_request("POST", f"{base}/api/torrent/genDlToken", data={"id": torrent_id},
-                                headers=headers, proxy=site.get("proxy") or "")
-            try:
-                body = rsp.json() if rsp.status_code == 200 else {}
-            except Exception:
-                body = {}
-            if str(body.get("code")) != "0" or not body.get("data"):
-                logger.warn(f"M-Team 换取下载地址返回：{body.get('message') or rsp.status_code}")
-                return b""
-            torrent = _site_request("GET", str(body["data"]), headers=dl_headers,
-                                    proxy=site.get("proxy") or "")
-            if torrent.status_code == 200 and _valid_torrent(torrent.content):
-                return torrent.content
-            logger.warn(f"M-Team 下载种子第 {attempt + 1} 次失败：HTTP {torrent.status_code} "
-                        f"{len(torrent.content)} 字节（换新 token 重试）")
-        return b""
     def _test_clients(self) -> List[str]:
         lines: List[str] = []
         for client in self._clients():
@@ -2757,92 +2408,12 @@ class ColaSeedGroup(_PluginBase):
             return True, f"pieces-hash 可用（{path}）"
         self._pieces_paths[host] = ""
         return False, last
-
-    def _test_one_site(self, site: Dict[str, str]) -> Tuple[str, str, str]:
-        """一个站到底能用哪条通道：pieces-hash / RSS / IYUU 逐条实测，报实测结果。
-
-        以前这里只认 rsskey 字段，没填就回「这个站目前没法匹配」；实际 2026-11-02 全站复测：
-        26 个站里只有观众有 rsskey，另外 11 个站用 passkey 就能读到 RSS（10~100 条全是 40 位
-        info_hash）。于是能用 RSS 的站被全部报成 ❌。现在按通道实测，并给出条数。
-        """
-        name = site["name"]
-        host = site["url"].split("://", 1)[-1].split("/")[0].lower()
-        if "m-team" in host:
-            if site.get("x_api_key"):
-                return name, "ok", "M-Team：IYUU 匹配 + x-api-key 下载（不走 pieces-hash）"
-            return name, "fail", "M-Team：缺少 x_api_key（IYUU 导出里应该有）"
-        channel = (site.get("channel") or "auto").lower()
-        good: List[str] = []
-        bad: List[str] = []
-        pieces_ok = False
-        if channel in ("auto", "pieces"):
-            pieces_ok, note = self._probe_pieces(site)
-            (good if pieces_ok else bad).append(note)
-        rss_n = 0
-        if channel in ("auto", "rss") and not pieces_ok:
-            rss_n, note = self._probe_rss(site)
-            (good if rss_n else bad).append(note)
-        if not pieces_ok and not rss_n and channel != "pieces":
-            # RSS 这会儿不可用（限流/没密钥）时再看一眼 pieces-hash：
-            # 很多站「channel 写的是 rss」其实也有 pieces-hash，别让它显示成没通道
-            pieces_ok, note = self._probe_pieces(site)
-            if pieces_ok:
-                good.append(note)
-        iyuu_ok = bool(site.get("sid")) and bool(self._iyuu_token)
-        if iyuu_ok:
-            good.insert(0, f"IYUU 匹配（sid={site['sid']}）")
-        elif site.get("sid"):
-            bad.append("没填 IYUU Token，sid 用不上")
-        if channel == "pieces" and pieces_ok:
-            return name, "ok", "；".join(good)
-        if channel == "rss" and rss_n:
-            return name, "ok", "；".join(good)
-        if channel == "iyuu" and iyuu_ok:
-            return name, "ok", "；".join(good)
-        if pieces_ok or rss_n:
-            return name, "ok", "；".join(good)
-        if iyuu_ok:
-            # 只剩 IYUU：通道在，但没有哪颗种子能证明命中，标黄而不是绿
-            return name, "warn", "；".join(good + bad)
-        return name, "fail", "；".join(bad) or "没有可用通道"
-
     def _rss_note(self, site: Dict[str, str]) -> str:
         host = (site.get("url") or "").split("://", 1)[-1].split("/")[0].lower()
         note = (self.get_data("rss_notes") or {}).get(host)
         if note:
             return str(note)
         return str(((self.get_data("rss_cache") or {}).get(host) or {}).get("note") or "")
-
-    def _probe_rss(self, site: Dict[str, str]) -> Tuple[int, str]:
-        """检查 RSS 通道，走 10 分钟缓存。
-
-        不能每次点「测试」都去真拉：观众/彩虹岛 这类站明说「请求间隔至少 2 分钟」，
-        连点两次测试就会被限流，反而把好站报成失败。
-        """
-        items = self._rss_index(site)
-        note = self._rss_note(site)
-        if items:
-            return len(items), f"RSS 可匹配 {len(items)} 条（{note}）"
-        return 0, note or "RSS 没有条目"
-
-    def _test_sites(self) -> List[str]:
-        sites = self._other_sites()
-        if not sites:
-            return ["ℹ️ 没有配置其他站（可粘贴 IYUU 配置或填「域名,passkey」）"]
-        lines: List[str] = []
-        # 以前用线程池并发探测；现在一律顺序跑 —— 见 auto_seed 里 RSS 索引那段的说明：
-        # 在解释器层面，多线程里做网络/第三方 C 扩展会放大崩溃面，宁可慢一点。
-        for site in sites:
-            name, level, msg = self._test_one_site(site)
-            mark = {"ok": "✅", "warn": "⚠️"}.get(level, "❌")
-            lines.append(f"{mark} {name}：{msg}")
-        good = sum(1 for line in lines if line.startswith("✅"))
-        warn = sum(1 for line in lines if line.startswith("⚠️"))
-        lines.insert(0, f"其他站 {len(sites)} 个，可匹配 {good} 个"
-                        f"{f'，仅 IYUU 匹配 {warn} 个' if warn else ''}，"
-                        f"不可用 {len(sites) - good - warn} 个")
-        return lines
-
     def _test_cola(self) -> str:
         if not self._session_token:
             return "❌ 可乐PT：未登录（打开插件页取验证码填一次）"
@@ -2857,64 +2428,18 @@ class ColaSeedGroup(_PluginBase):
         if rsp.status_code == 401:
             return "❌ 可乐PT：会话过期，需要重新登录"
         return f"❌ 可乐PT：HTTP {rsp.status_code}"
-
-    def _test_iyuu(self) -> str:
-        if not self._iyuu_token:
-            return "ℹ️ IYUU Token：未配置（可选；配置后用 IYUU 云端匹配，能覆盖没有 pieces-hash 的站）"
-        sid_map = self._iyuu_sid_map()
-        if not sid_map:
-            return "❌ IYUU Token：已填，但导入的站点没有 sid（请粘贴 IYUU 站点 JSON）"
-        sid_sha1 = self._iyuu_sid_sha1(sorted(sid_map))
-        if sid_sha1:
-            return f"✅ IYUU Token：有效（{len(sid_map)} 个站点已汇报）"
-        if getattr(self, "_iyuu_rate_limited", False):
-            return "⚠️ IYUU Token：已填，但云端限流（访问频率过快），稍后再试"
-        return "❌ IYUU Token：无效或云端拒绝（检查 token）"
-
     def run_tests(self, persist: bool = True) -> Dict[str, Any]:
+        """连通性检测：只测可乐账号与下载器（辅种站点不在这个插件里）。"""
         report = {
             "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "cola": self._test_cola(),
-            "iyuu": self._test_iyuu(),
             "clients": self._test_clients(),
-            "sites": self._test_sites(),
         }
         self._test_report = report
         if persist:
             self.save_data("test_report", report)
-        logger.info(f"连通性检测：{report['cola']}；{report['clients']}；"
-                    f"{report['sites'][0] if report['sites'] else ''}")
+        logger.info(f"连通性检测：{report['cola']}；{report['clients']}")
         return report
-    def _finish(self, stats: Dict[str, int]) -> None:
-        self.save_data("last_run", {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), **stats})
-        logger.info(f"可乐PT 辅种完成：{stats}")
-        if stats.get("already"):
-            logger.info(f"其中 {stats['already']} 个在客户端里已经有了（同一 info_hash），直接跳过")
-        if stats.get("trackers"):
-            logger.info(f"另有 {stats['trackers']} 个同 info_hash 的种子补上了新站 announce（不占空间）")
-        if self._notify and (stats["added"] or stats["filled"] or stats["failed"]):
-            self.post_message(
-                mtype=NotificationType.SiteMessage,
-                title="【可乐PT辅种】任务完成",
-                text=(f"匹配：{stats['matched']}\n可乐补种：{stats['added']}\n其他站补种：{stats['filled']}\n"
-                      + (f"补 tracker：{stats['trackers']}\n" if stats.get("trackers") else "")
-                      + f"重复跳过：{stats.get('duplicate', 0)}\n校验失败后降级成功：{stats.get('retried', 0)}\n"
-                      + f"跳过：{stats['skipped']}\n失败：{stats['failed']}"
-                      + (f"\n客户端已有：{stats['already']}" if stats.get("already") else "")
-                      + (f"\n待下一轮重试：{len(self._pending())} 个" if self._pending() else "")),
-            )
-
-    # ---------------- 可乐保种组 ----------------
-    #
-    # 与辅种是两条独立的腿：辅种是「客户端里已有 → 反向找可乐的种子」；
-    # 保种组是「站点官方资源池 → 按档位搬进客户端」，体积只能超、不能少。
-    # 解锁资格只认站点现成的东西：账号密码登录后读本人资料里的工作组头衔
-    # （GET /api/v1/me → GET /api/v1/users/{id}/profile 的 groups），
-    # 没有工作组头衔的账号插件直接拒绝解锁，保存配置时还会把开关强制关掉。
-
-    UNLOCK_TTL = 86400          # 工作组资格校验结果的缓存时长（秒）
-    SG_MAX_PAGES = 50
-    SG_BROWSE_PAGE_SIZE = 50
 
     def _sg_clients(self) -> List[_Client]:
         """保种组的下载器。
@@ -3510,7 +3035,7 @@ class ColaSeedGroup(_PluginBase):
             logger.error(f"保种组任务异常终止：{type(err).__name__}: {err}")
             try:
                 self.post_message(mtype=NotificationType.Plugin,
-                                  title="【可乐PT辅种】保种组执行异常",
+                                  title="【可乐保种组】保种组执行异常",
                                   text=f"{type(err).__name__}: {err}\n下一轮会重新开始，详细栈见 MoviePilot 日志。")
             except Exception:
                 pass
@@ -3728,7 +3253,7 @@ class ColaSeedGroup(_PluginBase):
         if self._notify and (added or failed):
             self.post_message(
                 mtype=NotificationType.SiteMessage,
-                title="【可乐PT辅种】保种组同步",
+                title="【可乐保种组】保种组同步",
                 text=(f"档位：{SEED_GROUP_TIER_LABELS.get(tier, tier)}\n"
                       f"目标：{target} GiB / 现有：{current_gib} GiB\n"
                       f"本轮新增：{added} 条（+{round(added_gib, 1)} GiB，重复 {duplicate}，失败 {failed}）\n"
@@ -3759,6 +3284,7 @@ class ColaSeedGroup(_PluginBase):
     # ---------------- 插件页面 / API / 表单 ----------------
 
     def get_page(self) -> Optional[List[dict]]:
+        """插件页：只有保种组面板（辅种已经在另一个插件里）。"""
         if not self._session_token:
             captcha_id, image = self._fetch_captcha()
             if not image:
@@ -3773,61 +3299,14 @@ class ColaSeedGroup(_PluginBase):
                 {"component": "VImg", "props": {"src": image, "max-width": 220, "class": "mt-3"}},
             ]
         last = self.get_data("last_run") or {}
-        report = self.get_data("test_report") or self._test_report or {}
-        pending = self._pending()
         blocks: List[dict] = [
-            # 版本写到页面上：用户在 issue 里反馈时，第一眼就能看到自己装的是哪一版
             {"component": "div", "text": f"插件版本 v{self.plugin_version}；已登录可乐PT。上次运行：{last.get('at', '未运行')}；"
-                                         f"可乐补种 {last.get('added', 0)}，其他站 {last.get('filled', 0)}，"
-                                         f"重复 {last.get('duplicate', 0)}，失败 {last.get('failed', 0)}；"
-                                         f"待重试 {len(pending)} 个。"}
+                                         f"本轮新增 {last.get('added', 0)} 条，重复 {last.get('duplicate', 0)}，"
+                                         f"失败 {last.get('failed', 0)}，覆盖 {last.get('covered_gib', 0)} GiB。"}
         ]
-        # ---- 可乐保种组面板：导航区第一块，档位与缺口一眼可见 ----
         blocks.insert(0, self._seedgroup_panel())
-        sites = self._other_sites()
-        # IYUU 一键导入的账目：粘一次 JSON 之后，这里就是「到底生效了哪些」的唯一凭据
-        iyuu_imported = [] if (self._sites_mode or "merge") == "manual" else self._iyuu_sites()
-        if iyuu_imported:
-            uid_n = sum(1 for x in iyuu_imported if x.get("uid"))
-            hash_n = sum(1 for x in iyuu_imported if x.get("downhash"))
-            cookie_n = sum(1 for x in iyuu_imported if x.get("cookie"))
-            blocks.append({
-                "component": "div",
-                "text": (f"IYUU 导入：{len(iyuu_imported)} 个启用站点"
-                         f"（带 uid {uid_n} / downhash {hash_n} / Cookie {cookie_n}；"
-                         f"站点来源 {self._sites_mode or 'merge'}）"),
-                "props": {"style": "white-space: pre-wrap; line-height: 1.7"},
-            })
-        if sites:
-            per = (last.get("by_site") or {}) if isinstance(last, dict) else {}
-            rows = []
-            for site in sites[:40]:
-                name = site.get("name") or site.get("url")
-                chans = []
-                if site.get("sid"):
-                    chans.append("IYUU")
-                if site.get("rsskey"):
-                    chans.append("RSS")
-                chans.append("pieces-hash")
-                forced = site.get("channel") or "auto"
-                hit = per.get(name) or per.get(site.get("url")) or {}
-                rows.append(f"· {name}（{'/'.join(chans)}，{forced}）"
-                            + (f" → 上次补种 {hit.get('added', 0)}" if hit else ""))
-            blocks.append({"component": "div", "text": f"站点清单（{len(sites)} 个）：\n" + "\n".join(rows),
-                           "props": {"style": "white-space: pre-wrap; line-height: 1.7"}})
-        if pending:
-            names = "\n".join(f"· {x.get('client', '?')} → {x.get('key', '')}" for x in pending[-8:])
-            blocks.append({"component": "div", "text": f"下一轮会先重试这些（最多 8 条）：\n{names}",
-                           "props": {"style": "white-space: pre-wrap; line-height: 1.7"}})
-        if report:
-            lines = [f"检测时间 {report.get('at', '')}", report.get("cola", ""), report.get("iyuu", "")]
-            lines += report.get("clients") or []
-            lines += report.get("sites") or []
-            blocks.append({"component": "div", "text": "\n".join([x for x in lines if x]),
-                           "props": {"style": "white-space: pre-wrap; line-height: 1.8"}})
-        else:
-            blocks.append({"component": "div", "text": "保存一次配置会自动做连通性检测，结果显示在这里。"})
         return blocks
+
 
     # 站点验证码 10 分钟内有效；插件缓存 5 分钟 —— 否则每次打开/刷新插件页都会换一张，
     # 用户看到的那张立刻作废（「第一次看不清，再刷就不出来了」就是这个）。
@@ -3941,12 +3420,9 @@ class ColaSeedGroup(_PluginBase):
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件（总开关）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                            {"component": "VSwitch", "props": {"model": "crossseed_enabled",
-                             "label": "启用辅种（功能一）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VSwitch", "props": {"model": "seedgroup_enabled",
-                             "label": "启用保种组（功能二）"}}]},
+                             "label": "启用保种组"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VSwitch", "props": {"model": "notify", "label": "任务结果通知"}}]},
                     ]},
@@ -3982,100 +3458,9 @@ class ColaSeedGroup(_PluginBase):
                                        "勾「使用 MoviePilot 已配置下载器」就用 MP 里的那几台；"
                                        "否则在下面按行填地址与账号。"),
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "use_mp_clients",
-                             "label": "使用 MP 已配置下载器"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "skip_check", "label": "辅种：跳过校验"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "target_client",
-                             "label": "辅种加到哪台（留空=自动）",
-                             "placeholder": "优先正在做种的那台"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VTextarea", "props": {"model": "clients_lines", "rows": 3, "persistent-hint": True,
-                             "label": "辅种自定义下载器（每行一台）",
-                             "hint": "地址,用户名,密码；Transmission 写成 tr,地址,用户名,密码。会与上面的 MP 下载器一起使用（并集）",
-                             "placeholder": "192.168.1.100:8080,admin,密码\ntr,192.168.1.101:9091,admin,密码"}}]},
-                    ]},
-
-                    # ── ③ 站点来源 ──
-                    self._form_section("③ 站点来源（IYUU 一键导入）",
-                                       "把 IYUU 导出的站点 JSON 整个粘到下面「IYUU 站点 JSON」里保存即可生效，"
-                                       "不必再手写站点行；passkey / uid / downhash / Cookie 会一起带走。"),
-                    {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VSelect", "props": {"model": "sites_mode", "label": "站点来源", "items": [
-                                {"title": "只用 IYUU 导入（推荐：粘一次 JSON 就生效）", "value": "iyuu_only"},
-                                {"title": "IYUU 导入 + 手写行补充（默认）", "value": "merge"},
-                                {"title": "只用手写的行（不看 IYUU 导入）", "value": "manual"}]}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "iyuu_token",
-                             "label": "IYUU Token（可选，填了走云端匹配）", "placeholder": "IYUU..."}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "iyuu_json_file",
-                             "label": "IYUU 配置文件路径（容器内，填了就以文件为准）",
-                             "persistent-hint": True,
-                             "hint": "把导出的 JSON 放到宿主的 MP 配置目录下（容器内 /config/…），保存即导入",
-                             "placeholder": "/config/cola-sites.json"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VTextarea", "props": {"model": "iyuu_json", "rows": 5,
-                             "label": "IYUU 站点 JSON（把导出内容整个粘贴进来，保存即生效）",
-                             "placeholder": "[{\"site\":\"keepfrds\",\"nickname\":\"朋友\",\"base_url\":\"pt.keepfrds.com\",\"sid\":1,\"disabled\":0,\"options\":{\"passkey\":\"...\",\"uid\":\"...\"}}]"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VTextarea", "props": {"model": "sites_lines", "rows": 3,
-                             "label": "其他站（可选，手写补充）", "persistent-hint": True,
-                             "hint": "每行 域名,passkey；可带 sid= rsskey= channel= uid= downhash= cookie= proxy=",
-                             "placeholder": "https://pt.example.com,abcdef123456\n观众,https://audiences.me,passkey=...,rsskey=...,channel=rss"}}]},
-                    ]},
-
-                    # ── ④ 辅种行为 ──
-                    self._form_section("④ 辅种（功能一）",
-                                       "开关在页面最上面「启用辅种」；这里设的是它的运行间隔与行为。"
-                                       "控制辅多少、补到哪个方向、以及标签怎么带。"),
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "cron",
-                             "label": "辅种运行间隔（cron，5 段）", "persistent-hint": True,
-                             "hint": "例如 0 */1 * * * = 每小时；写错会静默按每小时跑",
-                             "placeholder": "0 */1 * * *"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSelect", "props": {"model": "direction", "label": "辅种方向", "items": [
-                                {"title": "双向", "value": "both"}, {"title": "只补可乐", "value": "cola_only"},
-                                {"title": "只补其他站", "value": "other_only"}]}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "max_per_hour",
-                             "label": "每小时上限（0 = 不限）", "type": "number"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "max_per_site",
-                             "label": "单个站点每轮上限", "type": "number", "min": 1, "persistent-hint": True,
-                             "hint": "默认 20；填非数字会连同「每小时上限」一起重置"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "add_label",
-                             "label": "辅种标签（可留空）", "placeholder": "cross-seed"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "extra_tags",
-                             "label": "额外标签（逗号分隔）", "placeholder": "可乐PT,辅种"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "inherit_tags", "label": "继承原种子标签"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "fallback_skip_check",
-                             "label": "校验失败降级为跳过校验重试"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "retry_failed", "label": "失败下轮先重试"}}]},
+                            {"component": "VSwitch", "props": {"model": "seedgroup_use_mp_clients",
+                             "label": "保种用 MP 已配置下载器"}}]},
                     ]},
 
                     # ── ⑤ 可乐保种组 ──
@@ -4187,7 +3572,7 @@ class ColaSeedGroup(_PluginBase):
                 ],
             }
         ], {
-            "enabled": False, "crossseed_enabled": True, "notify": True, "cron": "0 */1 * * *",
+            "enabled": False, "notify": True,
             "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
             "skip_check": False, "max_per_hour": 0, "max_per_site": 20, "direction": "both",
             "use_mp_clients": True, "clients_json": "", "clients_lines": "",
