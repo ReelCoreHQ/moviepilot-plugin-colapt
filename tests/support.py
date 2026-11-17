@@ -15,6 +15,8 @@ import types
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLUGIN_PATH = ROOT / "plugins.v2" / "colacrossseed" / "__init__.py"
+# 拆出来的保种插件（2026-11-17）：它有自己的入口，测试用同一个装载器
+SEEDGROUP_PLUGIN_PATH = ROOT / "plugins.v2" / "colaseedgroup" / "__init__.py"
 
 
 def _loadable(name: str) -> bool:
@@ -129,6 +131,19 @@ def _install_stubs() -> None:
         _module("apscheduler.triggers.cron", CronTrigger=_StubCronTrigger)
 
 
+def load_seedgroup_plugin():
+    """导入拆出来的「可乐保种组」插件（带桩）。"""
+    _install_stubs()
+    name = "colaseedgroup_under_test"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, SEEDGROUP_PLUGIN_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_plugin():
     """导入插件模块（带桩），返回 module。"""
     _install_stubs()
@@ -188,9 +203,14 @@ class FakeClient:
         return True
 
 
-def make_plugin(module, store=None, **attrs):
-    """绕过 _PluginBase.__init__ 造一个实例，插件数据换成内存字典。"""
-    plugin = object.__new__(module.ColaCrossSeed)
+def make_plugin(module, store=None, cls_name=None, **attrs):
+    """绕过 _PluginBase.__init__ 造一个实例，插件数据换成内存字典。
+
+    拆出「保种组」插件之后一个仓库里有两个类，所以按名字取（不传就自动找）。
+    """
+    cls = getattr(module, cls_name) if cls_name else (
+        getattr(module, "ColaCrossSeed", None) or getattr(module, "ColaSeedGroup"))
+    plugin = object.__new__(cls)
     plugin._store = {} if store is None else store
 
     def get_data(key, default=None):
