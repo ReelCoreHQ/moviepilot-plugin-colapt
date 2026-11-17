@@ -218,6 +218,22 @@ def _seed_group_size_gib(size: Any) -> float:
     return value if value < 1e5 else value / GIB
 
 
+def _sg_on_target(covered: Any, target: Any, tolerance: float = 0.005) -> bool:
+    """覆盖是否算「达标」——站点据此累计当月保种时长。
+
+    留 0.5%（最少 1 GiB）容差：covered 来自客户端 size 累加，target 来自站点 size_bytes/GIB，
+    两者天然差几个 MB；严格 >= 会让「其实已全保完」的账号一直报 0。
+    """
+    try:
+        c = float(covered or 0)
+        t = float(target or 0)
+    except (TypeError, ValueError):
+        return False
+    if c <= 0 or t <= 0:
+        return False
+    return c >= t - max(t * tolerance, 1.0)
+
+
 def seed_group_plan(items: List[Dict[str, Any]], target_gib: float) \
         -> Tuple[List[Dict[str, Any]], float, float]:
     """按档位挑种子：只超不少。
@@ -1552,6 +1568,7 @@ class ColaSeedGroup(_PluginBase):
         if rsp is None or rsp.status_code != 200:
             return b""
         return rsp.content if _valid_torrent(rsp.content) else b""
+    @staticmethod
     def _split_line(line: str) -> List[str]:
         return [p.strip() for p in re.split(r"[,，]", line.strip()) if p.strip()]
 
@@ -2000,8 +2017,7 @@ class ColaSeedGroup(_PluginBase):
             "covered_gib": state.get("covered_gib"),
             "shortfall_gib": state.get("shortfall_gib"),
             # 站点按这个字段累计「当月达标时长」：covered >= target 才算达标
-            "on_target": bool(state.get("covered_gib") or 0) and bool(state.get("target_gib") or 0)
-                         and float(state.get("covered_gib") or 0) >= float(state.get("target_gib") or 0),
+            "on_target": _sg_on_target(state.get("covered_gib"), state.get("target_gib")),
             # 客户端里这批种子最老的那颗已经做了多久（交叉验证「保种时长」不是编的）
             "seeded_secs": self._sg_oldest_seeded_secs(clients),
             "enforced": {"dl_kib": self._limit_dl_kib, "up_kib": self._limit_up_kib},
@@ -2853,6 +2869,10 @@ class ColaSeedGroup(_PluginBase):
                 blind += 1
         return hashes, round(total, 3), blind
 
+    UNLOCK_TTL = 86400          # 工作组资格校验结果的缓存时长（秒）
+    SG_MAX_PAGES = 50
+    SG_BROWSE_PAGE_SIZE = 50
+    SG_MACHINE_PAGE_SIZE = 100
     SG_DOWNLOAD_GAP = 0.7        # 每颗之间停一下：站点下载限流 120 次/分，一颗要 2 个请求
     SG_SKIP_TTL = 7 * 86400      # 「加不进去」的种子记 7 天，别再每轮白下载一遍
 
@@ -3033,6 +3053,17 @@ class ColaSeedGroup(_PluginBase):
             self._seed_group_sync()
         except Exception as err:
             logger.error(f"保种组任务异常终止：{type(err).__name__}: {err}")
+            # 每轮必上报：站点只在 on_target=1 的相邻区间计时，漏报那段时间白丢
+            try:
+                self._maybe_report(self._sg_clients(), {
+                    "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "tier": seed_group_tier_key(self._seedgroup_tier),
+                    "target_gib": 0.0, "current_gib": 0.0, "covered_gib": 0.0,
+                    "shortfall_gib": 0.0, "activated": False, "unlocked": False,
+                    "reason": f"{type(err).__name__}: {err}"[:200],
+                })
+            except Exception as report_err:
+                logger.warn(f"保种组异常上报也失败了：{report_err}")
             try:
                 self.post_message(mtype=NotificationType.Plugin,
                                   title="【可乐保种组】保种组执行异常",

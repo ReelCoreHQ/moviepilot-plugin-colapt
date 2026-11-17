@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import support  # noqa: E402
 
 mod = support.load_plugin()
+SG_MOD = support.load_seedgroup_plugin()  # 保种组插件（2026-11-17 拆分后单独加载）
+SG = None  # 保种测试单独加载，见 load_seedgroup_plugin()
 
 RSS_OK = """<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0"><channel><title>demo</title>
@@ -739,7 +741,7 @@ class InitOrderTest(unittest.TestCase):
                 "username": "yg", "roles": ["member"], "groups": ["工作组-保种"]}
 
     def _plugin(self):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         plugin._session_token = "tok"
         plugin.update_config = lambda cfg: None
         plugin.run_tests = lambda persist=True: None
@@ -748,11 +750,11 @@ class InitOrderTest(unittest.TestCase):
     def test_limits_survive_unlock_failure(self):
         plugin = self._plugin()
         plugin.seed_group_identity = lambda: self._ident(ok=False, staff=False, reason="站点 502")
-        plugin.init_plugin({"enabled": True, "max_per_hour": 50, "max_per_site": 30,
+        plugin.init_plugin({"enabled": True, "limit_dl_kib": 500, "limit_up_kib": 300,
                             "seedgroup_enabled": True})
-        # 解锁校验失败不能把限速写成类属性默认值（0 = 不限）
-        self.assertEqual(plugin._max_per_hour, 50)
-        self.assertEqual(plugin._max_per_site, 30)
+        # 解锁校验失败不能把保种限速写成类属性默认值（0 = 不限）
+        self.assertEqual(plugin._limit_dl_kib, 500)
+        self.assertEqual(plugin._limit_up_kib, 300)
 
     def test_network_failure_keeps_switch(self):
         plugin = self._plugin()
@@ -765,10 +767,10 @@ class InitOrderTest(unittest.TestCase):
         written = {}
         plugin.update_config = lambda cfg: written.update(cfg)
         plugin.seed_group_identity = lambda: self._ident(ok=True, staff=False, reason="不在工作组")
-        plugin.init_plugin({"enabled": True, "seedgroup_enabled": True, "max_per_hour": 40})
+        plugin.init_plugin({"enabled": True, "seedgroup_enabled": True, "limit_dl_kib": 40})
         self.assertFalse(plugin._seedgroup_enabled)
         self.assertFalse(written.get("seedgroup_enabled"))
-        self.assertEqual(written.get("max_per_hour"), 40)
+        self.assertEqual(written.get("limit_dl_kib"), 40)
 
     def test_staff_keeps_switch_on(self):
         plugin = self._plugin()
@@ -779,7 +781,7 @@ class InitOrderTest(unittest.TestCase):
 
 class SeedGroupPaginationTest(unittest.TestCase):
     def _plugin(self):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         plugin._seedgroup_enabled = True
         plugin._seedgroup_tier = "10T"
         plugin._seedgroup_custom_gib = 2048
@@ -842,24 +844,24 @@ class OnTargetToleranceTest(unittest.TestCase):
     """达标判定要留容差：covered 与 target 天然差几 MB，严格 >= 会让保种时长永远 0。"""
 
     def test_exact_goal_counts(self):
-        self.assertTrue(mod._sg_on_target(1152.4, 1152.4))
+        self.assertTrue(SG_MOD._sg_on_target(1152.4, 1152.4))
 
     def test_slightly_under_still_counts(self):
-        self.assertTrue(mod._sg_on_target(1149.4, 1152.4))
+        self.assertTrue(SG_MOD._sg_on_target(1149.4, 1152.4))
 
     def test_clearly_short_does_not_count(self):
-        self.assertFalse(mod._sg_on_target(1132.4, 1152.4))
+        self.assertFalse(SG_MOD._sg_on_target(1132.4, 1152.4))
 
     def test_missing_values_do_not_count(self):
         for c, t in ((0, 1152), (None, 1152), (1152, 0), (1152, None)):
-            self.assertFalse(mod._sg_on_target(c, t))
+            self.assertFalse(SG_MOD._sg_on_target(c, t))
 
 
 class SeedGroupDownloadQuotaTest(unittest.TestCase):
     """进种限流（2026-11-16）：客户端「正在下载」达到上限就停止进种，低于就按剩余额度补。"""
 
     def _plugin(self, inflight, limit=5):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         plugin._session_token = "tok"
         plugin._seedgroup_enabled = True
         plugin._seedgroup_tier = "2T"
@@ -921,7 +923,7 @@ class SeedGroupDownloadQuotaTest(unittest.TestCase):
 
 class SeedGroupSyncRobustnessTest(unittest.TestCase):
     def _plugin(self):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         plugin._session_token = "tok"
         plugin._seedgroup_enabled = True
         plugin._seedgroup_tier = "2T"
@@ -946,9 +948,9 @@ class SeedGroupSyncRobustnessTest(unittest.TestCase):
         client = support.FakeClient(has_hash=[hash_])
         client.list_completed = lambda: [
             {"hash": hash_, "name": "x", "size": 1024 * mod.GIB,
-             "tags": mod.SEED_GROUP_TAG, "state": "uploading"}]
+             "tags": SG_MOD.SEED_GROUP_TAG, "state": "uploading"}]
         plugin._sg_clients = lambda: [client]
-        plugin._cola = lambda m, p, **k: mod._HttpResult(200, b"{}", "{}")
+        plugin._cola = lambda m, p, **k: SG_MOD._HttpResult(200, b"{}", "{}")
         plugin.seed_group_identity = lambda: {"ok": True, "staff": True, "reason": "", "uid": 7,
                                               "username": "yg", "roles": [], "groups": ["工作组-保种"]}
         plugin._sg_candidates = lambda: [{"torrent_id": 9, "size": 1500 * mod.GIB}]
@@ -1043,7 +1045,7 @@ class SeedGroupPruneTest(unittest.TestCase):
     HASH = "a" * 40
 
     def _plugin(self, status="approved", official=True, http=200):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         plugin._seedgroup_enabled = True
         plugin._seedgroup_tier = "2T"
         plugin._seedgroup_custom_gib = 2048
@@ -1061,11 +1063,11 @@ class SeedGroupPruneTest(unittest.TestCase):
         client = support.FakeClient()
         client.list_completed = lambda: [
             {"hash": self.HASH, "name": "x", "size": mod.GIB,
-             "tags": mod.SEED_GROUP_TAG, "state": "uploading"}]
+             "tags": SG_MOD.SEED_GROUP_TAG, "state": "uploading"}]
         plugin._sg_clients = lambda: [client]
         body = json.dumps({"id": 3, "status": status, "official": official,
                            "gate_phase": "confirmed"}).encode()
-        plugin._cola = lambda m, p, **k: mod._HttpResult(http, body, body.decode())
+        plugin._cola = lambda m, p, **k: SG_MOD._HttpResult(http, body, body.decode())
         plugin.save_data("seedgroup_items", {self.HASH: {"torrent_id": 3, "size_gib": 1}})
         return plugin, client
 
@@ -1316,7 +1318,7 @@ class PruneSafetyTest(unittest.TestCase):
     HASH = "b" * 40
 
     def _plugin(self, status="withdrawn", mode="seed", delete_ok=True):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         plugin._seedgroup_enabled = True
         plugin._seedgroup_prune_mode = mode
         plugin._seedgroup_prune = mode != "off"
@@ -1336,12 +1338,12 @@ class PruneSafetyTest(unittest.TestCase):
         client = support.FakeClient()
         client.list_completed = lambda: [
             {"hash": self.HASH, "name": "x", "size": mod.GIB,
-             "tags": mod.SEED_GROUP_TAG, "state": "uploading"}]
+             "tags": SG_MOD.SEED_GROUP_TAG, "state": "uploading"}]
         if not delete_ok:
             client.delete = lambda hashes, delete_files=False: False
         plugin._sg_clients = lambda: [client]
         body = json.dumps({"id": 3, "status": status, "official": True}).encode()
-        plugin._cola = lambda m, p, **k: mod._HttpResult(200, body, body.decode())
+        plugin._cola = lambda m, p, **k: SG_MOD._HttpResult(200, body, body.decode())
         plugin.save_data("seedgroup_items", {self.HASH: {"torrent_id": 3}})
         return plugin, client
 
@@ -1382,7 +1384,7 @@ class RotateTest(unittest.TestCase):
     """动态保种：达标后删「做种人数最多」的、补「最少」的，每次 N 颗。"""
 
     def _plugin(self, rotate=True, count=5):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         plugin._seedgroup_enabled = True
         plugin._seedgroup_rotate = rotate
         plugin._seedgroup_rotate_count = count
@@ -1414,8 +1416,8 @@ class RotateTest(unittest.TestCase):
         # 客户端里已有 A(seeders=900) B(seeders=400)；C(seeders=3)/D(seeders=1) 未保
         client = support.FakeClient()
         client.list_completed = lambda: [
-            {"hash": "a" * 40, "tags": mod.SEED_GROUP_TAG, "size": mod.GIB},
-            {"hash": "b" * 40, "tags": mod.SEED_GROUP_TAG, "size": mod.GIB},
+            {"hash": "a" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": mod.GIB},
+            {"hash": "b" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": mod.GIB},
         ]
         plugin.save_data("seedgroup_items", {
             "a" * 40: {"torrent_id": 1, "name": "A"},
@@ -1438,7 +1440,7 @@ class RotateTest(unittest.TestCase):
     def test_rotate_respects_count(self):
         plugin = self._plugin(count=1)
         client = support.FakeClient()
-        client.list_completed = lambda: [{"hash": "a" * 40, "tags": mod.SEED_GROUP_TAG, "size": mod.GIB}]
+        client.list_completed = lambda: [{"hash": "a" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": mod.GIB}]
         plugin.save_data("seedgroup_items", {"a" * 40: {"torrent_id": 1, "name": "A"}})
         pool = [{"torrent_id": 1, "info_hash": "a" * 40, "name": "A", "seeders": 50, "size": mod.GIB},
                 {"torrent_id": 2, "info_hash": "b" * 40, "name": "B", "seeders": 0, "size": mod.GIB}]
@@ -1450,7 +1452,7 @@ class RotateTest(unittest.TestCase):
     def test_rotate_skips_unknown_torrent(self):
         plugin = self._plugin()
         client = support.FakeClient()
-        client.list_completed = lambda: [{"hash": "z" * 40, "tags": mod.SEED_GROUP_TAG, "size": mod.GIB}]
+        client.list_completed = lambda: [{"hash": "z" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": mod.GIB}]
         plugin.save_data("seedgroup_items", {"z" * 40: {"torrent_id": 99, "name": "Z"}})
         out = plugin._sg_rotate([client], {}, [{"torrent_id": 1, "name": "A", "seeders": 1}])
         self.assertEqual(out["dropped"], 0)
@@ -1461,7 +1463,7 @@ class AllTierTest(unittest.TestCase):
     """「全站官种」档：目标按未过滤的池子算，跳过表不能让它缩水。"""
 
     def _plugin(self):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         plugin._session_token = "tok"
         plugin._seedgroup_enabled = True
         plugin._seedgroup_tier = "all"
@@ -1490,7 +1492,7 @@ class AllTierTest(unittest.TestCase):
         client = support.FakeClient()
         client.list_completed = lambda: []
         plugin._sg_clients = lambda: [client]
-        plugin._cola = lambda m, p, **k: mod._HttpResult(200, b"{}", "{}")
+        plugin._cola = lambda m, p, **k: SG_MOD._HttpResult(200, b"{}", "{}")
         plugin._sg_candidates = lambda: [
             {"torrent_id": 1, "info_hash": "a" * 40, "size": 100 * mod.GIB},
             {"torrent_id": 2, "info_hash": "c" * 40, "size": 50 * mod.GIB},
@@ -1511,14 +1513,14 @@ class AllTierTest(unittest.TestCase):
         plugin._session_token = ""
         plugin.init_plugin({"seedgroup_tier": "custom", "seedgroup_custom_gib": "1T"})
         self.assertEqual(plugin._seedgroup_custom_gib, 1024)
-        self.assertEqual(mod.seed_group_target_gib("custom", plugin._seedgroup_custom_gib), 1024)
+        self.assertEqual(SG_MOD.seed_group_target_gib("custom", plugin._seedgroup_custom_gib), 1024)
 
 
 class SpeedReportTest(unittest.TestCase):
     """限速情况上报：只统计开了保种组的用户。"""
 
     def _plugin(self, enabled=True, report=True):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         plugin._seedgroup_enabled = enabled
         plugin._seedgroup_report = report
         plugin._seedgroup_report_url = "http://23.81.118.186:18099/report"
@@ -1556,13 +1558,13 @@ class SpeedReportTest(unittest.TestCase):
         def fake_curl(method, url, **kwargs):
             captured["url"] = url
             captured["body"] = kwargs.get("json_body")
-            return mod._HttpResult(200, b"{}", "{}")
+            return SG_MOD._HttpResult(200, b"{}", "{}")
 
-        original, mod._curl = mod._curl, fake_curl
+        original, SG_MOD._curl = SG_MOD._curl, fake_curl
         try:
             out = plugin._report_seedgroup([Limited()], {"tier": "2T", "covered_gib": 100})
         finally:
-            mod._curl = original
+            SG_MOD._curl = original
         self.assertTrue(out["ok"])
         client = captured["body"]["clients"][0]
         self.assertEqual(client["client"], "198.72.127.68:8081")
@@ -1577,13 +1579,13 @@ class SpeedReportTest(unittest.TestCase):
         plugin = self._plugin()
 
         def fake_curl(method, url, **kwargs):
-            return mod._HttpResult(404, b"", "404 page not found")
+            return SG_MOD._HttpResult(404, b"", "404 page not found")
 
-        original, mod._curl = mod._curl, fake_curl
+        original, SG_MOD._curl = SG_MOD._curl, fake_curl
         try:
             out = plugin._report_seedgroup([support.FakeClient()], {})
         finally:
-            mod._curl = original
+            SG_MOD._curl = original
         self.assertFalse(out["ok"])
         self.assertIn("404", out["reason"])
         self.assertFalse(plugin.get_data("seedgroup_report_last")["ok"])
@@ -1598,13 +1600,13 @@ class SpeedReportTest(unittest.TestCase):
 
         def fake_curl(method, url, **kwargs):
             captured["body"] = kwargs.get("json_body")
-            return mod._HttpResult(200, b"", "")
+            return SG_MOD._HttpResult(200, b"", "")
 
-        original, mod._curl = mod._curl, fake_curl
+        original, SG_MOD._curl = SG_MOD._curl, fake_curl
         try:
             plugin._report_seedgroup([Blind()], {})
         finally:
-            mod._curl = original
+            SG_MOD._curl = original
         row = captured["body"]["clients"][0]
         self.assertFalse(row["readable"])
         self.assertEqual(row["dl_kib"], 0)      # 契约要整数：读不到记 0（= 不限），靠 readable 区分
@@ -1615,7 +1617,7 @@ class SeedGroupModeTest(unittest.TestCase):
     """档位/下载器来源/清理模式这三处「容易互相打架」的配置。"""
 
     def _plugin(self, **over):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         plugin.update_config = lambda cfg: None
         plugin.run_tests = lambda persist=True: None
         plugin._session_token = ""
@@ -1623,9 +1625,9 @@ class SeedGroupModeTest(unittest.TestCase):
         return plugin
 
     def test_all_tier_is_dynamic(self):
-        self.assertEqual(mod.seed_group_tier_key("all"), "all")
-        self.assertEqual(mod.seed_group_tier_key("SITE"), "all")
-        self.assertEqual(mod.seed_group_target_gib("all"), 0)
+        self.assertEqual(SG_MOD.seed_group_tier_key("all"), "all")
+        self.assertEqual(SG_MOD.seed_group_tier_key("SITE"), "all")
+        self.assertEqual(SG_MOD.seed_group_target_gib("all"), 0)
         self.assertIn("全站官种", mod.SEED_GROUP_TIER_LABELS["all"])
 
     def test_client_mode_explicit(self):
@@ -1650,7 +1652,7 @@ class SeedGroupModeTest(unittest.TestCase):
         self.assertEqual(plugin._seedgroup_prune_mode, "off")
 
     def test_form_has_no_scope_selector(self):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         form, _ = plugin.get_form()
         blob = json.dumps(form, ensure_ascii=False)
         self.assertNotIn('"model": "seedgroup_scope"', blob)
@@ -1699,23 +1701,30 @@ class FormLayoutTest(unittest.TestCase):
         components, models, titles = [], [], []
         self._walk(form, components, models, titles)
         ordered = [t for t in titles if t[:1] in "①②③④⑤"]
-        self.assertEqual(len(ordered), 6, ordered)   # ④-2 是限速接管
+        self.assertEqual(len(ordered), 4, ordered)   # ⑤ 保种组已搬到独立插件，这里只剩 ①..④
         self.assertTrue(ordered[0].startswith("①"))
         self.assertTrue(ordered[2].startswith("③"))
-        self.assertTrue(ordered[-1].startswith("⑤"))
+        self.assertTrue(ordered[-1].startswith("④"))
 
     def test_critical_models_present(self):
         plugin = support.make_plugin(mod)
         form, _ = plugin.get_form()
         components, models, titles = [], [], []
         self._walk(form, components, models, titles)
+        # 保种相关的东西（⑤ 区、seedgroup_* 字段）已搬到 ColaSeedGroup，这里只断言辅种侧
         for key in ("enabled", "username", "password", "captcha_code", "iyuu_json",
-                    "iyuu_json_file", "sites_mode", "seedgroup_prune_mode", "seedgroup_client_mode",
-                    "limit_dl_kib", "limit_up_kib", "limit_lines",
-                    "use_mp_clients", "clients_lines", "cron",
-                    "seedgroup_enabled", "seedgroup_tier", "seedgroup_custom_gib",
-                    "seedgroup_cron", "seedgroup_client_mode", "seedgroup_clients_lines",
-                    "seedgroup_rotate_count", "seedgroup_rotate_files"):
+                    "iyuu_json_file", "sites_mode",
+                    "use_mp_clients", "clients_lines", "cron"):
+            self.assertIn(key, models, key)
+
+    def test_seedgroup_models_live_in_the_new_plugin(self):
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+        form, _ = plugin.get_form()
+        components, models, titles = [], [], []
+        self._walk(form, components, models, titles)
+        for key in ("seedgroup_enabled", "seedgroup_tier", "seedgroup_custom_gib",
+                    "seedgroup_cron", "seedgroup_prune_mode", "seedgroup_client_mode",
+                    "seedgroup_clients_lines", "seedgroup_rotate_count", "seedgroup_rotate_files"):
             self.assertIn(key, models, key)
 
     def test_removed_fields_stay_out_of_ui(self):
@@ -1793,28 +1802,28 @@ class IyuuImportTest(unittest.TestCase):
 
 class SeedGroupTierTest(unittest.TestCase):
     def test_tiers_are_gib_floor(self):
-        self.assertEqual(mod.seed_group_target_gib("2T"), 2048)
-        self.assertEqual(mod.seed_group_target_gib("5T"), 5120)
-        self.assertEqual(mod.seed_group_target_gib("10T"), 10240)
-        self.assertEqual(mod.seed_group_target_gib("15T"), 15360)
-        self.assertEqual(mod.seed_group_target_gib("20T"), 20480)
+        self.assertEqual(SG_MOD.seed_group_target_gib("2T"), 2048)
+        self.assertEqual(SG_MOD.seed_group_target_gib("5T"), 5120)
+        self.assertEqual(SG_MOD.seed_group_target_gib("10T"), 10240)
+        self.assertEqual(SG_MOD.seed_group_target_gib("15T"), 15360)
+        self.assertEqual(SG_MOD.seed_group_target_gib("20T"), 20480)
 
     def test_old_20t_plus_alias(self):
         # 老配置写的 20T+ 就是现在的 20T（改名不改数值）
-        self.assertEqual(mod.seed_group_target_gib("20T+"), 20480)
-        self.assertEqual(mod.seed_group_tier_key("20T+"), "20T")
+        self.assertEqual(SG_MOD.seed_group_target_gib("20T+"), 20480)
+        self.assertEqual(SG_MOD.seed_group_tier_key("20T+"), "20T")
 
     def test_custom_tier_accepts_free_sizes(self):
         # 自定义档可以填 100M / 100G / 1T / 1P；只有 0 会被抬到 1 GiB
-        self.assertEqual(mod.seed_group_target_gib("custom", "100G"), 100)
-        self.assertEqual(mod.seed_group_target_gib("custom", "1T"), 1024)
-        self.assertEqual(mod.seed_group_target_gib("custom", "1P"), 1024 * 1024)
-        self.assertEqual(mod.seed_group_target_gib("custom", "2048"), 2048)
-        self.assertEqual(mod.seed_group_target_gib("custom", 2048), 2048)
-        self.assertEqual(mod.seed_group_target_gib("custom", "100M"), 1)
-        self.assertEqual(mod.seed_group_target_gib("custom", 0), 1)
-        self.assertEqual(mod.seed_group_target_gib("custom", None), 1)
-        self.assertEqual(mod.seed_group_target_gib("custom", "1p"), 1024 * 1024)
+        self.assertEqual(SG_MOD.seed_group_target_gib("custom", "100G"), 100)
+        self.assertEqual(SG_MOD.seed_group_target_gib("custom", "1T"), 1024)
+        self.assertEqual(SG_MOD.seed_group_target_gib("custom", "1P"), 1024 * 1024)
+        self.assertEqual(SG_MOD.seed_group_target_gib("custom", "2048"), 2048)
+        self.assertEqual(SG_MOD.seed_group_target_gib("custom", 2048), 2048)
+        self.assertEqual(SG_MOD.seed_group_target_gib("custom", "100M"), 1)
+        self.assertEqual(SG_MOD.seed_group_target_gib("custom", 0), 1)
+        self.assertEqual(SG_MOD.seed_group_target_gib("custom", None), 1)
+        self.assertEqual(SG_MOD.seed_group_target_gib("custom", "1p"), 1024 * 1024)
 
     def test_parse_size_units(self):
         self.assertAlmostEqual(mod.parse_size_gib("100M"), 100 / 1024, places=4)
@@ -1826,7 +1835,7 @@ class SeedGroupTierTest(unittest.TestCase):
         self.assertEqual(mod.parse_size_gib(""), 0.0)
 
     def test_form_has_custom_field_and_hides_removed(self):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         form, defaults = plugin.get_form()
         blob = json.dumps(form, ensure_ascii=False)
         self.assertIn("seedgroup_custom_gib", blob)
@@ -1839,21 +1848,21 @@ class SeedGroupTierTest(unittest.TestCase):
 
     def test_unknown_tier_falls_back_to_smallest(self):
         # 写错档位不能退化成「不保种」：一律按 2T 下限走
-        self.assertEqual(mod.seed_group_target_gib("100T"), 2048)
-        self.assertEqual(mod.seed_group_target_gib(""), 2048)
-        self.assertEqual(mod.seed_group_target_gib(None), 2048)
+        self.assertEqual(SG_MOD.seed_group_target_gib("100T"), 2048)
+        self.assertEqual(SG_MOD.seed_group_target_gib(""), 2048)
+        self.assertEqual(SG_MOD.seed_group_target_gib(None), 2048)
 
     def test_size_bytes_and_gib(self):
-        self.assertAlmostEqual(mod._seed_group_size_gib(2 * mod.GIB), 2.0)
-        self.assertAlmostEqual(mod._seed_group_size_gib(3.5), 3.5)      # 已经是 GiB
-        self.assertEqual(mod._seed_group_size_gib(0), 0.0)
-        self.assertEqual(mod._seed_group_size_gib("bad"), 0.0)
+        self.assertAlmostEqual(SG_MOD._seed_group_size_gib(2 * mod.GIB), 2.0)
+        self.assertAlmostEqual(SG_MOD._seed_group_size_gib(3.5), 3.5)      # 已经是 GiB
+        self.assertEqual(SG_MOD._seed_group_size_gib(0), 0.0)
+        self.assertEqual(SG_MOD._seed_group_size_gib("bad"), 0.0)
 
 
 class SeedGroupPlanTest(unittest.TestCase):
     def test_never_below_target(self):
         items = [{"info_hash": f"h{i}", "size": i * mod.GIB} for i in (60, 50, 40, 30)]
-        picked, total, shortfall = mod.seed_group_plan(items, 100)
+        picked, total, shortfall = SG_MOD.seed_group_plan(items, 100)
         self.assertGreaterEqual(total, 100)
         self.assertEqual(shortfall, 0)
         self.assertEqual(sum(x["size_gib"] for x in picked), total)
@@ -1862,14 +1871,14 @@ class SeedGroupPlanTest(unittest.TestCase):
         items = [{"info_hash": "a", "size": 60 * mod.GIB},
                  {"info_hash": "b", "size": 50 * mod.GIB},
                  {"info_hash": "c", "size": 40 * mod.GIB}]
-        picked, total, shortfall = mod.seed_group_plan(items, 100)
+        picked, total, shortfall = SG_MOD.seed_group_plan(items, 100)
         self.assertEqual(total, 100)
         self.assertEqual([x["info_hash"] for x in picked], ["a", "c"])
         self.assertEqual(shortfall, 0)
 
     def test_overflow_single_too_big(self):
         # 一颗就超过档位：照样收下（只超不少）
-        picked, total, shortfall = mod.seed_group_plan(
+        picked, total, shortfall = SG_MOD.seed_group_plan(
             [{"info_hash": "big", "size": 300 * mod.GIB}], 100)
         self.assertEqual(len(picked), 1)
         self.assertEqual(total, 300)
@@ -1878,7 +1887,7 @@ class SeedGroupPlanTest(unittest.TestCase):
     def test_shortfall_reported_when_pool_too_small(self):
         items = [{"info_hash": "a", "size": 40 * mod.GIB},
                  {"info_hash": "b", "size": 60 * mod.GIB}]
-        picked, total, shortfall = mod.seed_group_plan(items, 1000)
+        picked, total, shortfall = SG_MOD.seed_group_plan(items, 1000)
         self.assertEqual(len(picked), 2)
         self.assertEqual(total, 100)
         self.assertEqual(shortfall, 900)
@@ -1886,17 +1895,17 @@ class SeedGroupPlanTest(unittest.TestCase):
     def test_official_first(self):
         items = [{"info_hash": "plain", "size": 60 * mod.GIB, "official": False},
                  {"info_hash": "official", "size": 50 * mod.GIB, "official": True}]
-        picked, _, _ = mod.seed_group_plan(items, 50)
+        picked, _, _ = SG_MOD.seed_group_plan(items, 50)
         self.assertEqual(picked[0]["info_hash"], "official")
 
     def test_empty_pool(self):
-        picked, total, shortfall = mod.seed_group_plan([], 2048)
+        picked, total, shortfall = SG_MOD.seed_group_plan([], 2048)
         self.assertEqual((picked, total, shortfall), ([], 0.0, 2048.0))
 
 
 class SeedGroupPluginTest(unittest.TestCase):
     def _plugin(self, **attrs):
-        plugin = support.make_plugin(mod, **attrs)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup", **attrs)
         plugin._session_token = "token"
         plugin._seedgroup_enabled = True
         plugin._seedgroup_tier = "2T"
@@ -1916,11 +1925,11 @@ class SeedGroupPluginTest(unittest.TestCase):
         def call(method, path, **kwargs):
             if path == "/api/v1/me":
                 body = json.dumps(me or {"id": 0}).encode()
-                return mod._HttpResult(200, body, body.decode())
+                return SG_MOD._HttpResult(200, body, body.decode())
             if path.startswith("/api/v1/users/"):
                 body = json.dumps(profile or {}).encode()
-                return mod._HttpResult(200, body, body.decode())
-            return mod._HttpResult(404, b"", "404")
+                return SG_MOD._HttpResult(200, body, body.decode())
+            return SG_MOD._HttpResult(404, b"", "404")
         return call
 
     def test_identity_requires_login(self):
@@ -2026,9 +2035,9 @@ class SeedGroupPluginTest(unittest.TestCase):
             return [x["id"] for x in plugin.get_service()]
 
         self.assertEqual(names(False, True, True), [])
-        self.assertEqual(names(True, True, True), ["ColaCrossSeed", "ColaCrossSeedSeedGroup"])
-        self.assertEqual(names(True, True, False), ["ColaCrossSeed"])
-        self.assertEqual(names(True, False, True), ["ColaCrossSeedSeedGroup"])
+        self.assertEqual(names(True, True, True), ["ColaSeedGroup"])  # 这个测试用的是保种插件
+        self.assertEqual(names(True, True, False), [])
+        self.assertEqual(names(True, False, True), ["ColaSeedGroup"])  # 只看保种开关
 
     def test_service_trigger_is_object_not_string(self):
         plugin = self._plugin()
@@ -2076,7 +2085,7 @@ class SeedGroupPluginTest(unittest.TestCase):
         plugin._sg_download = lambda item: support.make_torrent(name=f"t{item['torrent_id']}.mkv")
         plugin._seed_group_sync()
         self.assertEqual(len(client.added), 2)          # 1500 + 600 = 2100 ≥ 2048
-        self.assertTrue(all(mod.SEED_GROUP_TAG in a["label"] for a in client.added))
+        self.assertTrue(all(SG_MOD.SEED_GROUP_TAG in a["label"] for a in client.added))
         state = plugin.get_data("seedgroup_state")
         self.assertTrue(state["unlocked"])
         self.assertEqual(state["added"], 2)
@@ -2088,7 +2097,7 @@ class SeedGroupPluginTest(unittest.TestCase):
         client = support.FakeClient()
         client.list_completed = lambda: [
             {"hash": "e" * 40, "name": "old", "size": 2048 * mod.GIB,
-             "tags": f"{mod.MANDATORY_TAG},{mod.SEED_GROUP_TAG}", "state": "uploading"},
+             "tags": f"{mod.MANDATORY_TAG},{SG_MOD.SEED_GROUP_TAG}", "state": "uploading"},
         ]
         plugin._sg_clients = lambda: [client]
         plugin._cola = self._fake_cola(
@@ -2107,20 +2116,20 @@ class SeedGroupPluginTest(unittest.TestCase):
         body = json.dumps({"items": [{"torrent_id": 5, "release_name": "Movie",
                                       "size_bytes": 2 * mod.GIB, "official": True}],
                            "page": 1, "page_size": 100, "total": 1}).encode()
-        plugin_curl = mod._curl
+        plugin_curl = SG_MOD._curl
 
         def fake_curl(method, url, **kwargs):
-            return mod._HttpResult(200, body, body.decode())
+            return SG_MOD._HttpResult(200, body, body.decode())
 
-        mod._curl = fake_curl
+        SG_MOD._curl = fake_curl
         try:
             items, total, source = plugin._sg_official_machine_page(1)
         finally:
-            mod._curl = plugin_curl
+            SG_MOD._curl = plugin_curl
         self.assertEqual(total, 1)
         self.assertEqual(source, "api-key")
         self.assertEqual(items[0]["torrent_id"], 5)
-        self.assertAlmostEqual(mod._seed_group_size_gib(items[0]["size"]), 2.0)
+        self.assertAlmostEqual(SG_MOD._seed_group_size_gib(items[0]["size"]), 2.0)
 
     def test_browse_page_extracts_official_versions(self):
         plugin = self._plugin()
@@ -2128,7 +2137,7 @@ class SeedGroupPluginTest(unittest.TestCase):
             {"id": 31, "release_name": "A", "size_bytes": mod.GIB, "official": True},
             {"id": 32, "release_name": "B", "size_bytes": mod.GIB, "official": False},
         ]}], "page": 1, "page_size": 50, "total": 1}).encode()
-        plugin._cola = lambda m, p, **k: mod._HttpResult(200, body, body.decode())
+        plugin._cola = lambda m, p, **k: SG_MOD._HttpResult(200, body, body.decode())
         items, total, source = plugin._sg_official_browse_page(1)
         self.assertEqual(total, 1)
         self.assertEqual(source, "session")
@@ -2137,7 +2146,7 @@ class SeedGroupPluginTest(unittest.TestCase):
 
 class SeedGroupClientTest(unittest.TestCase):
     def _plugin(self):
-        plugin = support.make_plugin(mod)
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
         plugin._use_mp_clients = True
         plugin._clients_lines = ""
         plugin._clients_json = ""
