@@ -1218,7 +1218,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.8"
+    plugin_version = "0.2.9"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1642,14 +1642,14 @@ class ColaSeedGroup(_PluginBase):
         # 带端口 —— 一定是地址
         if ":" in t:
             return True
-        host = t
-        if not host:
-            return False
-        # 含点（IPv4 / 域名）、或 localhost；纯 ASCII 短主机名也认，
-        # 但**必须 ASCII**，否则 `NAS-本地` 这类中文显示名会被误判成地址
-        if "." in host or host == "localhost":
-            return True
-        return host.isascii() and host.replace("-", "").isalnum() and len(host) <= 32
+        # 含点（IPv4 / 域名）、或 localhost。
+        #
+        # **不再接受「纯 ASCII 主机名」**：`a172604` / `qq321321` / `qb1`
+        # 这些用户名、密码同样是纯字母数字，会被一起判成地址
+        # （2026-11-19 二次事故：解析器把自己写对了、判定规则又放太宽，
+        #  结果 url=a172604，还是 `Failed to resolve`）。
+        # qB 的 WebUI 地址几乎总带端口，不带端口的纯主机名交给用户写 `http://`。
+        return "." in t or t == "localhost"
 
     def _parse_client_lines(self, text: str) -> List[_Client]:
         """每行一个客户端，**地址按内容识别，不靠位置**：
@@ -2581,7 +2581,17 @@ class ColaSeedGroup(_PluginBase):
             # 用参数走 MP 那一支，不临时改实例属性（保种组与辅种是两个独立 service，会并发）
             out = self._clients(use_mp=True, lines="")
         if not out:
-            out = self._clients()
+            # **绝不回落 MP 的下载器列表**（2026-11-19 事故）。
+            #
+            # 以前这里是 `out = self._clients()`，也就是「配置解析不出来就用
+            # MP 里配的所有下载器」。后果：用户只希望往一台远端 qB 加种，
+            # 一旦自定义行写得不规范，插件会把种**同时推到家里 NAS 的 qB**，
+            # 把本机磁盘和上行都占掉（老板原话：「不要推送任务到 192.168.31.100」）。
+            # 保种组的目标机器必须是**用户显式写下的那几台**，猜错代价太大 ——
+            # 宁可本轮什么都不加，也不往没被点名的机器上写文件。
+            logger.warn("保种组：没有可用的下载器（自定义行空或格式不对），本轮跳过。"
+                        "不会回落到 MoviePilot 的下载器列表")
+            return []
         target = (self._seedgroup_target_client or "").strip()
         if target:
             named = [c for c in out if c.name == target]
