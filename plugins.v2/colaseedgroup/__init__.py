@@ -1183,7 +1183,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.1"
+    plugin_version = "0.2.2"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -2591,8 +2591,21 @@ class ColaSeedGroup(_PluginBase):
         return record
 
     def _sg_unlock_record(self) -> Dict[str, Any]:
+        """解锁记录，**顺带算出 staff**。
+
+        `seed_group_unlock()` 写进去的记录里只有 groups（没有 staff 字段），而 0.2.0 的
+        「只有工作组成员才上报」直接读 `record["staff"]` → 永远取到 None → **一次都没上报过**
+        （站点面板因此一直停在旧版本的数字上）。这里统一补算，所有调用点都能拿到。
+        """
         record = self.get_data("seedgroup_unlock") or {}
-        return record if isinstance(record, dict) else {}
+        if not isinstance(record, dict):
+            return {}
+        groups = [str(g) for g in (record.get("groups") or [])]
+        prefix = self._seedgroup_staff_prefix or ""
+        record["staff"] = bool(groups) and any(g.startswith(prefix) for g in groups)
+        if not record["staff"] and self._seedgroup_allow_admin and "admin" in (record.get("roles") or []):
+            record["staff"] = True
+        return record
 
     def _sg_unlocked(self, refresh: bool = True) -> Tuple[bool, Dict[str, Any]]:
         """解锁是否有效：缓存 24 小时，且必须还是同一个账号（换号后旧记录不再沿用）。

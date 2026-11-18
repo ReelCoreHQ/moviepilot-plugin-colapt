@@ -855,6 +855,32 @@ class OnTargetToleranceTest(unittest.TestCase):
             self.assertFalse(SG_MOD._sg_on_target(c, t))
 
 
+class StaffFlagFromRecordTest(unittest.TestCase):
+    """解锁记录里只有 groups，staff 要现算 —— 读 record["staff"] 会永远拿到 None。"""
+
+    def test_staff_computed_from_group_prefix(self):
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup", store={
+            "seedgroup_unlock": {"ok": True, "until": 9999999999, "uid": 18,
+                                 "groups": ["工作组-组长"], "roles": ["member"]}})
+        plugin._seedgroup_staff_prefix = "工作组"
+        self.assertTrue(plugin._sg_unlock_record()["staff"])
+
+    def test_plain_member_is_not_staff(self):
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup", store={
+            "seedgroup_unlock": {"ok": True, "until": 9999999999, "uid": 8,
+                                 "groups": ["VIP"], "roles": ["member"]}})
+        plugin._seedgroup_staff_prefix = "工作组"
+        self.assertFalse(plugin._sg_unlock_record()["staff"])
+
+    def test_admin_counts_when_allowed(self):
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup", store={
+            "seedgroup_unlock": {"ok": True, "until": 9999999999, "uid": 1,
+                                 "groups": [], "roles": ["admin"]}})
+        plugin._seedgroup_staff_prefix = "工作组"
+        plugin._seedgroup_allow_admin = True
+        self.assertTrue(plugin._sg_unlock_record()["staff"])
+
+
 class SeedGroupDownloadQuotaTest(unittest.TestCase):
     """进种限流（2026-11-16）：客户端「正在下载」达到上限就停止进种，低于就按剩余额度补。"""
 
