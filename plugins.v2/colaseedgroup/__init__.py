@@ -1215,7 +1215,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.5"
+    plugin_version = "0.2.6"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -2920,17 +2920,55 @@ class ColaSeedGroup(_PluginBase):
                 logger.warn(f"保种组按 id 下载失败（{torrent_id}）：{err}")
         return b""
 
+    # 读不到某台客户端时，最多沿用多久之前的那次读数（秒）。
+    #
+    # 为什么需要（2026-11-18）：大量用户的 MP 装在家里（NAT/CGNAT，没有公网 IP），
+    # 而 qB 可能在另一台机器上。家里的上行往往只有几百 KiB/s 还夹丢包 ——
+    # 拉一次 `torrents/info`（几百 KB）必然超时，于是覆盖被算成 0、`on_target` 掉到 0、
+    # 保种时长的连续区间被白白打断。真实情况是「那台客户端的种一直好好在做」，
+    # 只是这一轮问不到它。
+    #
+    # 取舍：宁可沿用旧值（并把它标出来），也不要因为一次读超时就把覆盖清零。
+    # 24 小时是上限 —— 超过一天没读到就不再相信，避免把早已删掉的种一直算进去。
+    SG_STALE_COVERAGE_TTL = 24 * 3600
+
     def _sg_current(self, clients: List[_Client]) -> Tuple[set, float, int]:
-        """客户端里已带「可乐保种组」标签的种子：返回 (hash 集合, 体积 GiB, 无标签能力的客户端数)。"""
+        """客户端里已带「可乐保种组」标签的种子：返回 (hash 集合, 体积 GiB, 无标签能力的客户端数)。
+
+        某台客户端这一轮读不到（弱网/超时）时，沿用它的上次读数并记进
+        `seedgroup_client_cache`，不让一次超时把覆盖清零。
+        """
         hashes: set = set()
         total = 0.0
         blind = 0
+        cache = self.get_data("seedgroup_client_cache") or {}
+        if not isinstance(cache, dict):
+            cache = {}
+        dirty = False
         for client in clients:
+            name = str(getattr(client, "name", "") or "?")
             try:
                 torrents = client.list_completed()
-            except Exception:
-                blind += 1
+            except Exception as err:
+                logger.warn(f"保种组：{name} 读不到种子（{type(err).__name__}），沿用上次读数")
+                torrents = None
+            if torrents is None:
+                snap = cache.get(name) or {}
+                try:
+                    age = int(time.time()) - int(snap.get("at") or 0)
+                except Exception:
+                    age = self.SG_STALE_COVERAGE_TTL + 1
+                if snap.get("gib") is not None and age <= self.SG_STALE_COVERAGE_TTL:
+                    total += float(snap.get("gib") or 0)
+                    hashes.update(snap.get("hashes") or [])
+                    blind += 1
+                    logger.info(f"保种组：{name} 沿用 {age // 60} 分钟前的读数 "
+                                f"{float(snap.get('gib') or 0):.1f} GiB")
+                else:
+                    blind += 1
                 continue
+            client_gib = 0.0
+            client_hashes: List[str] = []
             tagged = False
             for torrent in torrents or []:
                 tags = str(torrent.get("tags") or "")
@@ -2942,9 +2980,18 @@ class ColaSeedGroup(_PluginBase):
                 if not info_hash or info_hash in hashes:
                     continue
                 hashes.add(info_hash)
-                total += _seed_group_size_gib(torrent.get("size"))
+                client_hashes.append(info_hash)
+                size_gib = _seed_group_size_gib(torrent.get("size"))
+                client_gib += size_gib
+            total += client_gib
             if torrents and not tagged:
                 blind += 1
+            # 只缓存「读成功的」：读失败就保留上一次成功值，别用空的覆盖掉
+            cache[name] = {"at": int(time.time()), "gib": round(client_gib, 3),
+                           "hashes": client_hashes[:2000]}
+            dirty = True
+        if dirty:
+            self.save_data("seedgroup_client_cache", cache)
         return hashes, round(total, 3), blind
 
     UNLOCK_TTL = 86400          # 工作组资格校验结果的缓存时长（秒）

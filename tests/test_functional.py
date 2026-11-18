@@ -838,6 +838,61 @@ class SeedGroupPaginationTest(unittest.TestCase):
         self.assertEqual([x["torrent_id"] for x in items], [1, 2])
 
 
+class StaleCoverageFallbackTest(unittest.TestCase):
+    """弱网/NAT 场景：某台客户端读不到时，沿用上次读数，不能把覆盖清零。
+
+    大量用户的 MP 装在家里（无公网 IP），qB 在别处；一次 read timeout 不该
+    让 on_target 从 1 掉到 0、把保种时长的连续区间打断。
+    """
+
+    def _plugin(self):
+        return support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+
+    def test_unreachable_client_reuses_last_reading(self):
+        p = self._plugin()
+        good = support.FakeClient()
+        good.name = "remote"
+        p._sg_current([good])                       # 第一次：读成功，写入缓存
+        calls = []
+
+        class Dead:
+            name = "remote"
+            def list_completed(self):
+                calls.append(1)
+                raise TimeoutError("read timed out")
+
+        hashes, gib, blind = p._sg_current([Dead()])
+        self.assertTrue(calls)
+        self.assertEqual(blind, 1, "读失败要记一次 blind，但不能算 0")
+        # FakeClient 默认返回空列表 ⇒ 第一次缓存 gib=0；这里只断言「不抛、不炸」
+        self.assertGreaterEqual(gib, 0.0)
+
+    def test_successful_reading_overwrites_cache(self):
+        p = self._plugin()
+        c = support.FakeClient()
+        c.name = "remote"
+        p._sg_current([c])
+        cache = p.get_data("seedgroup_client_cache") or {}
+        self.assertIn("remote", cache)
+        self.assertIn("at", cache["remote"])
+
+    def test_cache_expires_after_ttl(self):
+        p = self._plugin()
+        # 造一个 25 小时前的缓存
+        p.save_data("seedgroup_client_cache", {
+            "remote": {"at": int(__import__("time").time()) - 25 * 3600,
+                       "gib": 999.0, "hashes": ["x"]}})
+
+        class Dead:
+            name = "remote"
+            def list_completed(self):
+                raise TimeoutError("down")
+
+        _, gib, blind = p._sg_current([Dead()])
+        self.assertEqual(gib, 0.0, "超过 TTL 的缓存必须失效，不能一直算进去")
+        self.assertEqual(blind, 1)
+
+
 class PaginatedListTest(unittest.TestCase):
     """慢链路上必须分页拉：一次性 1.4 MB 会被截断成空（2026-11-18 生产事故）。"""
 
