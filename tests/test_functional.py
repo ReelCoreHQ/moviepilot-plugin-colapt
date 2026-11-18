@@ -838,6 +838,53 @@ class SeedGroupPaginationTest(unittest.TestCase):
         self.assertEqual([x["torrent_id"] for x in items], [1, 2])
 
 
+class ClientLineFormatTest(unittest.TestCase):
+    """下载器配置行的所有常见写法都要能解析对。
+
+    2026-11-19 事故：`地址,用户,密码,名称` 被切成 name=地址、url=用户，
+    报 `Failed to resolve 'a172604'` —— 4 段格式按位置切是错的。
+    现在按内容识别地址，地址前的段当名字、地址后的段当用户名密码。
+    """
+
+    def setUp(self):
+        self.p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+
+    def _one(self, line):
+        got = self.p._parse_client_lines(line)
+        self.assertEqual(len(got), 1, f"{line!r} 应该解析出 1 个客户端")
+        return got[0]
+
+    def test_three_segments(self):
+        c = self._one("192.168.31.100:8081,a172604,qq321321")
+        self.assertEqual(c.url, "http://192.168.31.100:8081")
+
+    def test_name_after_password(self):
+        c = self._one("192.168.31.100:8081,a172604,qq321321,NAS-本地")
+        self.assertEqual(c.name, "NAS-本地")
+        self.assertEqual(c.url, "http://192.168.31.100:8081")
+
+    def test_name_before_address(self):
+        c = self._one("198-远端,198.72.127.68:8081,qb1,qq321321")
+        self.assertEqual(c.name, "198-远端")
+        self.assertEqual(c.url, "http://198.72.127.68:8081")
+
+    def test_explicit_kind_prefix(self):
+        c = self._one("qb,198.72.127.68:8081,qb1,qq321321,198-远端")
+        self.assertEqual(c.name, "198-远端")
+        self.assertEqual(c.url, "http://198.72.127.68:8081")
+
+    def test_full_scheme(self):
+        c = self._one("http://127.0.0.1:8081,qb1,pwd")
+        self.assertEqual(c.url, "http://127.0.0.1:8081")
+
+    def test_two_lines_both_parsed(self):
+        got = self.p._parse_client_lines(
+            "192.168.31.100:8081,a172604,qq321321,NAS-本地\n"
+            "198-远端,198.72.127.68:8081,qb1,qq321321")
+        self.assertEqual(len(got), 2)
+        self.assertEqual({c.name for c in got}, {"NAS-本地", "198-远端"})
+
+
 class StaleCoverageFallbackTest(unittest.TestCase):
     """弱网/NAT 场景：某台客户端读不到时，沿用上次读数，不能把覆盖清零。
 
