@@ -868,29 +868,49 @@ class QBittorrentClient(_Client):
             logger.warn(f"qBittorrent ({self.name}) 读取下载队列失败：{err}")
             return -1
 
+    # 一次拉多少个：qB 的 `torrents/info` 一页 100 条约 200 KB。
+    #
+    # 为什么必须分页（2026-11-18 生产事故）：家里那台上行只有 ~370 KiB/s（被运营商限流，
+    # 网卡 requeues 330 万），一次性拉 700 多个种子的完整响应（1.4 MB）会在链路上被截断 ——
+    # 表现是 `filter=completed` 返回空数组、覆盖算成 0.0 GiB，而 qB 本身完全正常
+    # （同一台机器上 `torrents/info` 无 filter 能返回 698 条）。
+    # 分页把单次响应压到 200 KB 量级，慢链路上也能稳定拿到。
+    QB_LIST_PAGE = 100
+
     def list_completed(self) -> List[Dict[str, Any]]:
         try:
-            rsp = self._session.get(
-                f"{self.url}/api/v2/torrents/info",
-                params={"filter": "completed"},
-                timeout=REQUEST_TIMEOUT,
-            )
-            rsp.raise_for_status()
-            out = []
-            for item in (rsp.json() or []):
-                out.append({
-                    "hash": (item.get("hash") or "").lower(),
-                    "name": item.get("name") or "",
-                    "save_path": item.get("save_path") or item.get("content_path") or "",
-                    "category": item.get("category") or "",
-                    "size": item.get("size") or item.get("total_size") or 0,
-                    # 标签要带上：辅种时可能要「继承原种子标签」（issue #11）
-                    "tags": item.get("tags") or "",
-                    # 状态：同一颗种子出现在多个下载器时，优先在「正在做种」的那个里辅
-                    "state": item.get("state") or "",
-                    # 自动种子管理：开着时下载路径由分类决定，辅种要沿用同一套（issue #23）
-                    "auto_tmm": bool(item.get("auto_tmm")),
-                })
+            out: List[Dict[str, Any]] = []
+            for page in range(0, 200):          # 200 页 × 100 = 2 万条，够任何人的库
+                rsp = self._session.get(
+                    f"{self.url}/api/v2/torrents/info",
+                    params={
+                        "filter": "completed",
+                        "limit": self.QB_LIST_PAGE,
+                        "offset": page * self.QB_LIST_PAGE,
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+                rsp.raise_for_status()
+                batch = rsp.json() or []
+                if not batch:
+                    break
+                for item in batch:
+                    out.append({
+                        "hash": (item.get("hash") or "").lower(),
+                        "name": item.get("name") or "",
+                        "save_path": item.get("save_path") or item.get("content_path") or "",
+                        "category": item.get("category") or "",
+                        "size": item.get("size") or item.get("total_size") or 0,
+                        # 标签要带上：辅种时可能要「继承原种子标签」（issue #11）
+                        "tags": item.get("tags") or "",
+                        # 状态：同一颗种子出现在多个下载器时，优先在「正在做种」的那个里辅
+                        "state": item.get("state") or "",
+                        # 自动种子管理：开着时下载路径由分类决定，辅种要沿用同一套（issue #23）
+                        "auto_tmm": bool(item.get("auto_tmm")),
+                        })
+                # 不满一页 = 已经是最后一页，不必再请求
+                if len(batch) < self.QB_LIST_PAGE:
+                    break
             return out
         except Exception as err:
             logger.error(f"qBittorrent ({self.name}) 读取种子失败：{err}")
@@ -1195,7 +1215,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.4"
+    plugin_version = "0.2.5"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"

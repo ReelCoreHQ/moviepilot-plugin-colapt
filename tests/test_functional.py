@@ -838,6 +838,36 @@ class SeedGroupPaginationTest(unittest.TestCase):
         self.assertEqual([x["torrent_id"] for x in items], [1, 2])
 
 
+class PaginatedListTest(unittest.TestCase):
+    """慢链路上必须分页拉：一次性 1.4 MB 会被截断成空（2026-11-18 生产事故）。"""
+
+    def test_page_size_and_requests_are_paged(self):
+        calls = []
+
+        class Resp:
+            def __init__(self, payload): self._p = payload
+            def raise_for_status(self): pass
+            def json(self): return self._p
+
+        class Sess:
+            def get(self, url, params=None, timeout=None):
+                calls.append(dict(params or {}))
+                off = (params or {}).get("offset", 0)
+                # 250 条：100 + 100 + 50
+                n = min(100, max(0, 250 - off))
+                return Resp([{"hash": f"h{off+i:04d}", "size": 1024} for i in range(n)])
+
+        c = SG_MOD.QBittorrentClient.__new__(SG_MOD.QBittorrentClient)
+        c.name = "fake"
+        c.url = "http://x"
+        c._session = Sess()
+        rows = c.list_completed()
+        self.assertEqual(len(rows), 250, "分页必须拼回全量")
+        self.assertTrue(all("limit" in x and "offset" in x for x in calls), "每次都要带 limit/offset")
+        self.assertEqual([x["offset"] for x in calls], [0, 100, 200], "页码要连续")
+        self.assertEqual(calls[0]["limit"], SG_MOD.QBittorrentClient.QB_LIST_PAGE)
+
+
 class OnTargetToleranceTest(unittest.TestCase):
     """达标判定要留容差：covered 与 target 天然差几 MB，严格 >= 会让保种时长永远 0。"""
 
