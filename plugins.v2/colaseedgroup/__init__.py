@@ -1183,7 +1183,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.2"
+    plugin_version = "0.2.3"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1300,7 +1300,10 @@ class ColaSeedGroup(_PluginBase):
             # 档位归一化：老值 20T+ → 20T；未知值退回 2T；custom 走自定义数值
             self._seedgroup_tier = seed_group_tier_key(config.get("seedgroup_tier") or "2T")
             try:
-                self._seedgroup_max_downloading = max(0, min(int(config.get("seedgroup_max_downloading") or 5), 200))
+                # 注意不能用 `or 5`：老板要的 0 = 不限流，而 `0 or 5` 会把 0 变成 5，
+                # 限流永远关不掉（生产实测 quota 一直被压到 2）。
+                raw_limit = config.get("seedgroup_max_downloading")
+                self._seedgroup_max_downloading = max(0, min(int(raw_limit if raw_limit is not None else 5), 200))
             except Exception:
                 self._seedgroup_max_downloading = 5
             # 范围已从 UI 撤掉：统一「全站官种」；老配置里的 pool 也归一成 site（机器面通道只看有没有 Key）
@@ -3264,6 +3267,9 @@ class ColaSeedGroup(_PluginBase):
                 # 固定档位会长期显示缺口。补完记进映射，下一轮就能统计到。
                 duplicate += 1
                 self._sg_remember_item(info_hash, item)
+                # 也记进跳过表：客户端里已经有它，下一轮别再为它下载 .torrent
+                # （以前只补标签不记 skip，于是每轮都重复挑中同一颗，duplicate 永远是 2）
+                self._sg_mark_skip(item, "dup")
                 try:
                     client.add_tags(info_hash, SEED_GROUP_TAG)
                 except Exception as err:
