@@ -838,6 +838,26 @@ class SeedGroupPaginationTest(unittest.TestCase):
         self.assertEqual([x["torrent_id"] for x in items], [1, 2])
 
 
+class EmptyPoolKeepsCoverageTest(unittest.TestCase):
+    """池子空了也不能把覆盖报成 0。
+
+    2026-11-19 事故：`not candidates` 分支只更新 shortfall_gib，covered_gib 留着
+    上一次的值 —— 上一轮没写过就一直是 0.0，于是「池子空了」的每一轮都上报
+    covered=0 / on_target=0，保种时长的连续区间被凭空打断，而客户端里其实好好
+    保着 1348 GiB。
+    """
+
+    def test_empty_pool_branch_writes_covered(self):
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._seed_group_sync)
+        # 找到 not candidates 分支，断言它同时写了 covered_gib
+        idx = src.find("if not candidates:")
+        self.assertGreater(idx, 0, "分支不存在")
+        block = src[idx:idx + 1200]
+        self.assertIn('state["covered_gib"] = current_gib', block,
+                      "池子空的分支必须把本轮实测覆盖写进 state")
+
+
 class NoMpFallbackTest(unittest.TestCase):
     """保种组绝不允许回落到 MoviePilot 的下载器列表。
 

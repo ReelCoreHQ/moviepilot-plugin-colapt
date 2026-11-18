@@ -1218,7 +1218,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.9"
+    plugin_version = "0.2.10"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -3356,6 +3356,12 @@ class ColaSeedGroup(_PluginBase):
         if not candidates:
             # 还有缺口，但池子里剩下的全都「已在客户端」或在跳过表：如实说清是哪种
             state["activated"] = True
+            # **必须把本轮实测的覆盖写进 state**（2026-11-19 事故）：
+            # 这个分支以前只更新 shortfall_gib，covered_gib 保持上一次的值 ——
+            # 一旦上一轮没写过（比如刚启用/刚换客户端），它就一直是 0.0，
+            # 于是「池子空了」的每一轮都上报 covered=0、on_target=0，
+            # 保种时长的连续区间被凭空打断，而客户端里其实好好保着 1348 GiB。
+            state["covered_gib"] = current_gib
             state["shortfall_gib"] = max(0.0, need)
             state["reason"] = (f"池中 {len(pool_all)} 条全部已在客户端或处于 7 天跳过表"
                                f"（跳过 {len(skips)} 条），本轮没有可加的")

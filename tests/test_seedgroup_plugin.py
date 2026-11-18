@@ -9,7 +9,7 @@ class SplitPluginTest(unittest.TestCase):
         mod = support.load_seedgroup_plugin()
         cls = mod.ColaSeedGroup
         self.assertEqual(cls.plugin_name, "可乐保种组")
-        self.assertEqual(cls.plugin_version, "0.2.9")
+        self.assertEqual(cls.plugin_version, "0.2.10")
 
     def test_keeps_seed_group_and_drops_crossseed(self):
         mod = support.load_seedgroup_plugin()
