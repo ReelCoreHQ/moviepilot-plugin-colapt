@@ -218,8 +218,19 @@ def _seed_group_size_gib(size: Any) -> float:
     return value if value < 1e5 else value / GIB
 
 
-def _sg_on_target(covered: Any, target: Any, tolerance: float = 0.005) -> bool:
+# 「全站官种」档位的达标线：只要覆盖到目标的 60% 就算达标（老板 2026-11-18 定）。
+# 为什么单独给 all 档放宽：全站官种的目标 = 站点所有官方种的总体积，它每天都在涨
+# （站点持续给老种补官方标记），要求 100% 等于永远追不上；而 60% 已经能保证
+# 「站点上大部分官方资源有源」，考核意义足够。**其他档位仍是 100%**。
+SEED_GROUP_ALL_TARGET_RATIO = 0.6
+
+
+def _sg_on_target(covered: Any, target: Any, tolerance: float = 0.005,
+                  ratio: float = 1.0) -> bool:
     """覆盖是否算「达标」——站点据此累计当月保种时长。
+
+    `ratio` 是达标线：默认 1.0（必须保满目标），`all` 档传
+    [`SEED_GROUP_ALL_TARGET_RATIO`]（60%）。
 
     留 0.5%（最少 1 GiB）容差：covered 来自客户端 size 累加，target 来自站点 size_bytes/GIB，
     两者天然差几个 MB；严格 >= 会让「其实已全保完」的账号一直报 0。
@@ -231,7 +242,8 @@ def _sg_on_target(covered: Any, target: Any, tolerance: float = 0.005) -> bool:
         return False
     if c <= 0 or t <= 0:
         return False
-    return c >= t - max(t * tolerance, 1.0)
+    need = t * max(0.0, min(float(ratio), 1.0))
+    return c >= need - max(need * tolerance, 1.0)
 
 
 def seed_group_plan(items: List[Dict[str, Any]], target_gib: float) \
@@ -1183,7 +1195,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.3"
+    plugin_version = "0.2.4"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -2031,7 +2043,14 @@ class ColaSeedGroup(_PluginBase):
             "covered_gib": state.get("covered_gib"),
             "shortfall_gib": state.get("shortfall_gib"),
             # 站点按这个字段累计「当月达标时长」：covered >= target 才算达标
-            "on_target": _sg_on_target(state.get("covered_gib"), state.get("target_gib")),
+            # `all` 档按 60% 算达标（目标每天都在涨，要求 100% 永远追不上），
+            # 其余档位仍是 100%。站点只认这个布尔值，不自己算。
+            "on_target": _sg_on_target(
+                state.get("covered_gib"), state.get("target_gib"),
+                ratio=SEED_GROUP_ALL_TARGET_RATIO
+                if seed_group_tier_key(state.get("tier") or self._seedgroup_tier) == SEED_GROUP_ALL_TIER
+                else 1.0,
+            ),
             # 客户端里这批种子最老的那颗已经做了多久（交叉验证「保种时长」不是编的）
             "seeded_secs": self._sg_oldest_seeded_secs(clients),
             "enforced": {"dl_kib": self._limit_dl_kib, "up_kib": self._limit_up_kib},

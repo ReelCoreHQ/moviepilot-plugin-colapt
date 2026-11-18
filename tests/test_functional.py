@@ -850,6 +850,20 @@ class OnTargetToleranceTest(unittest.TestCase):
     def test_clearly_short_does_not_count(self):
         self.assertFalse(SG_MOD._sg_on_target(1132.4, 1152.4))
 
+    def test_all_tier_counts_at_sixty_percent(self):
+        """all 档：覆盖到 60% 就算达标（目标每天都在涨，要求 100% 追不上）。"""
+        r = SG_MOD.SEED_GROUP_ALL_TARGET_RATIO
+        self.assertEqual(r, 0.6)
+        self.assertTrue(SG_MOD._sg_on_target(840, 1400, ratio=r), "60% 该达标")
+        # 同样 50%：不传 ratio（默认 100%）不达标；传 60% 阈值下也不达标
+        self.assertFalse(SG_MOD._sg_on_target(700, 1400, ratio=r), "50% 不该达标")
+        self.assertFalse(SG_MOD._sg_on_target(700, 1400), "不传 ratio 时是 100% 语义")
+
+    def test_all_tier_still_needs_sixty_percent(self):
+        r = SG_MOD.SEED_GROUP_ALL_TARGET_RATIO
+        self.assertFalse(SG_MOD._sg_on_target(820, 1400, ratio=r), "58.6% 不该达标")
+        self.assertTrue(SG_MOD._sg_on_target(845, 1400, ratio=r), "60.4% 该达标")
+
     def test_missing_values_do_not_count(self):
         for c, t in ((0, 1152), (None, 1152), (1152, 0), (1152, None)):
             self.assertFalse(SG_MOD._sg_on_target(c, t))
