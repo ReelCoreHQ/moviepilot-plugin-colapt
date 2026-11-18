@@ -909,7 +909,7 @@ class PaginatedListTest(unittest.TestCase):
                 calls.append(dict(params or {}))
                 off = (params or {}).get("offset", 0)
                 # 250 条：100 + 100 + 50
-                n = min(100, max(0, 250 - off))
+                n = min(10, max(0, 250 - off))
                 return Resp([{"hash": f"h{off+i:04d}", "size": 1024} for i in range(n)])
 
         c = SG_MOD.QBittorrentClient.__new__(SG_MOD.QBittorrentClient)
@@ -919,7 +919,8 @@ class PaginatedListTest(unittest.TestCase):
         rows = c.list_completed()
         self.assertEqual(len(rows), 250, "分页必须拼回全量")
         self.assertTrue(all("limit" in x and "offset" in x for x in calls), "每次都要带 limit/offset")
-        self.assertEqual([x["offset"] for x in calls], [0, 100, 200], "页码要连续")
+        self.assertEqual([x["offset"] for x in calls][:3], [0, 10, 20], "页码要连续（每页 10 条）")
+        self.assertEqual(len(calls), 26, "250 条 ÷ 10 条/页 = 25 页 + 1 次空页收尾")
         self.assertEqual(calls[0]["limit"], SG_MOD.QBittorrentClient.QB_LIST_PAGE)
 
 

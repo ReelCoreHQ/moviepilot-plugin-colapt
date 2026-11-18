@@ -62,7 +62,7 @@ MANDATORY_TAG = "可乐辅种"   # 加进客户端的种子一律带这个标签
 COLA_MATCH_BATCH = 500
 # colapt.com 在部分国内网络会被解析到连不通的 Cloudflare 段；这些是实测可用的备用段。
 COLA_FALLBACK_IPS = ("104.21.66.130", "172.67.132.88", "104.26.10.0")
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = 90
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
 
 # ---------------- 可乐保种组 ----------------
@@ -868,14 +868,17 @@ class QBittorrentClient(_Client):
             logger.warn(f"qBittorrent ({self.name}) 读取下载队列失败：{err}")
             return -1
 
-    # 一次拉多少个：qB 的 `torrents/info` 一页 100 条约 200 KB。
+    # 一次拉多少个：qB 的 `torrents/info` 一页 10 条约 20 KB。
     #
-    # 为什么必须分页（2026-11-18 生产事故）：家里那台上行只有 ~370 KiB/s（被运营商限流，
-    # 网卡 requeues 330 万），一次性拉 700 多个种子的完整响应（1.4 MB）会在链路上被截断 ——
-    # 表现是 `filter=completed` 返回空数组、覆盖算成 0.0 GiB，而 qB 本身完全正常
-    # （同一台机器上 `torrents/info` 无 filter 能返回 698 条）。
-    # 分页把单次响应压到 200 KB 量级，慢链路上也能稳定拿到。
-    QB_LIST_PAGE = 100
+    # 为什么是 10 而不是 100（2026-11-18 实测）：家里 NAS 到远端 qB 的链路
+    # 上行只有 ~172 KiB/s 且夹丢包。实测每页 10 条（20 KB）**零失败**、每页 10 秒，
+    # 拉完 700 条约 12 分钟；而每页 100 条（200 KB）要 25-30 秒，正好卡在超时上，
+    # 表现是返回空数组、覆盖算成 0.0 GiB —— 看起来像"qB 挂了"，其实 qB 完全正常
+    # （同机 `torrents/info` 无 filter 能返回 700 条）。
+    #
+    # 慢是慢，但**能传完**。一轮 12 分钟对每小时跑一次完全可接受 —— 没必要为了
+    # 快一点把超时设短、把结果丢光。
+    QB_LIST_PAGE = 10
 
     def list_completed(self) -> List[Dict[str, Any]]:
         try:
@@ -1215,7 +1218,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.6"
+    plugin_version = "0.2.7"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
