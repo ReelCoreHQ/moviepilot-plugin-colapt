@@ -838,6 +838,38 @@ class SeedGroupPaginationTest(unittest.TestCase):
         self.assertEqual([x["torrent_id"] for x in items], [1, 2])
 
 
+class NoMpFallbackTest(unittest.TestCase):
+    """保种组绝不允许回落到 MoviePilot 的下载器列表。
+
+    2026-11-19 事故：用户只想往一台远端 qB 加种，自定义行写得不规范导致解析
+    为空，插件就 `out = self._clients()` 拿 MP 里**所有**下载器 —— 于是把种
+    同时推到了家里 NAS 的 qB，占掉本机磁盘和上行。
+    保种组的目标机器必须是用户显式写下的那几台，猜错代价太大。
+    """
+
+    def setUp(self):
+        self.p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+
+    def test_empty_custom_lines_returns_no_client(self):
+        self.p._seedgroup_clients_lines = ""
+        self.p._seedgroup_use_mp_clients = False
+        self.assertEqual(self.p._sg_clients(), [],
+                         "没配自定义行时不能回落 MP 下载器")
+
+    def test_broken_custom_lines_returns_no_client(self):
+        self.p._seedgroup_clients_lines = "这不是一行合法配置"
+        self.p._seedgroup_use_mp_clients = False
+        self.assertEqual(self.p._sg_clients(), [],
+                         "配置写坏了也不能回落 MP 下载器")
+
+    def test_explicit_client_is_used(self):
+        self.p._seedgroup_clients_lines = "198-远端,198.72.127.68:8081,qb1,qq321321"
+        self.p._seedgroup_use_mp_clients = False
+        got = self.p._sg_clients()
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].url, "http://198.72.127.68:8081")
+
+
 class ClientLineFormatTest(unittest.TestCase):
     """下载器配置行的所有常见写法都要能解析对。
 
@@ -872,6 +904,20 @@ class ClientLineFormatTest(unittest.TestCase):
         c = self._one("qb,198.72.127.68:8081,qb1,qq321321,198-远端")
         self.assertEqual(c.name, "198-远端")
         self.assertEqual(c.url, "http://198.72.127.68:8081")
+
+    def test_username_is_not_mistaken_for_address(self):
+        """`a172604` / `qq321321` / `qb1` 都是纯字母数字，绝不能被当成地址。
+
+        2026-11-19 二次事故：解析器改成按内容识别地址后，「纯 ASCII 主机名」
+        这条规则把它们全判成了地址，于是 url=a172604，还是 `Failed to resolve`。
+        """
+        for token in ("a172604", "qq321321", "qb1", "NAS-本地", "198-远端"):
+            self.assertFalse(self.p._looks_like_address(token),
+                             f"{token!r} 不是地址")
+        for token in ("192.168.31.100:8081", "127.0.0.1", "localhost",
+                      "http://127.0.0.1:8081", "qbt.example.com"):
+            self.assertTrue(self.p._looks_like_address(token),
+                            f"{token!r} 是地址")
 
     def test_full_scheme(self):
         c = self._one("http://127.0.0.1:8081,qb1,pwd")
@@ -2360,12 +2406,18 @@ class SeedGroupClientTest(unittest.TestCase):
         plugin._seedgroup_target_client = "MP-tr"
         self.assertEqual([c.name for c in plugin._sg_clients()], ["MP-tr"])
 
-    def test_falls_back_to_crossseed_clients(self):
+    def test_does_not_fall_back_to_crossseed_clients(self):
+        """**不回落**到辅种的客户端列表 —— 这是 2026-11-19 事故的直接原因。
+
+        用户只希望往一台远端 qB 加种；自定义行写坏了就不该猜，
+        更不该把种推到家里 NAS 的 qB 上。
+        """
         plugin = self._plugin()
         fake = support.FakeClient()
         plugin._seedgroup_use_mp_clients = False
-        plugin._clients = lambda: [fake]
-        self.assertEqual(plugin._sg_clients(), [fake])
+        plugin._seedgroup_clients_lines = ""
+        plugin._clients = lambda *a, **k: [fake]
+        self.assertEqual(plugin._sg_clients(), [])
 
 
 if __name__ == "__main__":
