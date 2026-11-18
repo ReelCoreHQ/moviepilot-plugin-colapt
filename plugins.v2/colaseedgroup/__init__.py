@@ -1218,7 +1218,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.7"
+    plugin_version = "0.2.8"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1623,8 +1623,44 @@ class ColaSeedGroup(_PluginBase):
     def _line_clients(self) -> List[_Client]:
         return self._parse_client_lines(self._clients_lines)
 
+    @staticmethod
+    def _looks_like_address(token: str) -> bool:
+        """这一段像不像地址（host / host:port / http://…）。
+
+        用来在 `_parse_client_lines` 里**不靠位置**找地址 —— 4 段写法里
+        「名字在前」还是「名字在后」都有人写，硬按位置切会把用户名当地址
+        （2026-11-19 真实事故：`地址,用户,密码,名称` 被切成 name=地址、
+        url=用户，报 `Failed to resolve 'a172604'`）。
+        """
+        t = str(token or "").strip().lower()
+        if not t:
+            return False
+        if t.startswith(("http://", "https://")):
+            return True
+        if "/" in t or " " in t:
+            return False
+        # 带端口 —— 一定是地址
+        if ":" in t:
+            return True
+        host = t
+        if not host:
+            return False
+        # 含点（IPv4 / 域名）、或 localhost；纯 ASCII 短主机名也认，
+        # 但**必须 ASCII**，否则 `NAS-本地` 这类中文显示名会被误判成地址
+        if "." in host or host == "localhost":
+            return True
+        return host.isascii() and host.replace("-", "").isalnum() and len(host) <= 32
+
     def _parse_client_lines(self, text: str) -> List[_Client]:
-        """每行一个客户端：`地址,用户名,密码`，或 `qb|tr,地址,用户名,密码`，可再带名称。"""
+        """每行一个客户端，**地址按内容识别，不靠位置**：
+
+            `地址,用户名,密码`
+            `地址,用户名,密码,名称`          ← 名称在后（最常见）
+            `名称,地址,用户名,密码`          ← 名称在前也认
+            `qb|tr,地址,用户名,密码[,名称]`   ← 显式指定类型
+
+        4 段以上时看哪一段像地址：谁像地址谁就是地址，剩下的是名字。
+        """
         out: List[_Client] = []
         for line in (text or "").splitlines():
             line = line.strip()
@@ -1635,20 +1671,32 @@ class ColaSeedGroup(_PluginBase):
                 logger.warn(f"下载器配置行格式不对（至少 地址,用户名,密码）：{line}")
                 continue
             kind = "qb"
-            name = ""
             if parts[0].lower() in ("qb", "qbittorrent", "tr", "transmission"):
                 kind = "tr" if parts[0].lower() in ("tr", "transmission") else "qb"
                 parts = parts[1:]
-            if len(parts) >= 4:
-                name = parts[0]
-                parts = parts[1:]
-            url = self._normalise_url(parts[0], "http")
-            if not name:
-                name = url.split("://", 1)[-1]
+            if len(parts) < 3:
+                logger.warn(f"下载器配置行格式不对：{line}")
+                continue
+            addr_idx = next((i for i, p in enumerate(parts)
+                             if self._looks_like_address(p)), None)
+            if addr_idx is None:
+                logger.warn(f"下载器配置里找不到地址段：{line}")
+                continue
+            url = self._normalise_url(parts[addr_idx], "http")
+            # 地址**后**紧跟用户名、密码；地址**前**的段是名字（`名称,地址,用户,密码`）
+            # 地址后再多出来的第 3 段也是名字（`地址,用户,密码,名称`）
+            before = parts[:addr_idx]
+            after = parts[addr_idx + 1:]
+            if len(after) < 2:
+                logger.warn(f"下载器配置缺用户名或密码：{line}")
+                continue
+            user, password = after[0], after[1]
+            name = (before[0] if before
+                    else (after[2] if len(after) > 2 else url.split("://", 1)[-1]))
             if kind == "tr":
-                out.append(TransmissionClient(name, url, parts[1], parts[2]))
+                out.append(TransmissionClient(name, url, user, password))
             else:
-                out.append(QBittorrentClient(name, url, parts[1], parts[2]))
+                out.append(QBittorrentClient(name, url, user, password))
         return out
 
     def _line_sites(self) -> List[Dict[str, str]]:
