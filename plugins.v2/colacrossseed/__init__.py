@@ -1056,7 +1056,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.11.1"
+    plugin_version = "0.11.2"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1092,6 +1092,7 @@ class ColaCrossSeed(_PluginBase):
     _sites_mode = "merge"
     _add_label = ""
     _target_client = ""       # 辅种加到哪个下载器：留空=自动（优先正在做种的那台）
+    _target_state: Dict[str, Any] = {}   # 上一轮「目标下载器解析结果」，页面与日志共用
     _inherit_tags = True      # 辅种时继承原种子已有的标签（站点标签、已整理、订阅…）
     _extra_tags = ""          # 额外附加的标签，逗号分隔
     _fallback_skip_check = True
@@ -1578,8 +1579,35 @@ class ColaCrossSeed(_PluginBase):
     def _line_clients(self) -> List[_Client]:
         return self._parse_client_lines(self._clients_lines)
 
+    @staticmethod
+    def _looks_like_address(token: str) -> bool:
+        """这一段像不像地址（host / host:port / http://…）。
+
+        用来在 `_parse_client_lines` 里**不靠位置**找地址 —— 4 段写法里
+        「名字在前」还是「名字在后」都有人写，硬按位置切会把用户名当地址
+        （2026-11-19 事故：`地址,用户,密码,名称` 被切成 name=地址、url=用户，
+        报 `Failed to resolve 'a172604'`）。
+        """
+        t = str(token or "").strip().lower()
+        if not t:
+            return False
+        if t.startswith(("http://", "https://")):
+            return True
+        if "/" in t or " " in t:
+            return False
+        if ":" in t:
+            return True
+        # 只认带点的（IPv4 / 域名）或 localhost：纯主机名与用户名/密码无法区分
+        return "." in t or t == "localhost"
+
     def _parse_client_lines(self, text: str) -> List[_Client]:
-        """每行一个客户端：`地址,用户名,密码`，或 `qb|tr,地址,用户名,密码`，可再带名称。"""
+        """每行一个客户端，**地址按内容识别，不靠位置**：
+
+            `地址,用户名,密码`
+            `地址,用户名,密码,名称`          ← 名称在后（最常见）
+            `名称,地址,用户名,密码`          ← 名称在前也认
+            `qb|tr,地址,用户名,密码[,名称]`   ← 显式指定类型
+        """
         out: List[_Client] = []
         for line in (text or "").splitlines():
             line = line.strip()
@@ -1590,21 +1618,105 @@ class ColaCrossSeed(_PluginBase):
                 logger.warn(f"下载器配置行格式不对（至少 地址,用户名,密码）：{line}")
                 continue
             kind = "qb"
-            name = ""
             if parts[0].lower() in ("qb", "qbittorrent", "tr", "transmission"):
                 kind = "tr" if parts[0].lower() in ("tr", "transmission") else "qb"
                 parts = parts[1:]
-            if len(parts) >= 4:
-                name = parts[0]
-                parts = parts[1:]
-            url = self._normalise_url(parts[0], "http")
-            if not name:
-                name = url.split("://", 1)[-1]
+            if len(parts) < 3:
+                logger.warn(f"下载器配置行格式不对：{line}")
+                continue
+            addr_idx = next((i for i, p in enumerate(parts)
+                             if self._looks_like_address(p)), None)
+            if addr_idx is None:
+                logger.warn(f"下载器配置里找不到地址段：{line}")
+                continue
+            url = self._normalise_url(parts[addr_idx], "http")
+            before = parts[:addr_idx]
+            after = parts[addr_idx + 1:]
+            if len(after) < 2:
+                logger.warn(f"下载器配置缺用户名或密码：{line}")
+                continue
+            user, password = after[0], after[1]
+            name = (before[0] if before
+                    else (after[2] if len(after) > 2 else url.split("://", 1)[-1]))
             if kind == "tr":
-                out.append(TransmissionClient(name, url, parts[1], parts[2]))
+                out.append(TransmissionClient(name, url, user, password))
             else:
-                out.append(QBittorrentClient(name, url, parts[1], parts[2]))
+                out.append(QBittorrentClient(name, url, user, password))
         return out
+
+    # ---- 下载器名字匹配 ----
+
+    @staticmethod
+    def _client_aliases(name: str) -> List[str]:
+        """一个下载器可能被用户写成的几种名字。
+
+        MP 枚举出来的实例带 `MP-` 前缀（`MP-tr辅种`），而用户在设置里只会写
+        `tr辅种`、`tr`。以前是 `c.name == wanted` 精确比，于是「辅种加到哪台」
+        填什么都匹配不上，静默退回自动判断 —— 表现为「这个功能不生效」。
+        """
+        raw = str(name or "").strip()
+        if not raw:
+            return []
+        out = [raw, raw.lower()]
+        if raw.lower().startswith("mp-"):
+            out += [raw[3:], raw[3:].lower()]
+        host = raw.split("://", 1)[-1].strip("/")
+        if host and host != raw:
+            out += [host, host.lower()]
+        # 去重但保持顺序
+        seen, uniq = set(), []
+        for x in out:
+            if x and x not in seen:
+                seen.add(x)
+                uniq.append(x)
+        return uniq
+
+    @staticmethod
+    def _normalise_target(raw: str) -> str:
+        """用户填的名字：去空白（含全角空格）、去包裹引号。"""
+        t = str(raw or "").replace("\u3000", " ").strip()
+        for q in ('"', "'", "`", "\u201c", "\u201d", "\u2018", "\u2019"):
+            if len(t) >= 2 and t.startswith(q) and t.endswith(q):
+                t = t[1:-1].strip()
+        return t
+
+    def _resolve_target_clients(self, raw: str, clients: List["_Client"]) -> List["_Client"]:
+        """把用户填的「辅种加到哪台」解析成实际客户端。
+
+        匹配优先级：完全一致 → 忽略大小写 → 去掉 `MP-` 前缀后一致 → **唯一**包含。
+        - 不做反向包含：`a in wanted` 会让短客户端名吞掉长输入，匹配到没点名的机器；
+        - 不做单字符模糊：`t` 会命中一整片；
+        - 多命中一律判歧义（返回空，让用户写全名）—— 猜错就把种子推到别的机器上，
+          宁可这一轮不加。
+        """
+        wanted = self._normalise_target(raw)
+        self._target_ambiguous = []
+        if not wanted:
+            return []
+        low = wanted.lower()
+        exact = [c for c in clients if c.name == wanted or c.name.lower() == low]
+        if len(exact) > 1:
+            # 两台下载器同名（或只差大小写）：用户写全名也无法区分，不能替他挑一台
+            self._target_ambiguous = [c.name for c in exact]
+            return []
+        if exact:
+            return exact
+        alias = [c for c in clients
+                 if any(a.lower() == low for a in self._client_aliases(c.name))]
+        if len(alias) > 1:
+            self._target_ambiguous = [c.name for c in alias]
+            return []
+        if alias:
+            return alias
+        if len(low) < 2:
+            return []
+        fuzzy = [c for c in clients
+                 if any(low in a.lower() for a in self._client_aliases(c.name))]
+        if len(fuzzy) == 1:
+            return fuzzy
+        if len(fuzzy) > 1:
+            self._target_ambiguous = [c.name for c in fuzzy]
+        return []
 
     def _line_sites(self) -> List[Dict[str, str]]:
         """每行一个站点。两种写法都支持，可以混用：
@@ -1971,19 +2083,44 @@ class ColaCrossSeed(_PluginBase):
         for info_hash, name in first.items():
             candidates = seeding.get(info_hash) or []
             preferred[info_hash] = candidates[0] if candidates else name
-        # 用户显式指定了目标下载器时，覆盖自动判断（只对它确实有的种子生效）
-        wanted = (self._target_client or "").strip()
-        if wanted:
-            holders: Dict[str, List[str]] = {}
-            for client, torrents in scanned:
-                for torrent in torrents:
-                    info_hash = torrent.get("hash")
-                    if info_hash:
-                        holders.setdefault(info_hash, []).append(client.name)
-            for info_hash, names in holders.items():
-                if wanted in names:
-                    preferred[info_hash] = wanted
+        # 「辅种加到哪台」**不在这里打补丁**：目标下载器在 `_apply_target_client`
+        # 里就已经把客户端列表收窄成一台，这里的自动判断天然只在那台里挑。
         return preferred
+
+    def _apply_target_client(self, clients: List["_Client"]) -> List["_Client"]:
+        """把「辅种加到哪台」落实到客户端列表上。
+
+        语义是**只要这一台**：留空才自动（谁在做种归谁）。以前这里只是给
+        `preferred` 打补丁 —— 目标机器上没有的种子照样会被加到别的机器上，
+        所以用户看到「指定了但还是往 qB 推」。名字也更宽松：`tr` 能匹配
+        `MP-tr辅种`、`tr辅种`（MP 枚举出来的实例带 `MP-` 前缀）。
+        解析不出来就本轮不加，绝不把种子推到没被点名的机器上。
+        """
+        wanted = (self._target_client or "").strip()
+        if not wanted:
+            self._target_state = {}
+            return clients
+        matched = self._resolve_target_clients(wanted, clients)
+        available = [c.name for c in clients]
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not matched and getattr(self, "_target_ambiguous", None):
+            self._target_state = {"wanted": wanted, "resolved": [], "available": available,
+                                  "ambiguous": list(self._target_ambiguous), "ok": False, "at": stamp}
+            logger.error(f"辅种目标 `{wanted}` 同时匹配到多台下载器："
+                         f"{', '.join(self._target_ambiguous)}。请写全名；如果名字本来就一样，"
+                         f"先去 MoviePilot 设置里给这两台改不同的名字。本轮不向任何下载器加种")
+            return []
+        if not matched:
+            self._target_state = {"wanted": wanted, "resolved": [], "available": available,
+                                  "ok": False, "at": stamp}
+            logger.error(f"辅种目标下载器 `{wanted}` 不存在；当前可用的有："
+                         f"{', '.join(available) or '（无）'}。本轮不向任何下载器加种")
+            return []
+        self._target_state = {"wanted": wanted, "resolved": [c.name for c in matched],
+                              "available": available, "ok": True, "at": stamp}
+        if [c.name for c in matched] != [wanted]:
+            logger.info(f"辅种目标 `{wanted}` → {', '.join(c.name for c in matched)}")
+        return matched
 
     def _mp_clients(self) -> List[_Client]:
         """枚举 MoviePilot「设置 → 下载器」里的**每一个**实例。
@@ -1993,11 +2130,14 @@ class ColaCrossSeed(_PluginBase):
         所有已启用实例，一台一个适配器。
         """
         out: List[_Client] = []
+        self._mp_enum_error = ""
         try:
             from app.application.downloader import DownloaderHelper
             services = DownloaderHelper().get_services() or {}
         except Exception as err:
-            logger.info(f"MoviePilot 多下载器接口不可用（{type(err).__name__}: {err}），退回单实例模式")
+            self._mp_enum_error = f"{type(err).__name__}: {err}"
+            logger.warn(f"MoviePilot 多下载器接口不可用（{self._mp_enum_error}），"
+                        f"只能看到默认下载器；此时「辅种加到哪台」填非默认机器的名字会解析不到")
             return []
         for name, info in services.items():
             instance = getattr(info, "instance", None)
@@ -2195,7 +2335,7 @@ class ColaCrossSeed(_PluginBase):
         self._save_pending(items)
 
     def _place(self, client: _Client, data: bytes, torrent: Dict[str, Any], key: str,
-               stats: Dict[str, int], bucket: str, hash_hint: str = "", site_key: str = "") -> None:
+               stats: Dict[str, int], bucket: str, hash_hint: str = "", site_key: str = "") -> bool:
         """把一颗种子放进客户端：成功 / 重复 / 失败降级 / 进失败队列，都在这里决定。
 
         交叉做种最常见的失败是「文件不完全一致」（多一个 nfo、少一条音轨）：校验态下客户端会
@@ -2218,12 +2358,12 @@ class ColaCrossSeed(_PluginBase):
         auto_tmm = bool(torrent.get("auto_tmm"))
         if site_key and self._site_budget_left(site_key) <= 0:
             stats["skipped"] = stats.get("skipped", 0) + 1
-            return  # 这个站这一轮已经补满 max_per_site 颗
+            return False  # 这个站这一轮已经补满 max_per_site 颗
         if hash_hint and client.has(hash_hint):
             # 客户端里已经有这颗：qB 一定会回 Fails.，别浪费一次上传，直接记重复
             stats["duplicate"] = stats.get("duplicate", 0) + 1
             self._remember(key)
-            return
+            return True
         remembered = self._take_tags(hash_hint) if hash_hint else ""
         result = client.add(data, save_path, self._skip_check, label, hash_hint,
                             category=category, auto_tmm=auto_tmm)
@@ -2241,13 +2381,13 @@ class ColaCrossSeed(_PluginBase):
             self._remember(key)
             if site_key:
                 self._site_counter[site_key] = self._site_counter.get(site_key, 0) + 1
-            return
+            return True
         if result == "dup":
             stats["duplicate"] = stats.get("duplicate", 0) + 1
             self._remember(key)
             # 重复说明客户端里本来就有这颗种子，之前记过的失败可以撤掉
             self._save_pending([x for x in self._pending() if x.get("key") != key])
-            return
+            return True
         if not self._skip_check and self._fallback_skip_check:
             retry = client.add(data, save_path, True, label, hash_hint)
             if retry == "ok":
@@ -2258,13 +2398,14 @@ class ColaCrossSeed(_PluginBase):
                 self._remember(key)
                 if site_key:
                     self._site_counter[site_key] = self._site_counter.get(site_key, 0) + 1
-                return
+                return True
             if retry == "dup":
                 stats["duplicate"] = stats.get("duplicate", 0) + 1
                 self._remember(key)
-                return
+                return True
         stats["failed"] += 1
         self._queue_failure(client.name, key, data, save_path, label)
+        return False
 
     def _retry_pending(self, clients: Dict[str, _Client], done: set, stats: Dict[str, int]) -> None:
         """先重试上一轮失败的种子（最多 max_per_hour 个，占当轮预算）。"""
@@ -2278,7 +2419,10 @@ class ColaCrossSeed(_PluginBase):
                 continue
             client = clients.get(item.get("client") or "")
             if client is None:
-                continue  # 下载器已被删掉，这条失败记录没有意义
+                # 不在本轮名单里（例如指定了别的目标下载器）：留着，别静默丢掉 ——
+                # 配置改回来还能继续重试；以前直接 continue，等于把记录删了。
+                left.append(item)
+                continue
             key = item.get("key") or ""
             if key in done:
                 continue
@@ -2853,15 +2997,27 @@ class ColaCrossSeed(_PluginBase):
 
     def _test_clients(self) -> List[str]:
         lines: List[str] = []
-        for client in self._clients():
+        clients = self._clients()
+        wanted = (self._target_client or "").strip()
+        target_names = ({c.name for c in self._resolve_target_clients(wanted, clients)}
+                        if wanted and clients else set())
+        for client in clients:
+            mark = " ← 辅种目标" if client.name in target_names else ""
             torrents = client.list_completed()
             if torrents:
-                lines.append(f"✅ {client.name}：连接成功，已完成 {len(torrents)} 个种子")
+                lines.append(f"✅ {client.name}：连接成功，已完成 {len(torrents)} 个种子{mark}")
             else:
                 # 能连上但列表为空，和连不上要分开说。
-                lines.append(f"⚠️ {client.name}：连接成功，但没有已完成种子（或读取失败）")
+                lines.append(f"⚠️ {client.name}：连接成功，但没有已完成种子（或读取失败）{mark}")
         if not lines:
             lines.append("❌ 没有可用下载器：检查「下载器」每行格式与地址")
+        if wanted and not target_names:
+            ambiguous = list(getattr(self, "_target_ambiguous", []) or [])
+            if ambiguous:
+                lines.append(f"❌ 辅种目标 `{wanted}` 同时匹配到多台：{', '.join(ambiguous)}；请写全名")
+            else:
+                lines.append(f"❌ 辅种目标 `{wanted}` 没匹配到任何下载器；"
+                             f"可用：{', '.join(c.name for c in clients) or '（无）'}")
         return lines
 
     def _probe_pieces(self, site: Dict[str, str]) -> Tuple[bool, str]:
@@ -3061,6 +3217,25 @@ class ColaCrossSeed(_PluginBase):
         if not clients:
             logger.warn("没有可用的下载器")
             return
+        # 「辅种加到哪台」在这里落地：解析不出来就本轮不加（不回落自动，免得推到没点名的机器）
+        all_clients = clients
+        clients = self._apply_target_client(all_clients)
+        try:
+            self.save_data("target_state", self._target_state or {})
+        except Exception:
+            pass
+        if not clients:
+            # 目标名写错 = 本轮什么都不做，但**必须留痕**：否则面板「上次运行」停在上一轮，
+            # 用户以为任务没跑，其实是名字没对上。
+            state = self._target_state or {}
+            stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0,
+                     "duplicate": 0, "retried": 0, "already": 0, "trackers": 0}
+            self.save_data("last_run", {
+                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), **stats,
+                "reason": (f"辅种目标 {state.get('wanted')} 匹配到多台下载器，本轮跳过"
+                           if state.get("ambiguous") else
+                           f"辅种目标 {state.get('wanted')} 不存在，本轮跳过")})
+            return
         # 限速只针对保种组（老板 2026-11-15）：辅种不接管、不改任何客户端限速设置
         # 自愈：上一轮加进去但文件对不上的（state=missingFiles），清掉，别在 qB 里留垃圾
         for client in clients:
@@ -3096,14 +3271,33 @@ class ColaCrossSeed(_PluginBase):
         # 所以“另一边已经有的可乐种”必须跳过，不能只在本客户端内去重。
         if self._retry_failed:
             self._retry_pending({c.name: c for c in clients}, done, stats)
+        # 扫描两件事分开：**加种**只落目标下载器；**去重用的 hash 视图**必须是全部下载器。
+        # tracker 不允许同一账号同一颗种子在多台同时做种，收窄扫描范围会把这条守卫弄丢
+        # （2026-11-19 复审指出：目标改到 tr 后，qB 里已有的可乐种会被重复拉一遍）。
+        target_ids = {id(c) for c in clients}
         scanned = []
         all_hashes = set()
-        for client in clients:
+        for client in all_clients:
             torrents = client.list_completed()
-            if torrents:
+            if not torrents:
+                continue
+            all_hashes.update(t["hash"] for t in torrents if t.get("hash"))
+            if id(client) in target_ids:
                 scanned.append((client, torrents))
-                all_hashes.update(t["hash"] for t in torrents if t.get("hash"))
         # 同一颗种子在多个下载器里都有时，只在「正在做种」的那个里补种（见 _preferred_clients）。
+        if not scanned:
+            # 收窄到目标下载器后，如果这台读不到任何种子（连不上 / 列表为空），
+            # 后面所有分支都会静默跳过 —— 用户只会看到「上次运行」停在旧时间。
+            wanted = (self._target_client or "").strip()
+            logger.warn(f"没有扫描到任何种子（{'目标下载器 ' + wanted if wanted else '全部下载器'}），"
+                        f"本轮不会加种。检查下载器连通性与「已完成」列表")
+            if wanted and all_hashes:
+                logger.warn(f"目标下载器 `{wanted}` 读不到种子，但其它下载器有 {len(all_hashes)} 颗 —— "
+                            f"重点查目标机的地址/账号，或它是不是被选成了空客户端")
+            self.save_data("scan_empty", {
+                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "target": (self._target_client or "").strip(),
+                "others": len(all_hashes)})
         preferred = self._preferred_clients(scanned)
         if len(scanned) > 1:
             logger.info(f"下载器 {len(scanned)} 个；同一颗种子跨客户端的归属已按「谁在做种」决定")
@@ -3191,9 +3385,9 @@ class ColaCrossSeed(_PluginBase):
                             by_site[site_url]["trackers"] += 1
                             logger.info(f"{site_url} 同一 info_hash 已在客户端，已补 tracker：{tracker_hash[:8]}")
                         continue
-                    self._place(client, data, torrent, key, stats, "filled",
-                                hash_hint=tracker_hash, site_key=site_url)
-                    done.add(key)
+                    if self._place(client, data, torrent, key, stats, "filled",
+                                   hash_hint=tracker_hash, site_key=site_url):
+                        done.add(key)
                     rss_done = True
                     by_site.setdefault(site_url, {"added": 0, "failed": 0})["added"] += 1
                 if rss_done:
@@ -3230,8 +3424,9 @@ class ColaCrossSeed(_PluginBase):
                     if not data:
                         stats["failed"] += 1
                         continue
-                    self._place(client, data, torrent, key, stats, "added", (hit.get("info_hash") or "").lower())
-                    done.add(key)
+                    if self._place(client, data, torrent, key, stats, "added",
+                                   (hit.get("info_hash") or "").lower()):
+                        done.add(key)
                 # 方向二：客户端已是可乐种子，去别的站补同 pieces 的种
                 elif self._direction in ("both", "other_only") and self._iyuu_token and sid_map:
                     # IYUU 云端匹配：把客户端 hash 发过去，拿回「站点 + torrent_id」。
@@ -3271,10 +3466,10 @@ class ColaCrossSeed(_PluginBase):
                             continue
                         # 站点返回的种子自己的 info_hash：qB 回 Fails. 时用来判断是「早就有」
                         # 还是「种子本身坏了」（以前一律打「未知 hash」）
-                        self._place(client, remote, torrent, key, stats, "filled",
-                                    hash_hint=_torrent_info_hash(remote),
-                                    site_key=site.get("name") or site.get("url") or "?")
-                        done.add(key)
+                        if self._place(client, remote, torrent, key, stats, "filled",
+                                       hash_hint=_torrent_info_hash(remote),
+                                       site_key=site.get("name") or site.get("url") or "?"):
+                            done.add(key)
                         by_site.setdefault(site.get("name") or site.get("url") or "?", {"added": 0, "failed": 0})["added"] += 1
                 elif own_hits and sites and self._direction in ("both", "other_only"):
                     hit = own_hits[0]
@@ -3300,8 +3495,9 @@ class ColaCrossSeed(_PluginBase):
                         if not remote:
                             stats["failed"] += 1
                             continue
-                        self._place(client, remote, torrent, key, stats, "filled", site_key=site.get("name") or site.get("url") or "?")
-                        done.add(key)
+                        if self._place(client, remote, torrent, key, stats, "filled",
+                                       site_key=site.get("name") or site.get("url") or "?"):
+                            done.add(key)
                         by_site.setdefault(site.get("name") or site.get("url") or "?", {"added": 0, "failed": 0})["added"] += 1
         if by_site:
             stats["by_site"] = by_site
@@ -3384,6 +3580,39 @@ class ColaCrossSeed(_PluginBase):
                                          f"重复 {last.get('duplicate', 0)}，失败 {last.get('failed', 0)}；"
                                          f"待重试 {len(pending)} 个。"}
         ]
+        if isinstance(last, dict) and last.get("reason"):
+            blocks.append({"component": "div",
+                           "text": f"⚠️ 上一轮没加种：{last['reason']}"})
+        # 下载器清单 + 「辅种加到哪台」的解析结果：名字对不上是这里最容易踩的坑，
+        # 把可用名字直接列在页面上，用户不用去翻日志。
+        try:
+            live_clients = self._clients()
+        except Exception as err:
+            live_clients = []
+            logger.info(f"读取下载器列表失败：{type(err).__name__}: {err}")
+        live_names = [c.name for c in live_clients]
+        wanted = (self._target_client or "").strip()
+        if wanted:
+            matched = [c.name for c in self._resolve_target_clients(wanted, live_clients)] if live_clients else []
+            ambiguous = list(getattr(self, "_target_ambiguous", []) or [])
+            if matched:
+                blocks.append({"component": "div",
+                               "text": f"辅种目标：`{wanted}` → {', '.join(matched)}（只往这一台加种）"})
+            elif ambiguous:
+                blocks.append({"component": "div",
+                               "text": (f"⚠️ 辅种目标 `{wanted}` 同时匹配到多台：{', '.join(ambiguous)}，"
+                                        f"本轮不会加种。请写全名")})
+            else:
+                blocks.append({"component": "div",
+                               "text": (f"⚠️ 辅种目标 `{wanted}` 没匹配到任何下载器，本轮不会加种。"
+                                        f"当前可用：{', '.join(live_names) or '（读不到下载器）'}")})
+        elif live_names:
+            blocks.append({"component": "div",
+                           "text": f"辅种目标：自动（谁在做种归谁）。当前下载器：{', '.join(live_names)}"})
+        if getattr(self, "_mp_enum_error", ""):
+            blocks.append({"component": "div",
+                           "text": f"⚠️ MoviePilot 多下载器接口不可用（{self._mp_enum_error}）："
+                                   f"只列出默认下载器，勾了「使用 MP 已配置下载器」也只看到这一台。"})
         sites = self._other_sites()
         # IYUU 一键导入的账目：粘一次 JSON 之后，这里就是「到底生效了哪些」的唯一凭据
         iyuu_imported = [] if (self._sites_mode or "merge") == "manual" else self._iyuu_sites()
