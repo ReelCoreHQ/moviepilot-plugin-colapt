@@ -16,6 +16,7 @@
 """
 import base64
 import hashlib
+import hmac
 import json
 import re
 import subprocess
@@ -1218,7 +1219,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.10"
+    plugin_version = "0.2.12"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -2062,18 +2063,153 @@ class ColaSeedGroup(_PluginBase):
         except Exception as err:
             logger.warn(f"保种组清理异常（不影响本轮同步）：{type(err).__name__}: {err}")
 
+    # ==================== 插件凭据 ====================
+    # 站点给每份插件安装发两样东西：
+    #   票据（rcapi_…，两小时）—— 随每次上报走。短命是因为它每 5 分钟过一过一次网络，
+    #     泄露窗口按小时算，不按年算。
+    #   签名密钥（长期）—— 只留在本机插件数据里，唯一的用途是票据过期后换一张新的。
+    #     它驱动不了任何业务端点：站点只认它的 HMAC，不把它当 token。
+    #
+    # 为什么必须能换票：票据两小时就过期，而站点登录要解图形验证码，那只能在浏览器前解。
+    # 没有换票，用户每两小时要回家点一次验证码 —— 那不是安全，那是让人把插件关掉。
+    PLUGIN_ID = "colaseedgroup"
+    _SIG_MODEL = "COLA-PLUGIN-1"
+
+    def _plugin_instance_id(self) -> str:
+        """本机实例标识：首次生成后落盘，容器重建不变（数据卷还在）。"""
+        iid = str(self.get_data("plugin_instance_id") or "").strip()
+        if not iid:
+            iid = uuid.uuid4().hex[:16]
+            self.save_data("plugin_instance_id", iid)
+        return iid
+
+    def _plugin_credentials(self) -> Tuple[str, str]:
+        """返回 (票据, 签名密钥)。只存在插件数据里，不渲染到表单 —— 可编辑的输入框
+        只会让用户把自己别的机器的票据粘进来。"""
+        return (str(self.get_data("plugin_key") or "").strip(),
+                str(self.get_data("plugin_signing_key") or "").strip())
+
+    def _plugin_save_credentials(self, token: str = "", secret: str = "") -> None:
+        if token:
+            self.save_data("plugin_key", token)
+        if secret:
+            self.save_data("plugin_signing_key", secret)
+
+    def _plugin_signature(self, method: str, url: str, body: str) -> str:
+        """签名串必须与站点逐字节一致：
+        COLA-PLUGIN-1 / method / path+query / instance / ts / nonce / sha256hex(body)。
+        站点侧有同名实现与固定向量测试，改格式两边会一起红。"""
+        _, secret = self._plugin_credentials()
+        if not secret:
+            return ""
+        # 站点签的是「路径 + 查询串」，不含 scheme 与 host。
+        host_and_path = url.split("://", 1)[-1]
+        slash = host_and_path.find("/")
+        path = host_and_path[slash:] if slash >= 0 else "/"
+        ts = int(time.time())
+        nonce = base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b"=").decode()
+        body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        canonical = "\n".join([self._SIG_MODEL, method, path, self._plugin_instance_id(),
+                               str(ts), nonce, body_hash])
+        mac = base64.urlsafe_b64encode(
+            hmac.new(secret.encode("utf-8"), canonical.encode("utf-8"),
+                     hashlib.sha256).digest()).rstrip(b"=").decode()
+        return f"v1 ts={ts} nonce={nonce} mac={mac}"
+
+    def _plugin_headers(self, method: str, url: str, body: str) -> Dict[str, str]:
+        """带凭据的请求头。
+
+        刻意不带 Cookie / X-CSRF-Token：那是浏览器会话的东西。混进来只会让站点分不清
+        这次调用按哪个身份算，票据等于白拿。
+        """
+        token, _ = self._plugin_credentials()
+        headers = {
+            "Content-Type": "application/json",
+            "Origin": COLA_BASE,
+            "X-Plugin-Instance": self._plugin_instance_id(),
+            "X-Plugin-Version": self.plugin_version,
+        }
+        if token:
+            headers["X-API-Key"] = token
+            sig = self._plugin_signature(method, url, body)
+            if sig:
+                headers["X-Plugin-Signature"] = sig
+        return headers
+
+    def _plugin_enroll(self) -> bool:
+        """用站点会话换一把票据（登录成功后调用）。"""
+        if not self._session_token:
+            return False
+        payload = {"plugin_id": self.PLUGIN_ID,
+                   "instance_id": self._plugin_instance_id(),
+                   "label": ""}
+        url = urljoin(COLA_BASE, "/api/v1/plugin/keys")
+        headers = {"Content-Type": "application/json", "Origin": COLA_BASE,
+                   "Cookie": f"reelcore_session={self._session_token}"}
+        csrf = self._csrf_token()
+        if csrf:
+            headers["X-CSRF-Token"] = csrf
+        try:
+            rsp = _curl("POST", url, headers=headers, json_body=payload, timeout=REQUEST_TIMEOUT)
+        except Exception as err:
+            logger.warn(f"插件凭据签发失败：{type(err).__name__}: {err}")
+            return False
+        if rsp is None or rsp.status_code not in (200, 201):
+            logger.warn(f"插件凭据签发失败：站点返回 {0 if rsp is None else rsp.status_code}"
+                        "（站点未升级时这里会是 404，插件按会话继续跑）")
+            return False
+        try:
+            data = json.loads(rsp.text or "{}")
+        except Exception:
+            return False
+        token = str(data.get("token") or "")
+        secret = str(data.get("signing_key") or "")
+        if not token or not secret:
+            return False
+        self._plugin_save_credentials(token, secret)
+        logger.info(f"可乐PT 插件凭据已签发（{token[:12]}…），有效期至 {data.get('expires_at')}")
+        return True
+
+    def _plugin_renew(self) -> bool:
+        """用签名换一张新票据。不需要站点会话 —— 站点宕机几小时后恢复，插件一次调用就活。"""
+        token, secret = self._plugin_credentials()
+        if not token or not secret:
+            return False
+        url = urljoin(COLA_BASE, "/api/v1/plugin/keys/renew")
+        sig = self._plugin_signature("POST", url, "")
+        if not sig:
+            return False
+        headers = {"Content-Type": "application/json", "Origin": COLA_BASE,
+                   "X-API-Key": token, "X-Plugin-Instance": self._plugin_instance_id(),
+                   "X-Plugin-Version": self.plugin_version, "X-Plugin-Signature": sig}
+        try:
+            rsp = _curl("POST", url, headers=headers, timeout=REQUEST_TIMEOUT)
+        except Exception as err:
+            logger.warn(f"插件凭据换新失败：{type(err).__name__}: {err}")
+            return False
+        if rsp is None or rsp.status_code != 200:
+            return False
+        try:
+            data = json.loads(rsp.text or "{}")
+        except Exception:
+            return False
+        new_token = str(data.get("token") or "")
+        if not new_token:
+            return False
+        self._plugin_save_credentials(token=new_token)
+        logger.info(f"可乐PT 插件凭据已换新（{new_token[:12]}…）")
+        return True
+
     def _maybe_report(self, clients: List[_Client], state: Dict[str, Any]) -> None:
         """上报不抛异常：限速采集/发送失败不能影响保种本身。
 
-        **只有站点工作组成员才汇报**（2026-11-18 老板定）：非成员照样拉官种、照样算自己的
-        覆盖与缺口，只是数据不进站点考核表 —— 申请进组后自动开始汇报。
+        **所有人都上报**（2026-11-19 改）。原先「只有工作组成员才汇报」的规则会让非成员的
+        票据永远拿不到续命的业务写入 —— 他们一行都不发，站点两小时后就当他们掉线，
+        而换票次数有限，几天之后就必须重新解图形验证码。
+        现在站点按上报者当时的身份决定这一行进不进考核（rc_site_seed_group_reports.is_staff），
+        非成员的数据只留档，不影响任何人的分数。
         """
         try:
-            if not (self._sg_unlock_record() or {}).get("staff"):
-                state["report_skipped"] = "非工作组成员，不上报（进组后自动开始）"
-                self.save_data("seedgroup_state", state)
-                return
-
             report = self._report_seedgroup(clients, state)
             state["report_ok"] = report.get("ok")
             state["report_reason"] = report.get("reason")
@@ -2127,20 +2263,26 @@ class ColaSeedGroup(_PluginBase):
             "enforced": {"dl_kib": self._limit_dl_kib, "up_kib": self._limit_up_kib},
             "clients": limits,
         }
-        # 站点对 POST 要求「会话 Cookie + CSRF + Origin」三件套（契约 x-origin-required），
-        # 少了任何一个都会 403 origin_denied —— 早先这里只带 Content-Type，线上会一直 403。
-        headers = {"Content-Type": "application/json", "Origin": COLA_BASE}
-        if self._session_token:
-            headers["Cookie"] = f"reelcore_session={self._session_token}"
-        csrf = self._csrf_token()
-        if csrf:
-            headers["X-CSRF-Token"] = csrf
-        if self._seedgroup_report_token:
-            headers["X-Report-Token"] = self._seedgroup_report_token
+        # 上报只认插件凭据（两小时票据 + 实例签名），站点会话不再能写这一行。
+        # 没有票据时先领一把 —— 领不到（站点还没升级）就按会话继续跑，不报错。
+        if not self._plugin_credentials()[0] and self._session_token:
+            self._plugin_enroll()
+        # 签名要对**实际发出去的字节**算，所以按 _curl 里同一个 json.dumps 先算出字符串。
+        body_text = json.dumps(payload)
+        headers = self._plugin_headers("POST", url, body_text)
         status = 0
         try:
             rsp = _curl("POST", url, headers=headers, json_body=payload, timeout=REQUEST_TIMEOUT)
             status = 0 if rsp is None else rsp.status_code
+            # 票据过期才值得换一张：站点把「过期」与「无效/撤销」分开答，撤销了换也没用，
+            # 那种情况只能重新登录站点。
+            if status == 401 and self._plugin_credentials()[0]:
+                if self._plugin_renew():
+                    headers = self._plugin_headers("POST", url, body_text)
+                    rsp = _curl("POST", url, headers=headers, json_body=payload,
+                                timeout=REQUEST_TIMEOUT)
+                    status = 0 if rsp is None else rsp.status_code
+                    out["renewed"] = True
         except Exception as err:
             out["reason"] = f"{type(err).__name__}: {err}"
         out["status"] = status
