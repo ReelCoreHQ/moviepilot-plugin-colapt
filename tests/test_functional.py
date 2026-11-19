@@ -618,25 +618,165 @@ class PreferredClientTest(unittest.TestCase):
 
 
 class TargetClientTest(unittest.TestCase):
-    """手动指定目标下载器时，应覆盖「谁在做种」的自动判断。"""
+    """手动指定目标下载器：只往这一台加，且名字匹配要宽松。
 
-    def test_override_to_tr(self):
-        plugin = support.make_plugin(mod, _target_client="TR")
+    2026-11-19 现场事故：MP 枚举出来的实例叫 `MP-tr辅种`，用户填 `tr` / `tr辅种`
+    都匹配不上（以前 `_preferred_clients` 里是 `wanted in names` 精确比），
+    静默退回自动判断 —— 用户看到的就是「指定下载器这个功能不生效」。
+    """
+
+    def _clients(self):
+        qb = support.FakeClient(); qb.name = "MP-qb下载"
+        tr = support.FakeClient(); tr.name = "MP-tr辅种"
+        return [qb, tr]
+
+    def test_exact_name(self):
+        plugin = support.make_plugin(mod, _target_client="MP-tr辅种")
+        got = plugin._apply_target_client(self._clients())
+        self.assertEqual([c.name for c in got], ["MP-tr辅种"])
+
+    def test_mp_prefix_is_optional(self):
+        for wanted in ("tr辅种", "MP-tr辅种", "TR辅种"):
+            plugin = support.make_plugin(mod, _target_client=wanted)
+            got = plugin._apply_target_client(self._clients())
+            self.assertEqual([c.name for c in got], ["MP-tr辅种"], wanted)
+
+    def test_short_prefix_contains(self):
+        """用户常只写 `tr`，实例叫 `tr辅种`：包含匹配。"""
+        plugin = support.make_plugin(mod, _target_client="tr")
+        got = plugin._apply_target_client(self._clients())
+        self.assertEqual([c.name for c in got], ["MP-tr辅种"])
+
+    def test_unknown_target_adds_nothing(self):
+        """填错名字时**一轮都不加**，绝不回落把种子推到没点名的机器上。"""
+        plugin = support.make_plugin(mod, _target_client="不存在的机器")
+        self.assertEqual(plugin._apply_target_client(self._clients()), [])
+        self.assertFalse(plugin._target_state.get("ok"))
+        self.assertEqual(plugin._target_state.get("available"),
+                         ["MP-qb下载", "MP-tr辅种"])
+
+    def test_blank_target_keeps_all(self):
+        plugin = support.make_plugin(mod, _target_client="")
+        got = plugin._apply_target_client(self._clients())
+        self.assertEqual([c.name for c in got], ["MP-qb下载", "MP-tr辅种"])
+
+    def test_preferred_inside_target_only(self):
+        """收窄之后自动判断只在目标那台里挑，不会把别的下载器写在 owner 里。"""
+        plugin = support.make_plugin(mod, _target_client="tr辅种")
+        clients = plugin._apply_target_client(self._clients())
         h = "ab" * 20
-        qb = support.FakeClient(); qb.name = "qB"
-        tr = support.FakeClient(); tr.name = "TR"
-        scanned = [(qb, [{"hash": h, "state": "uploading"}]),
-                   (tr, [{"hash": h, "state": "pausedDL"}])]
-        self.assertEqual(plugin._preferred_clients(scanned)[h], "TR")
+        scanned = [(clients[0], [{"hash": h, "state": "uploading"}])]
+        self.assertEqual(plugin._preferred_clients(scanned)[h], "MP-tr辅种")
 
-    def test_override_ignored_when_client_lacks_hash(self):
-        plugin = support.make_plugin(mod, _target_client="TR")
-        h = "cd" * 20
-        qb = support.FakeClient(); qb.name = "qB"
-        tr = support.FakeClient(); tr.name = "TR"
-        scanned = [(qb, [{"hash": h, "state": "uploading"}]),
-                   (tr, [{"hash": "ee" * 20, "state": "uploading"}])]
-        self.assertEqual(plugin._preferred_clients(scanned)[h], "qB")
+
+class TargetAmbiguityTest(unittest.TestCase):
+    """名字有歧义时不能瞎挑：宁可这一轮不加，也不能推到没点名的机器上。"""
+
+    def _clients(self):
+        a = support.FakeClient(); a.name = "MP-tr辅种"
+        b = support.FakeClient(); b.name = "MP-tr备用"
+        return [a, b]
+
+    def test_multiple_matches_stop(self):
+        plugin = support.make_plugin(mod, _target_client="tr")
+        self.assertEqual(plugin._apply_target_client(self._clients()), [])
+        self.assertFalse(plugin._target_state.get("ok"))
+        self.assertEqual(sorted(plugin._target_state.get("ambiguous") or []),
+                         ["MP-tr备用", "MP-tr辅种"])
+
+    def test_full_name_resolves_even_with_sibling(self):
+        plugin = support.make_plugin(mod, _target_client="MP-tr备用")
+        got = plugin._apply_target_client(self._clients())
+        self.assertEqual([c.name for c in got], ["MP-tr备用"])
+
+    def test_single_char_never_fuzzy(self):
+        plugin = support.make_plugin(mod, _target_client="t")
+        self.assertEqual(plugin._apply_target_client(self._clients()), [])
+
+    def test_quoted_and_spaced_input(self):
+        plugin = support.make_plugin(mod, _target_client='  "MP-tr辅种"  ')
+        got = plugin._apply_target_client(self._clients())
+        self.assertEqual([c.name for c in got], ["MP-tr辅种"])
+
+    def test_pending_for_other_client_is_kept(self):
+        """收窄客户端后，别的机器的待重试记录要留着，不能静默丢。"""
+        plugin = support.make_plugin(mod, _target_client="MP-tr备用")
+        plugin._pending = lambda: [{"client": "MP-qb下载", "key": "k1", "data": ""}]
+        plugin._save_pending = lambda x: setattr(plugin, "_saved", x)
+        meta = {"added": 0, "filled": 0, "duplicate": 0, "retried": 0, "failed": 0, "skipped": 0}
+        plugin._retry_pending({"MP-tr备用": self._clients()[0]}, set(), meta)
+        self.assertEqual([x["key"] for x in getattr(plugin, "_saved", [])], ["k1"])
+
+
+class TargetDuplicateNameTest(unittest.TestCase):
+    """两台同名（或只差大小写）时，写全名也分不清，必须判歧义而不是挑一台。"""
+
+    def _clients(self):
+        a = support.FakeClient(); a.name = "MP-tr辅种"
+        b = support.FakeClient(); b.name = "mp-TR辅种"
+        return [a, b]
+
+    def test_same_name_is_ambiguous(self):
+        plugin = support.make_plugin(mod, _target_client="MP-tr辅种")
+        self.assertEqual(plugin._apply_target_client(self._clients()), [])
+        self.assertFalse(plugin._target_state.get("ok"))
+
+    def test_alias_stage_ambiguity(self):
+        plugin = support.make_plugin(mod, _target_client="tr辅种")
+        self.assertEqual(plugin._apply_target_client(self._clients()), [])
+        self.assertTrue(plugin._target_state.get("ambiguous"))
+
+
+class PlaceResultTest(unittest.TestCase):
+    """失败不能记 done：记了下一轮就永远跳过这颗（复审 M2）。"""
+
+    def test_fail_returns_false(self):
+        plugin = support.make_plugin(mod)
+        client = support.FakeClient()
+        client.add = lambda *a, **k: "fail"
+        torrent = {"hash": "ab" * 20, "save_path": "/d"}
+        stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0,
+                 "failed": 0, "duplicate": 0, "retried": 0, "already": 0, "trackers": 0}
+        self.assertFalse(plugin._place(client, b"data", torrent, "k", stats, "added"))
+
+    def test_duplicate_returns_true(self):
+        plugin = support.make_plugin(mod)
+        client = support.FakeClient()
+        client.add = lambda *a, **k: "dup"
+        torrent = {"hash": "cd" * 20, "save_path": "/d"}
+        stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0,
+                 "failed": 0, "duplicate": 0, "retried": 0, "already": 0, "trackers": 0}
+        self.assertTrue(plugin._place(client, b"data", torrent, "k", stats, "added"))
+
+
+class CrossSeedClientLinesTest(unittest.TestCase):
+    """辅种插件的下载器配置行：4 段写法按内容识别地址（保种组 0.2.8/0.2.9 同款修复）。"""
+
+    def setUp(self):
+        self.p = support.make_plugin(mod)
+
+    def test_name_after_password(self):
+        got = self.p._parse_client_lines("192.168.31.100:8081,a172604,qq321321,NAS-本地")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].name, "NAS-本地")
+        self.assertEqual(got[0].url, "http://192.168.31.100:8081")
+
+    def test_name_before_address(self):
+        got = self.p._parse_client_lines("198-远端,198.72.127.68:8081,qb1,qq321321")
+        self.assertEqual(got[0].name, "198-远端")
+        self.assertEqual(got[0].url, "http://198.72.127.68:8081")
+
+    def test_tr_kind_prefix(self):
+        got = self.p._parse_client_lines("tr,198.72.127.68:9091,admin,pwd,198-TR")
+        self.assertEqual(got[0].name, "198-TR")
+        self.assertEqual(got[0].url, "http://198.72.127.68:9091/transmission/rpc")
+        self.assertIn("Transmission", type(got[0]).__name__)
+
+    def test_username_not_address(self):
+        for token in ("a172604", "qq321321", "qb1"):
+            self.assertFalse(self.p._looks_like_address(token), token)
+        for token in ("192.168.31.100:8081", "127.0.0.1", "localhost"):
+            self.assertTrue(self.p._looks_like_address(token), token)
 
 
 class PlaceTest(unittest.TestCase):
