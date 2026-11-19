@@ -148,11 +148,24 @@ curl -X POST "http://<MP地址>/api/v1/plugin/ColaCrossSeed/sites/import" \
 
 开了保种组的用户，每轮同步结束会把**每台客户端此刻的限速**（qB 读 `preferences.dl_limit/up_limit`，
 TR 读 `session-get` 的 `speed-limit-*`）连同档位、覆盖体积、缺口、插件是否接管限速，一起
-`POST` 到站点收集端 **`https://www.colapt.com/seedgroup-report`**（站点 nginx 反代到本机收集服务，带 `X-Report-Token`）。
+`POST` 到 **`https://www.colapt.com/api/v1/plugin/seed-group/report`**。
 
-- 只采集保种组用户：**没开保种组的用户一条都不发**；
-- 上报失败只记日志与面板，不影响保种；
-- 站点侧落盘：`23:/var/log/colapt-seedgroup/report-YYYYMMDD.jsonl`（一行一条 JSON）。
+**认证用站点签发的插件凭据，不是登录会话**（0.2.12 起）：
+
+- 插件登录成功后，用会话换一把**两小时票据** `rcapi_…` + 一把**长寿命签名密钥**；
+- 每个上报请求带 `X-API-Key` + `X-Plugin-Instance` + `X-Plugin-Signature`
+  （HMAC-SHA256，绑定 method/路径/body/时间窗/nonce），伪造或别的插件拿不到有效签名；
+- 票据过期时用签名密钥**自动换新**，不需要重新登录、不需要图形验证码 ——
+  所以无人值守的 NAS 不会每两小时掉线；
+- 凭据只存在插件数据里，设置页不显示、也不可编辑（可编辑的输入框只会让人把自己的另一把票据粘进来）。
+
+其他约定：
+
+- **所有人都会上报**（不只是工作组成员）：站点按上报者当时的身份决定这一行进不进考核，
+  非成员的数据只留档。这样非成员的票据才有续命所需的业务写入；
+- 站点**自己算** `target_gib` 与 `on_target`，插件报的这两个值只作参考 ——
+  所以谎报「已达标」不会生效；
+- 上报失败只记日志与面板，不影响保种。
 
 `_MPClient`（走 MoviePilot 已配置下载器）目前不支持反向设置，会在日志里记「失败 1 台」；要用限速接管请把 qB/TR 写成自定义下载器行。
 
