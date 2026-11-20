@@ -1114,7 +1114,7 @@ class StaleCoverageFallbackTest(unittest.TestCase):
                 calls.append(1)
                 raise TimeoutError("read timed out")
 
-        hashes, gib, blind = p._sg_current([Dead()])
+        hashes, gib, blind, offline = p._sg_current([Dead()])
         self.assertTrue(calls)
         self.assertEqual(blind, 1, "读失败要记一次 blind，但不能算 0")
         # FakeClient 默认返回空列表 ⇒ 第一次缓存 gib=0；这里只断言「不抛、不炸」
@@ -1141,7 +1141,7 @@ class StaleCoverageFallbackTest(unittest.TestCase):
             def list_completed(self):
                 raise TimeoutError("down")
 
-        _, gib, blind = p._sg_current([Dead()])
+        _, gib, blind, offline = p._sg_current([Dead()])
         self.assertEqual(gib, 0.0, "超过 TTL 的缓存必须失效，不能一直算进去")
         self.assertEqual(blind, 1)
 
@@ -1254,7 +1254,7 @@ class SeedGroupDownloadQuotaTest(unittest.TestCase):
         client.inflight_count = inflight
         plugin._sg_clients = lambda: [client]
         plugin._sg_unlocked = lambda: (True, {"ok": True, "groups": ["工作组-组长"], "reason": ""})
-        plugin._sg_current = lambda clients: (set(), 0.0, 0)
+        plugin._sg_current = lambda clients: (set(), 0.0, 0, 0)
         plugin._sg_skips = lambda: set()
         plugin._sg_candidates = lambda: [
             {"torrent_id": i, "info_hash": f"{i:040x}", "size": 500 * mod.GIB, "official": True}
