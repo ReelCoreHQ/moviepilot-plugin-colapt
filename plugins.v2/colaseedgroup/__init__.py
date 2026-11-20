@@ -3545,7 +3545,7 @@ class ColaSeedGroup(_PluginBase):
             # 稳态：该保的都保了。下架清理仍要跑（UI 写的是「每轮回站点核对」）。
             state.update({"activated": True, "covered_gib": current_gib, "shortfall_gib": 0.0})
             if skips:
-                state["reason"] = f"{len(skips)} 条在 7 天跳过表里，本轮不重试"
+                state["reason"] = f"{len(skips)} 条在跳过表里，本轮不重试"
             self.save_data("seedgroup_state", state)
             logger.info(f"保种组已达标：档位 {tier} / 目标 {target} GiB / 现有 {current_gib} GiB")
             try:
@@ -3569,8 +3569,13 @@ class ColaSeedGroup(_PluginBase):
             # 保种时长的连续区间被凭空打断，而客户端里其实好好保着 1348 GiB。
             state["covered_gib"] = current_gib
             state["shortfall_gib"] = max(0.0, need)
-            state["reason"] = (f"池中 {len(pool_all)} 条全部已在客户端或处于 7 天跳过表"
-                               f"（跳过 {len(skips)} 条），本轮没有可加的")
+            # 跳过表里混着两种：net（5 分钟后自动重投）与 fail/dup（7 天）。
+            # 分开数出来，否则「跳过 410 条」会让人以为整池被锁死了。
+            net_n = sum(1 for v in skips.values()
+                        if isinstance(v, dict) and v.get("reason") in ("net", "error"))
+            state["reason"] = (f"池中 {len(pool_all)} 条全部已在客户端或处于跳过表"
+                               f"（跳过 {len(skips)} 条：其中 {net_n} 条是网络重试、"
+                               f"{len(skips) - net_n} 条是坏种/重复），本轮没有可加的")
             self.save_data("seedgroup_state", state)
             logger.warn(f"保种组：{state['reason']}，缺口 {state['shortfall_gib']} GiB")
             self._sg_prune_if_enabled(state)
