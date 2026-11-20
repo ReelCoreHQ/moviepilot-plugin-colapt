@@ -1114,7 +1114,7 @@ class StaleCoverageFallbackTest(unittest.TestCase):
                 calls.append(1)
                 raise TimeoutError("read timed out")
 
-        hashes, gib, blind = p._sg_current([Dead()])
+        hashes, gib, blind, offline = p._sg_current([Dead()])
         self.assertTrue(calls)
         self.assertEqual(blind, 1, "读失败要记一次 blind，但不能算 0")
         # FakeClient 默认返回空列表 ⇒ 第一次缓存 gib=0；这里只断言「不抛、不炸」
@@ -1141,7 +1141,7 @@ class StaleCoverageFallbackTest(unittest.TestCase):
             def list_completed(self):
                 raise TimeoutError("down")
 
-        _, gib, blind = p._sg_current([Dead()])
+        _, gib, blind, offline = p._sg_current([Dead()])
         self.assertEqual(gib, 0.0, "超过 TTL 的缓存必须失效，不能一直算进去")
         self.assertEqual(blind, 1)
 
@@ -1254,7 +1254,7 @@ class SeedGroupDownloadQuotaTest(unittest.TestCase):
         client.inflight_count = inflight
         plugin._sg_clients = lambda: [client]
         plugin._sg_unlocked = lambda: (True, {"ok": True, "groups": ["工作组-组长"], "reason": ""})
-        plugin._sg_current = lambda clients: (set(), 0.0, 0)
+        plugin._sg_current = lambda clients: (set(), 0.0, 0, 0)
         plugin._sg_skips = lambda: set()
         plugin._sg_candidates = lambda: [
             {"torrent_id": i, "info_hash": f"{i:040x}", "size": 500 * mod.GIB, "official": True}
@@ -2582,3 +2582,60 @@ class SeedGroupClientTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class ClientOfflineMathTest(unittest.TestCase):
+    """读数失败的数学：偶发沿用，连断才算掉线（2026-11-20 老板要求）。
+
+    他家那条 NAS→198 的线实测 50% 丢包、RTT 293ms，一次 list_completed 失败是常态。
+    以前只要失败就把覆盖从 1500 打成 0，保种时长凭空断档 —— 而客户端里好好保着。
+    现在：连续失败 1–2 轮沿用上次读数，第 3 轮起判掉线、覆盖归 0。
+    """
+
+    def _plugin(self):
+        p = support.make_plugin(SG_MOD)
+        p.get_data = lambda k: getattr(p, "_fake_data", {}).get(k)
+        p.save_data = lambda k, v: setattr(p, "_fake_data", {**(getattr(p, "_fake_data", {}) or {}), k: v})
+        p._fake_data = {}
+        return p
+
+    class _Ok:
+        name = "198"
+
+        def list_completed(self):
+            return [{"hash": "a" * 40, "size": 2 * 1024 ** 3, "tags": "可乐保种组"}]
+
+    class _Down:
+        name = "198"
+
+        def list_completed(self):
+            raise RuntimeError("timeout")
+
+    def test_first_two_failures_keep_last_reading(self):
+        p = self._plugin()
+        _, gib1, _, off1 = p._sg_current([self._Ok()])
+        self.assertGreater(gib1, 0)
+        self.assertEqual(off1, 0)
+        for round_no in (1, 2):
+            _, gib, blind, off = p._sg_current([self._Down()])
+            self.assertEqual(off, 0, f"第 {round_no} 轮不该判掉线")
+            self.assertAlmostEqual(gib, gib1, places=3, msg=f"第 {round_no} 轮应沿用上次读数")
+
+    def test_third_failure_counts_as_offline(self):
+        p = self._plugin()
+        p._sg_current([self._Ok()])
+        for _ in range(3):
+            _, gib, _, off = p._sg_current([self._Down()])
+        self.assertEqual(off, 1, "连续第 3 轮应判掉线")
+        self.assertEqual(gib, 0.0, "掉线时覆盖如实记 0")
+
+    def test_recovery_resets_the_streak(self):
+        p = self._plugin()
+        p._sg_current([self._Ok()])
+        p._sg_current([self._Down()])
+        p._sg_current([self._Down()])
+        # 第 3 轮之前恢复：不该判掉线，且 fail_streak 归零
+        _, gib, _, off = p._sg_current([self._Ok()])
+        self.assertEqual(off, 0)
+        self.assertGreater(gib, 0)
+        cache = p.get_data("seedgroup_client_cache") or {}
+        self.assertEqual(cache.get("198", {}).get("fail_streak"), 0)
