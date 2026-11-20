@@ -2639,3 +2639,68 @@ class ClientOfflineMathTest(unittest.TestCase):
         self.assertGreater(gib, 0)
         cache = p.get_data("seedgroup_client_cache") or {}
         self.assertEqual(cache.get("198", {}).get("fail_streak"), 0)
+
+class NetworkRetryAndBackoffTest(unittest.TestCase):
+    """网络类失败：单条重试 + 短退避，不能像坏种那样关 7 天（2026-11-20）。
+
+    现场：NAS→保种机 50% 丢包，371 条要加，每条一次 Connection reset 就被记成
+    fail 并关 7 天 —— 一轮下来整池锁死，缺口再也填不上。
+    """
+
+    def _plugin(self):
+        p = support.make_plugin(SG_MOD)
+        p._fake_data = {}
+        p.get_data = lambda k: getattr(p, "_fake_data", {}).get(k)
+        p.save_data = lambda k, v: setattr(p, "_fake_data", {**(getattr(p, "_fake_data", {}) or {}), k: v})
+        p._seedgroup_save_path = "/tmp/x"
+        p._seedgroup_skip_check = False
+        return p
+
+    class _Flaky:
+        """前 N 次抛 ConnectionReset，之后成功。"""
+
+        name = "198"
+
+        def __init__(self, fails):
+            self.fails = fails
+            self.calls = 0
+
+        def add(self, data, path, skip_check, label=None, hash_hint=""):
+            self.calls += 1
+            if self.calls <= self.fails:
+                raise ConnectionResetError(104, "Connection reset by peer")
+            return "ok"
+
+    def test_transient_reset_is_retried_in_place(self):
+        p = self._plugin()
+        c = self._Flaky(fails=2)
+        result, err = p._sg_add_with_retry(c, b"d", "a" * 40)
+        self.assertEqual(result, "ok", "第二次重试应成功")
+        self.assertIsNone(err)
+        self.assertEqual(c.calls, 3, "第一次失败 + 两次重试")
+
+    def test_persistent_failure_sets_short_backoff(self):
+        p = self._plugin()
+        c = self._Flaky(fails=99)
+        result, err = p._sg_add_with_retry(c, b"d", "a" * 40)
+        self.assertIsNone(result)
+        self.assertIsNotNone(err)
+        self.assertEqual(c.calls, p.SG_ADD_RETRY + 1)
+
+    def test_net_skip_expires_much_sooner_than_fail(self):
+        p = self._plugin()
+        p._sg_mark_skip({"torrent_id": 1, "info_hash": "b" * 40}, "net")
+        p._sg_mark_skip({"torrent_id": 2, "info_hash": "c" * 40}, "fail")
+        skips = p.get_data("seedgroup_skip") or {}
+        self.assertEqual(skips["1"]["ttl"], p.SG_SKIP_TTL_NET)
+        self.assertEqual(skips["2"]["ttl"], p.SG_SKIP_TTL)
+        self.assertLess(p.SG_SKIP_TTL_NET, p.SG_SKIP_TTL, "网络类必须比坏种早得多地重试")
+
+    def test_net_skip_is_released_after_its_ttl(self):
+        p = self._plugin()
+        p._sg_mark_skip({"torrent_id": 1, "info_hash": "b" * 40}, "net")
+        skips = p.get_data("seedgroup_skip") or {}
+        # 把时间往前拨到 TTL 之外
+        skips["1"]["at"] = int(time.time()) - p.SG_SKIP_TTL_NET - 10
+        p.save_data("seedgroup_skip", skips)
+        self.assertNotIn("1", p._sg_skips(), "过了短退避就该重新尝试")
