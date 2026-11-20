@@ -1219,7 +1219,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.12"
+    plugin_version = "0.2.13"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1967,7 +1967,7 @@ class ColaSeedGroup(_PluginBase):
             out["reason"] = "没有可用的下载器"
             return out
         limit = max(1, min(50, int(self._seedgroup_rotate_count or 5)))
-        existing, _, _ = self._sg_current(clients)
+        existing, _, _, _ = self._sg_current(clients)
         items = self._sg_items()
         by_tid = {str(x.get("torrent_id")): x for x in pool_all if x.get("torrent_id") is not None}
 
@@ -3135,15 +3135,26 @@ class ColaSeedGroup(_PluginBase):
     # 24 小时是上限 —— 超过一天没读到就不再相信，避免把早已删掉的种一直算进去。
     SG_STALE_COVERAGE_TTL = 24 * 3600
 
-    def _sg_current(self, clients: List[_Client]) -> Tuple[set, float, int]:
-        """客户端里已带「可乐保种组」标签的种子：返回 (hash 集合, 体积 GiB, 无标签能力的客户端数)。
+    def _sg_current(self, clients: List[_Client]) -> Tuple[set, float, int, int]:
+        """客户端里已带「可乐保种组」标签的种子。
 
-        某台客户端这一轮读不到（弱网/超时）时，沿用它的上次读数并记进
-        `seedgroup_client_cache`，不让一次超时把覆盖清零。
+        返回 (hash 集合, 体积 GiB, 沿用上次读数的客户端数, 判为掉线的客户端数)。
+
+        # 读数失败怎么算（2026-11-20 老板要求）
+        弱网下一次读不到是常态（他家那条线实测 50% 丢包、RTT 293ms），绝不能让它
+        直接把覆盖打成 0 —— 那会让「保种时长」凭空断档，而客户端里其实好好保着。
+        所以按**连续失败轮数**分档：
+
+          第 1–2 轮  沿用 `seedgroup_client_cache` 里最后一次成功读数，覆盖不变；
+          第 3 轮起  判为掉线（offline），本轮不计入覆盖，日志说清楚。
+
+        这条线画在 3 轮：一轮 cron 一分钟，两轮足够盖住 SSH 抖动/容器重启；
+        连断三分钟就是真的连不上了，那时把覆盖记 0 才是对的事实。
         """
         hashes: set = set()
         total = 0.0
         blind = 0
+        offline = 0
         cache = self.get_data("seedgroup_client_cache") or {}
         if not isinstance(cache, dict):
             cache = {}
@@ -3153,10 +3164,19 @@ class ColaSeedGroup(_PluginBase):
             try:
                 torrents = client.list_completed()
             except Exception as err:
-                logger.warn(f"保种组：{name} 读不到种子（{type(err).__name__}），沿用上次读数")
+                logger.warn(f"保种组：{name} 读不到种子（{type(err).__name__}）")
                 torrents = None
             if torrents is None:
-                snap = cache.get(name) or {}
+                snap = dict(cache.get(name) or {})
+                streak = int(snap.get("fail_streak") or 0) + 1
+                snap["fail_streak"] = streak
+                cache[name] = snap
+                dirty = True
+                if streak >= self.SG_CLIENT_OFFLINE_AFTER:
+                    # 连断这么多轮：这就是掉线，覆盖如实记 0，别再拿旧读数撑场面。
+                    offline += 1
+                    logger.warn(f"保种组：{name} 连续 {streak} 轮读不到，判为掉线（本轮不计入覆盖）")
+                    continue
                 try:
                     age = int(time.time()) - int(snap.get("at") or 0)
                 except Exception:
@@ -3165,8 +3185,8 @@ class ColaSeedGroup(_PluginBase):
                     total += float(snap.get("gib") or 0)
                     hashes.update(snap.get("hashes") or [])
                     blind += 1
-                    logger.info(f"保种组：{name} 沿用 {age // 60} 分钟前的读数 "
-                                f"{float(snap.get('gib') or 0):.1f} GiB")
+                    logger.info(f"保种组：{name} 第 {streak} 轮读不到，沿用 {age // 60} 分钟前的读数 "
+                                f"{float(snap.get('gib') or 0):.1f} GiB（连续 {self.SG_CLIENT_OFFLINE_AFTER} 轮才判掉线）")
                 else:
                     blind += 1
                 continue
@@ -3189,13 +3209,14 @@ class ColaSeedGroup(_PluginBase):
             total += client_gib
             if torrents and not tagged:
                 blind += 1
-            # 只缓存「读成功的」：读失败就保留上一次成功值，别用空的覆盖掉
+            # 只缓存「读成功的」：读失败就保留上一次成功值，别用空的覆盖掉。
+            # fail_streak 归零 —— 读成功即是「这条线又通了」。
             cache[name] = {"at": int(time.time()), "gib": round(client_gib, 3),
-                           "hashes": client_hashes[:2000]}
+                           "hashes": client_hashes[:2000], "fail_streak": 0}
             dirty = True
         if dirty:
             self.save_data("seedgroup_client_cache", cache)
-        return hashes, round(total, 3), blind
+        return hashes, round(total, 3), blind, offline
 
     UNLOCK_TTL = 86400          # 工作组资格校验结果的缓存时长（秒）
     SG_MAX_PAGES = 50
@@ -3203,6 +3224,7 @@ class ColaSeedGroup(_PluginBase):
     SG_MACHINE_PAGE_SIZE = 100
     SG_DOWNLOAD_GAP = 0.7        # 每颗之间停一下：站点下载限流 120 次/分，一颗要 2 个请求
     SG_SKIP_TTL = 7 * 86400      # 「加不进去」的种子记 7 天，别再每轮白下载一遍
+    SG_CLIENT_OFFLINE_AFTER = 3  # 连续这么多轮读不到客户端 → 判掉线（前两轮沿用上次读数）
 
     def _sg_skips(self) -> Dict[str, Any]:
         """读的时候也清一遍过期：没有新写入时，过期条目不能永久生效。"""
@@ -3430,7 +3452,7 @@ class ColaSeedGroup(_PluginBase):
         staff = bool(record.get("staff"))
         state.update({"unlocked": unlocked, "staff": staff,
                       "staff_groups": record.get("groups") or []})
-        existing, current_gib, blind = self._sg_current(clients)
+        existing, current_gib, blind, offline = self._sg_current(clients)
         # 丢失文件自检：带标签却 missingFiles 的种子既不计入覆盖、也永远不会下动。
         missing_total = 0
         rechecked = 0
@@ -3593,13 +3615,25 @@ class ColaSeedGroup(_PluginBase):
         # 覆盖体积以「客户端实测」为准（刚加进去的种子立刻可见），
         # 不再用「计划值 + dup 的体积」估，避免缺口报 0 的假达标。
         try:
-            _, measured_gib, _ = self._sg_current(clients)
+            _, measured_gib, _, offline_now = self._sg_current(clients)
         except Exception:
             measured_gib = 0.0
+        # 覆盖取「客户端实测」与「上轮实测 + 本轮新增」的较大者。
+        # 掉线的客户端（连续 SG_CLIENT_OFFLINE_AFTER 轮读不到）两处都不计入 —— 它确实
+        # 不再提供覆盖；而偶发一两轮读不到的那些，_sg_current 已经沿用上次读数，
+        # 所以这里的数不会因为一次超时从 1500 掉到 0。
         covered = round(max(measured_gib, current_gib + added_gib), 3)
+        # 与上一轮的覆盖对比：只用来给面板一个「掉线/骤降」的说明，不参与达标判定。
+        prev_covered = 0.0
+        try:
+            prev_covered = float(state.get("covered_gib") or 0)
+        except Exception:
+            prev_covered = 0.0
         state.update({"activated": True, "picked": len(picked), "planned_gib": planned_gib,
                       "added": added, "duplicate": duplicate, "failed": failed,
                       "added_gib": round(added_gib, 3), "covered_gib": covered,
+                      "clients_offline": offline_now,
+                      "prev_covered_gib": round(prev_covered, 3),
                       "shortfall_gib": max(0.0, round(target - covered, 3))})
         if state["shortfall_gib"] > 0 and not state["reason"]:
             state["reason"] = (f"实际覆盖还差 {state['shortfall_gib']} GiB"
@@ -3607,9 +3641,14 @@ class ColaSeedGroup(_PluginBase):
         if blind:
             state["reason"] = (state["reason"] + "；" if state["reason"] else "") + \
                               f"{blind} 个下载器不返回标签，体积统计可能偏低"
+        if offline_now:
+            state["reason"] = (state["reason"] + "；" if state["reason"] else "") + \
+                              f"{offline_now} 个下载器连续读不到（判为掉线，不计入本轮覆盖）"
         self.save_data("seedgroup_state", state)
         logger.info(f"保种组完成：档位 {tier} 目标 {target} GiB，新增 {added} 条 (+{round(added_gib, 1)} GiB)，"
-                    f"覆盖 {covered} GiB，缺口 {state['shortfall_gib']} GiB，失败 {failed}")
+                    f"覆盖 {covered} GiB（上轮 {round(prev_covered, 1)}）"
+                    f"，缺口 {state['shortfall_gib']} GiB，失败 {failed}"
+                    + (f"，掉线 {offline_now} 台" if offline_now else ""))
         # 站点下架 / 撤掉官方标记的，跟着从本地删（colabot1 的 prune）
         self._sg_prune_if_enabled(state)
         # 只统计开了保种组的用户：把每台客户端此刻的限速设置汇报给站点
