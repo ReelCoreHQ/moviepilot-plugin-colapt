@@ -1219,7 +1219,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.13"
+    plugin_version = "0.2.14"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -3224,16 +3224,36 @@ class ColaSeedGroup(_PluginBase):
     SG_MACHINE_PAGE_SIZE = 100
     SG_DOWNLOAD_GAP = 0.7        # 每颗之间停一下：站点下载限流 120 次/分，一颗要 2 个请求
     SG_SKIP_TTL = 7 * 86400      # 「加不进去」的种子记 7 天，别再每轮白下载一遍
+    # 网络类失败（连接被重置/超时）不是种子的问题，是那条线的问题 —— 只退避几分钟，
+    # 不能像坏种那样关 7 天，否则一次抖动就把 371 条全锁死（2026-11-20 就是这么丢的缺口）。
+    SG_SKIP_TTL_NET = 300
+    SG_ADD_RETRY = 2             # 单条加种的额外重试次数（网络类才重试）
+    SG_ADD_RETRY_BACKOFF = 2     # 重试间隔：2s、4s
     SG_CLIENT_OFFLINE_AFTER = 3  # 连续这么多轮读不到客户端 → 判掉线（前两轮沿用上次读数）
 
+    def _sg_skip_ttl(self, reason: str) -> int:
+        """这条跳过记录能活多久。网络类是短退避，其余（坏种/重复）才用 7 天。"""
+        return self.SG_SKIP_TTL_NET if reason in ("net", "error") else self.SG_SKIP_TTL
+
     def _sg_skips(self) -> Dict[str, Any]:
-        """读的时候也清一遍过期：没有新写入时，过期条目不能永久生效。"""
+        """读的时候也清一遍过期：没有新写入时，过期条目不能永久生效。
+
+        每条按自己记下的 `ttl` 判定 —— 网络类失败只关 5 分钟，坏种关 7 天。
+        """
         data = self.get_data("seedgroup_skip") or {}
         if not isinstance(data, dict):
             return {}
         now = int(time.time())
-        fresh = {k: v for k, v in data.items()
-                 if isinstance(v, dict) and now - int(v.get("at") or 0) < self.SG_SKIP_TTL}
+        fresh = {}
+        for k, v in data.items():
+            if not isinstance(v, dict):
+                continue
+            try:
+                ttl = int(v.get("ttl") or self._sg_skip_ttl(str(v.get("reason") or "")))
+            except Exception:
+                ttl = self.SG_SKIP_TTL
+            if now - int(v.get("at") or 0) < ttl:
+                fresh[k] = v
         if len(fresh) != len(data):
             self.save_data("seedgroup_skip", fresh)
         return fresh
@@ -3243,10 +3263,32 @@ class ColaSeedGroup(_PluginBase):
         if not key:
             return
         now = int(time.time())
-        skips = {k: v for k, v in self._sg_skips().items()
-                 if isinstance(v, dict) and now - int(v.get("at") or 0) < self.SG_SKIP_TTL}
-        skips[key] = {"at": now, "reason": reason}
+        skips = self._sg_skips()
+        skips[key] = {"at": now, "reason": reason, "ttl": self._sg_skip_ttl(reason)}
         self.save_data("seedgroup_skip", skips)
+
+    def _sg_add_with_retry(self, client: "_Client", data: bytes, info_hash: str) -> Tuple[Optional[str], Optional[Exception]]:
+        """加一颗种子，网络类失败就地重试两次。
+
+        为什么值得重试：那条线实测 50% 丢包，一次 `Connection reset` 完全不代表这颗种子
+        加不进去。不重试的话 371 条里会有几十条被误判成失败，再各自进跳过表 —— 缺口就是这么来的。
+
+        只对「抛异常」重试（连接被重置/超时）；qB 明确回 `Fails` 的那种是内容问题，
+        重试没有意义，交给上层判 dup/fail。
+        """
+        last: Optional[Exception] = None
+        for attempt in range(self.SG_ADD_RETRY + 1):
+            try:
+                return client.add(data, self._seedgroup_save_path, self._seedgroup_skip_check,
+                                  label=SEED_GROUP_TAG, hash_hint=info_hash), None
+            except Exception as err:
+                last = err
+                if attempt >= self.SG_ADD_RETRY:
+                    break
+                delay = self.SG_ADD_RETRY_BACKOFF ** (attempt + 1)
+                logger.info(f"保种组加种网络异常（第 {attempt + 1} 次），{delay}s 后重试：{err}")
+                time.sleep(delay)
+        return None, last
 
     def _sg_items(self) -> Dict[str, Any]:
         data = self.get_data("seedgroup_items") or {}
@@ -3592,14 +3634,13 @@ class ColaSeedGroup(_PluginBase):
                 except Exception as err:
                     logger.warn(f"保种组：给已有种子补标签失败（{info_hash[:12]}）：{err}")
                 continue
-            try:
-                result = client.add(data, self._seedgroup_save_path, self._seedgroup_skip_check,
-                                    label=SEED_GROUP_TAG, hash_hint=info_hash)
-            except Exception as err:
-                # 单条加种炸了不能拖垮整轮：记下来，下一轮换别的种子
-                logger.warn(f"保种组加种异常（{item.get('torrent_id')}）：{err}")
+            result, err = self._sg_add_with_retry(client, data, info_hash)
+            if result is None:
+                # 重试过仍然连不上：这是网络问题，不是这颗种子的问题 —— 记短退避（5 分钟），
+                # 下一轮还会试它，而不是像坏种那样关 7 天。
+                logger.warn(f"保种组加种异常（{item.get('torrent_id')}，重试 {self.SG_ADD_RETRY} 次后仍失败）：{err}")
                 failed += 1
-                self._sg_mark_skip(item, "error")
+                self._sg_mark_skip(item, "net")
                 continue
             if result == "ok":
                 added += 1
