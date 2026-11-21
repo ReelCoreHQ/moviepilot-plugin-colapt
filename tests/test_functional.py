@@ -1147,9 +1147,16 @@ class StaleCoverageFallbackTest(unittest.TestCase):
 
 
 class PaginatedListTest(unittest.TestCase):
-    """慢链路上必须分页拉：一次性 1.4 MB 会被截断成空（2026-11-18 生产事故）。"""
+    """分页必须拼回全量，且页数不能多到把烂链路压垮（2026-11-18 与大页优化）。
+
+    两头都要守住：一次拉 1.4 MB 会在慢链路上被截断；但每页只有 10 条时，
+    907 颗种子要 91 次请求，同样会全灭。现在是每页 500 条。
+    数据量取 1200 条（> 每页），确保真的走了多页拼接。
+    """
 
     def test_page_size_and_requests_are_paged(self):
+        page = SG_MOD.QBittorrentClient.QB_LIST_PAGE
+        total = page * 2 + max(1, page // 3)   # 三页：满、满、余
         calls = []
 
         class Resp:
@@ -1161,8 +1168,7 @@ class PaginatedListTest(unittest.TestCase):
             def get(self, url, params=None, timeout=None):
                 calls.append(dict(params or {}))
                 off = (params or {}).get("offset", 0)
-                # 250 条：100 + 100 + 50
-                n = min(10, max(0, 250 - off))
+                n = min(page, max(0, total - off))
                 return Resp([{"hash": f"h{off+i:04d}", "size": 1024} for i in range(n)])
 
         c = SG_MOD.QBittorrentClient.__new__(SG_MOD.QBittorrentClient)
@@ -1170,11 +1176,13 @@ class PaginatedListTest(unittest.TestCase):
         c.url = "http://x"
         c._session = Sess()
         rows = c.list_completed()
-        self.assertEqual(len(rows), 250, "分页必须拼回全量")
+        self.assertEqual(len(rows), total, "分页必须拼回全量")
+        self.assertEqual(len(calls), 3, "三页就该只有三次请求")
+        self.assertEqual(calls[0].get("limit"), page)
         self.assertTrue(all("limit" in x and "offset" in x for x in calls), "每次都要带 limit/offset")
-        self.assertEqual([x["offset"] for x in calls][:3], [0, 10, 20], "页码要连续（每页 10 条）")
-        self.assertEqual(len(calls), 26, "250 条 ÷ 10 条/页 = 25 页 + 1 次空页收尾")
-        self.assertEqual(calls[0]["limit"], SG_MOD.QBittorrentClient.QB_LIST_PAGE)
+        self.assertEqual([x["offset"] for x in calls][:3], [0, page, page * 2], "页码要连续")
+        self.assertEqual(len(calls), 3, "三页数据正好三次请求，不该有空页收尾")
+        self.assertEqual(calls[0]["limit"], page)
 
 
 class OnTargetToleranceTest(unittest.TestCase):
