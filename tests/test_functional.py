@@ -2781,3 +2781,37 @@ class MhClientHasMustNotRaiseTest(unittest.TestCase):
 
         c.list_completed = boom
         self.assertFalse(c.has("a" * 40), "读失败应答 False，而不是抛出去")
+
+class OldestSeededSecsTest(unittest.TestCase):
+    """seeded_secs 必须真的算出来（2026-11-21 查实一直是 0）。
+
+    站点按 covered>50 且 seeded_secs<300 判 zero_seeded（「声称保了很多，
+    但最老的才做了几分钟」）。而 list_completed() 以前不返回 added_on，
+    _sg_oldest_seeded_secs 拿不到时间就一直是 0 —— 覆盖正常也会被标可疑。
+    """
+
+    def test_added_on_flows_from_client_to_seeded_secs(self):
+        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+        now = int(__import__("time").time())
+
+        class C:
+            name = "remote"
+
+            def list_completed(self):
+                return [{"hash": "a" * 40, "tags": "可乐保种组",
+                         "size": 1024 ** 3, "added_on": now - 7200}]
+
+        secs = p._sg_oldest_seeded_secs([C()])
+        self.assertGreaterEqual(secs, 7100, "两小时前加进来的种子，seeded_secs 应接近 7200")
+        self.assertLessEqual(secs, 7300)
+
+    def test_missing_added_on_yields_zero_not_crash(self):
+        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+
+        class C:
+            name = "remote"
+
+            def list_completed(self):
+                return [{"hash": "a" * 40, "tags": "可乐保种组", "size": 1024 ** 3}]
+
+        self.assertEqual(p._sg_oldest_seeded_secs([C()]), 0)
