@@ -2764,3 +2764,20 @@ class ListFailureMustNotLookEmptyTest(unittest.TestCase):
         _, gib2, _, off = p._sg_current([Boom()])
         self.assertAlmostEqual(gib2, gib1, places=3, msg="读失败应沿用上次读数，而不是归零")
         self.assertEqual(off, 0, "第一轮失败不该判掉线")
+
+class MhClientHasMustNotRaiseTest(unittest.TestCase):
+    """_MPClient.has() 在加种循环里被调用，读失败必须咽下，不能让整轮崩。
+
+    list_completed() 为了不让上层把「读不到」当成「空客户端」，已改成抛异常。
+    但 has() 没有这层保护时，异常会冒到 _seed_group_sync 外面，整轮中断。
+    """
+
+    def test_has_returns_false_when_list_raises(self):
+        c = SG_MOD._MPClient.__new__(SG_MOD._MPClient)
+        c.name = "MP-测试"
+
+        def boom():
+            raise RuntimeError("read failed")
+
+        c.list_completed = boom
+        self.assertFalse(c.has("a" * 40), "读失败应答 False，而不是抛出去")
