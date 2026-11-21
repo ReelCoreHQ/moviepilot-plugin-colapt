@@ -1248,7 +1248,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.15"
+    plugin_version = "0.2.16"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -3213,6 +3213,8 @@ class ColaSeedGroup(_PluginBase):
                 if snap.get("gib") is not None and age <= self.SG_STALE_COVERAGE_TTL:
                     total += float(snap.get("gib") or 0)
                     hashes.update(snap.get("hashes") or [])
+                    # blind = 本轮没读到的客户端数（体积用的是上次读数）。
+                    # 它与 offline 的区别是程度：blind 是「这轮没读到」，offline 是「连断到判掉线」。
                     blind += 1
                     logger.info(f"保种组：{name} 第 {streak} 轮读不到，沿用 {age // 60} 分钟前的读数 "
                                 f"{float(snap.get('gib') or 0):.1f} GiB（连续 {self.SG_CLIENT_OFFLINE_AFTER} 轮才判掉线）")
@@ -3237,7 +3239,9 @@ class ColaSeedGroup(_PluginBase):
                 client_gib += size_gib
             total += client_gib
             if torrents and not tagged:
-                blind += 1
+                # 客户端返回了种子但一颗都没有 tags 字段 —— 极罕见（qB/TR 都一定带）。
+                # 不并进 blind（那是「读不到」的计数），单独说一句，免得文案互相污染。
+                logger.warn(f"保种组：{name} 的种子没有 tags 字段，无法识别保种标记")
             # 只缓存「读成功的」：读失败就保留上一次成功值，别用空的覆盖掉。
             # fail_streak 归零 —— 读成功即是「这条线又通了」。
             cache[name] = {"at": int(time.time()), "gib": round(client_gib, 3),
@@ -3715,7 +3719,7 @@ class ColaSeedGroup(_PluginBase):
                                f"（池子可挑 {round(planned_gib, 1)} GiB，失败 {failed} 条）")
         if blind:
             state["reason"] = (state["reason"] + "；" if state["reason"] else "") + \
-                              f"{blind} 个下载器不返回标签，体积统计可能偏低"
+                              f"{blind} 个下载器本轮读不到，体积沿用上次读数"
         if offline_now:
             state["reason"] = (state["reason"] + "；" if state["reason"] else "") + \
                               f"{offline_now} 个下载器连续读不到（判为掉线，不计入本轮覆盖）"
@@ -4118,12 +4122,22 @@ class _MPClient(_Client):
         return out
 
     def has(self, info_hash: str) -> bool:
-        """MP 客户端没有现成的「有没有这颗」接口，用扫描结果做一次短缓存。"""
+        """MP 客户端没有现成的「有没有这颗」接口，用扫描结果做一次短缓存。
+
+        list_completed() 现在读失败会抛异常（为了不让上层把「读不到」当成「空客户端」）。
+        但这个方法是在加种循环里被调用的，**抛出去会让整轮崩掉** —— 所以这里自己咽下来、
+        答 False：最坏结果是多下一次 .torrent（客户端回 dup / Fails，流程照旧能走完），
+        比整轮中断好得多。
+        """
         if not info_hash:
             return False
         cached = getattr(self, "_hash_cache", None)
         if cached is None or time.time() - getattr(self, "_hash_cache_at", 0) > 30:
-            cached = {t.get("hash") for t in self.list_completed() if t.get("hash")}
+            try:
+                cached = {t.get("hash") for t in self.list_completed() if t.get("hash")}
+            except Exception as err:
+                logger.warn(f"MP 下载器 {self.name} 读不到种子列表，本轮按「没有」处理：{err}")
+                return False
             self._hash_cache, self._hash_cache_at = cached, time.time()
         return str(info_hash).lower() in cached
 
