@@ -2704,3 +2704,55 @@ class NetworkRetryAndBackoffTest(unittest.TestCase):
         skips["1"]["at"] = int(time.time()) - p.SG_SKIP_TTL_NET - 10
         p.save_data("seedgroup_skip", skips)
         self.assertNotIn("1", p._sg_skips(), "过了短退避就该重新尝试")
+
+class ListFailureMustNotLookEmptyTest(unittest.TestCase):
+    """列表读失败必须抛异常，不能返回空列表。
+
+    生产事故（2026-11-20）：qB 分页每页 10 条，907 颗种子要 91 次请求，50% 丢包下几乎
+    必失败；而 list_completed 把异常吞掉 `return []`，于是 _sg_current 认为「读成功、
+    客户端里一颗都没有」→ 覆盖从 1543 GiB 直接变 0，保种时长断档。
+    修法两条：①每页 500 条（2 次请求）；②失败抛出去，让上层沿用上次读数。
+    """
+
+    def test_qb_list_failure_raises_instead_of_returning_empty(self):
+        import requests
+        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+
+        class _Boom:
+            def get(self, *a, **k):
+                raise requests.exceptions.ConnectionError("Connection reset by peer")
+
+        qb = SG_MOD.QBittorrentClient("198-远端", "http://198.72.127.68:8081", "qb1", "pw")
+        qb._session = _Boom()
+        with self.assertRaises(Exception):
+            qb.list_completed()
+
+    def test_qb_page_size_is_large_enough_for_one_or_two_requests(self):
+        # 907 颗种子 / 每页 500 = 2 次请求。以前的 10 是 91 次。
+        qb_cls = SG_MOD.QBittorrentClient
+        self.assertGreaterEqual(qb_cls.QB_LIST_PAGE, 200,
+                                "每页太少会让远端链路上的请求次数爆炸")
+
+    def test_sg_current_falls_back_when_list_raises(self):
+        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+        p._fake_data = {}
+        p.get_data = lambda k: getattr(p, "_fake_data", {}).get(k)
+        p.save_data = lambda k, v: setattr(p, "_fake_data", {**(getattr(p, "_fake_data", {}) or {}), k: v})
+
+        class Ok:
+            name = "198"
+
+            def list_completed(self):
+                return [{"hash": "a" * 40, "size": 1024 ** 3, "tags": "可乐保种组"}]
+
+        class Boom:
+            name = "198"
+
+            def list_completed(self):
+                raise RuntimeError("Connection reset by peer")
+
+        _, gib1, _, _ = p._sg_current([Ok()])
+        self.assertGreater(gib1, 0)
+        _, gib2, _, off = p._sg_current([Boom()])
+        self.assertAlmostEqual(gib2, gib1, places=3, msg="读失败应沿用上次读数，而不是归零")
+        self.assertEqual(off, 0, "第一轮失败不该判掉线")

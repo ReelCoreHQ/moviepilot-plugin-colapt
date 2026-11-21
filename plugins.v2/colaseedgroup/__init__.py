@@ -879,12 +879,25 @@ class QBittorrentClient(_Client):
     #
     # 慢是慢，但**能传完**。一轮 12 分钟对每小时跑一次完全可接受 —— 没必要为了
     # 快一点把超时设短、把结果丢光。
-    QB_LIST_PAGE = 10
+    # 一页拿 500 条：907 颗种子只要 2 次请求，而不是 91 次。
+    # 这是远端下载器最关键的一个参数（2026-11-20）：MP 装在 NAS、qB 在别人机上时，
+    # 那条链路可能 50% 丢包，91 次分页全部成功的概率约等于 0，于是「读不到种子」成了常态。
+    QB_LIST_PAGE = 500
+    QB_LIST_RETRY = 2          # 单页失败重试次数
+    # 列表请求用短超时：它是每分钟一轮的常规动作，不能占着 90 秒让两轮叠在一起。
+    # 45 秒在 293ms RTT 的远端链路上足够读完 500 条；真读不完就重试，再不行就沿用上次读数。
+    QB_LIST_TIMEOUT = 45
 
-    def list_completed(self) -> List[Dict[str, Any]]:
-        try:
-            out: List[Dict[str, Any]] = []
-            for page in range(0, 200):          # 200 页 × 100 = 2 万条，够任何人的库
+    def _list_page(self, page: int) -> List[Dict[str, Any]]:
+        """取一页 completed 种子，网络类失败就地重试。
+
+        拿不到就**抛异常**，绝不返回空列表 —— 返回空会被 `_sg_current` 当成
+        「读成功、客户端里一颗都没有」，直接把覆盖清零（生产上覆盖 1543 GiB 变 0
+        就是这么来的）。抛出去，上层会沿用上一次成功读数。
+        """
+        last: Optional[Exception] = None
+        for attempt in range(self.QB_LIST_RETRY + 1):
+            try:
                 rsp = self._session.get(
                     f"{self.url}/api/v2/torrents/info",
                     params={
@@ -892,10 +905,24 @@ class QBittorrentClient(_Client):
                         "limit": self.QB_LIST_PAGE,
                         "offset": page * self.QB_LIST_PAGE,
                     },
-                    timeout=REQUEST_TIMEOUT,
+                    timeout=self.QB_LIST_TIMEOUT,
                 )
                 rsp.raise_for_status()
-                batch = rsp.json() or []
+                return rsp.json() or []
+            except Exception as err:
+                last = err
+                if attempt >= self.QB_LIST_RETRY:
+                    break
+                delay = 2 ** (attempt + 1)
+                logger.info(f"qBittorrent ({self.name}) 第 {page + 1} 页读取失败，{delay}s 后重试：{err}")
+                time.sleep(delay)
+        raise RuntimeError(f"qBittorrent ({self.name}) 种子列表读取失败：{last}")
+
+    def list_completed(self) -> List[Dict[str, Any]]:
+        try:
+            out: List[Dict[str, Any]] = []
+            for page in range(0, 40):           # 40 页 × 500 = 2 万条，够任何人的库
+                batch = self._list_page(page)
                 if not batch:
                     break
                 for item in batch:
@@ -918,7 +945,8 @@ class QBittorrentClient(_Client):
             return out
         except Exception as err:
             logger.error(f"qBittorrent ({self.name}) 读取种子失败：{err}")
-            return []
+            # 不吞异常：让 _sg_current 走「沿用上次读数」，而不是把它当成空客户端。
+            raise
 
     def recheck(self, hashes: List[str]) -> int:
         if not hashes:
@@ -1170,7 +1198,8 @@ class TransmissionClient(_Client):
                                      "percentDone", "totalSize", "status"]},
         })
         if not rsp:
-            return []
+            # 和 qB 那条一样：拿不到就抛，别返回空列表冒充「客户端里没有种子」。
+            raise RuntimeError(f"Transmission ({self.name}) 种子列表读取失败")
         out = []
         for item in (rsp.get("arguments") or {}).get("torrents") or []:
             if item.get("percentDone") != 1:
@@ -1219,7 +1248,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.14"
+    plugin_version = "0.2.15"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -4084,6 +4113,8 @@ class _MPClient(_Client):
                             "tags": str(tags or ""), "state": str(state or "")})
         except Exception as err:
             logger.error(f"MP 下载器 {self.name} 读取失败：{err}")
+            # 与其他两条链路一致：读失败就抛，别让上层把它当成「客户端里一颗都没有」。
+            raise
         return out
 
     def has(self, info_hash: str) -> bool:
