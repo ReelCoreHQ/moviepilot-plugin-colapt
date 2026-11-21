@@ -928,6 +928,10 @@ class QBittorrentClient(_Client):
                 for item in batch:
                     out.append({
                         "hash": (item.get("hash") or "").lower(),
+                        # added_on 是「这颗加进客户端的时间」——_sg_oldest_seeded_secs 全靠它
+                        # 算「最早那颗做了多久」。以前没带上，于是 seeded_secs 永远是 0，
+                        # 站点按 covered>50 判定会一直报 zero_seeded（2026-11-21 查实）。
+                        "added_on": item.get("added_on") or 0,
                         "name": item.get("name") or "",
                         "save_path": item.get("save_path") or item.get("content_path") or "",
                         "category": item.get("category") or "",
@@ -1195,7 +1199,7 @@ class TransmissionClient(_Client):
         rsp = self._rpc({
             "method": "torrent-get",
             "arguments": {"fields": ["hashString", "name", "downloadDir", "labels",
-                                     "percentDone", "totalSize", "status"]},
+                                     "percentDone", "totalSize", "status", "addedDate"]},
         })
         if not rsp:
             # 和 qB 那条一样：拿不到就抛，别返回空列表冒充「客户端里没有种子」。
@@ -1207,6 +1211,7 @@ class TransmissionClient(_Client):
             status = item.get("status")
             out.append({
                 "hash": (item.get("hashString") or "").lower(),
+                "added_on": item.get("addedDate") or 0,
                 "name": item.get("name") or "",
                 "save_path": item.get("downloadDir") or "",
                 "category": ",".join(item.get("labels") or []),
@@ -1248,7 +1253,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.16"
+    plugin_version = "0.2.17"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -4112,7 +4117,10 @@ class _MPClient(_Client):
                     continue
                 if isinstance(tags, (list, tuple)):
                     tags = ",".join(str(t) for t in tags)
+                added = (torrent.get("added_on") if isinstance(torrent, dict)
+                         else getattr(torrent, "added_on", 0)) or 0
                 out.append({"hash": str(hash_str).lower(), "name": name,
+                            "added_on": added,
                             "save_path": save_path, "category": category, "size": size,
                             "tags": str(tags or ""), "state": str(state or "")})
         except Exception as err:
