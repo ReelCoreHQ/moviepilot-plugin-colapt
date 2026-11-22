@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 
 | 通道 | 依赖 | 说明 |
 |---|---|---|
-| 可乐 `/api/v1/plugin/match` | 可乐PT 账号 | 主通道，按 `info_hash` / `source_info_hash` 反查 |
+| 可乐哈希反查（开放 API `POST /api/v1/torrents/hashes`） | 可乐PT API Key（读取） | 主通道，按 `info_hash` / `source_info_hash` 反查 |
 | `info.source` 归一化 | 同上（qB 4.5+） | 用客户端导出的 `.torrent` 把 `source` 换成可乐的章再算一遍哈希去反查；命中即真命中（其余字段逐字节相同） |
 | **文件清单指纹 `content_key`** | 站点接口 | 「相对路径 + 字节数」的 SHA1，与谁重新打包无关；**不需要导出种子**，Transmission / 老 qB 也能用 |
 | 站点 `/api/pieces-hash` | 站点开放该接口 | 有接口的 NexusPHP 站 |
@@ -62,9 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 | 字段 | 说明 |
 |---|---|
 | 启用插件 | 总开关 |
-| 可乐PT 用户名 / 密码 | 你的可乐PT 账号（登录一次后会保存会话 token，不用反复填） |
-| 验证码 | **先打开插件详情页**，页面会显示一张验证码图片（5 分钟内不变），把 4 位数字填到这里保存即完成登录 |
-| 两步验证码 | 账号开了 2FA 时填（可选） |
+| 可乐PT API Key | 在站点「账号 → Key → API Key」（<https://www.colapt.com/account/tracker?tab=api>）新建一把 Key，范围勾**读取**和**下载**，粘到这里保存。插件只把它放在 `X-API-Key` 请求头里；不再需要账号密码、验证码和两步验证码 |
 | 使用 MoviePilot 已配置下载器 | 勾选后使用 MP「设置 → 下载器」里的**所有**实例（qB / TR） |
 | 下载器 | 每行一个：`地址,用户名,密码`；Transmission 写 `tr,地址,用户名,密码` |
 | 其他站 | 每行一个站点，位置写法和键值写法都支持（见下） |
@@ -119,11 +117,11 @@ https://pt.example.com,<32位passkey>
 
 ## ⑥ 常见问题
 
-**验证码看不清 / 刷新就不出图？**
-0.10.12 起验证码缓存 5 分钟（站点侧 10 分钟有效），反复打开插件页不再是新的一张；取码与登录都走系统 curl，部分机器的 Python TLS 握手问题不再报「获取失败」。仍失败时页面会显示具体原因（HTTP 码 / 异常类型）。
+**升级到 0.12.0 后提示「还没填 API Key」？**
+0.12.0 起插件改用可乐PT 的开放 API，不再用账号密码 + 验证码登录（站点会删掉那套登录入口）。到 <https://www.colapt.com/account/tracker?tab=api> 新建一把 Key，范围勾「读取」和「下载」，粘到设置「API Key」保存即可；旧的账号密码字段会被忽略。
 
-**提示会话过期？**
-重新打开插件页取验证码、填一次即可；插件只保存可乐的会话 token，其他站只要域名 + passkey。
+**提示 API Key 不能用？**
+401 是 Key 填错、被撤销或过期；403 `api_key_scope_denied` 是缺范围（辅种要「读取」查哈希、「下载」取种子）。重建一把两项都勾上的 Key 即可；插件只保存可乐的 API Key，其他站只要域名 + passkey。
 
 **为什么有的种子补上了却没有别的标签？**
 辅种进去的是**新的种子**，标签由你/MP 后来打。若某颗之前被插件自动清理过（文件缺失），重新补种时插件会把它原来的标签一并恢复（0.10.15 起）。

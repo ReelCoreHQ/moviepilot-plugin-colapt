@@ -46,7 +46,7 @@ case "${1:-install}" in
     echo "安装完成，容器 $C 已重启。"
     echo
     echo "接下来：MoviePilot → 插件 → 找到「可乐PT辅种」→ 启用。"
-    echo "首次使用：先在插件详情页看验证码图片，把 4 位数字填进设置「验证码」，再填可乐账号密码，保存。"
+    echo "首次使用：在可乐PT「账号 → Key → API Key」新建一把勾「读取」「下载」的 Key，填进插件设置「API Key」，保存。"
     ;;
   *)
     echo "用法: $0 [install|uninstall]" >&2

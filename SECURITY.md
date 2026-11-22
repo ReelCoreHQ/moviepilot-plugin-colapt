@@ -11,8 +11,7 @@
 
 | 凭据 | 用途 | 存在哪里 |
 |---|---|---|
-| 可乐PT 用户名 / 密码 | 登录站点（换会话 token） | MoviePilot 插件配置 |
-| 可乐PT 会话 token | 之后调用站点接口 | 插件数据目录 |
+| 可乐PT API Key（读取 + 下载） | 调站点开放 API（只放在 `X-API-Key` 请求头里；取种子用站点签的 30 分钟直链，不带 Key） | MoviePilot 插件配置 |
 | 其他站 passkey | 查 `/api/pieces-hash`、拼下载链接 | MoviePilot 插件配置 |
 | IYUU token | 用 IYUU 云端做辅种匹配 | MoviePilot 插件配置 |
 | 下载器地址/账号/密码 | 列出已完成种子、添加种子 | MoviePilot 插件配置 |

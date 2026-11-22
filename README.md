@@ -52,9 +52,7 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
 | 字段 | 说明 |
 |---|---|
 | 启用插件 | 总开关 |
-| 可乐PT 用户名 / 密码 | 你的可乐PT 账号（登录一次后会保存会话 token，不用反复填） |
-| 验证码 | **先打开插件详情页**，页面会显示一张验证码图片，把 4 位数字填到这里，保存即完成登录 |
-| 两步验证码 | 账号开了 2FA 时填（可选） |
+| 可乐PT API Key | 在站点「账号 → Key → API Key」（<https://www.colapt.com/account/tracker?tab=api>）新建一把 Key，范围勾**读取**和**下载**，粘到这里保存。插件只把它放在 `X-API-Key` 请求头里；不再需要账号密码、验证码和两步验证码 |
 | 使用 MoviePilot 已配置下载器 | 勾选后使用 MP 里的 qB/TR |
 | 下载器 | 每行一个：`地址,用户名,密码`；Transmission 写 `tr,地址,用户名,密码`（qB 可写 `qb,地址,用户名,密码`） |
 | 其他站 | 每行一个站点，位置写法和键值写法都支持（见下） |
@@ -155,7 +153,7 @@ https://pt.example.com,abcdef1234567890abcdef1234567890
 
 | 通道 | 依赖 | 适用 |
 |---|---|---|
-| 可乐 `/api/v1/plugin/match` | 可乐PT 账号 | 客户端里的种子在可乐有没有（主通道，按 `info_hash` / `source_info_hash`） |
+| 可乐哈希反查（开放 API `POST /api/v1/torrents/hashes`） | 可乐PT API Key（读取） | 客户端里的种子在可乐有没有（主通道，按 `info_hash` / `source_info_hash`） |
 | `info.source` 归一化 | 同上（qB 4.5+ 能导出 `.torrent`） | 可乐发布时会把 `info.source` 盖成自己的章，同一份文件在不同站 info_hash 必然不同；把 source 换掉再算哈希去反查 |
 | **文件清单指纹 `content_key`** | 站点接口 | 「相对路径 + 字节数」的 SHA1，与谁重新打包无关；不需要导出种子，Transmission / 老 qB 也能用 |
 | 站点 `/api/pieces-hash` | 站点开放 pieces-hash 接口 | 有该接口的 NexusPHP 站 |
@@ -168,9 +166,10 @@ RSS 命中的是**同一 info_hash**，qB 不允许同 hash 双开，所以这�
 
 ## 注意
 
-- 会话过期（站点返回 401）时插件会发站内通知：重新打开插件页面取验证码、填一次即可；
-- 插件只保存可乐的会话 token，其他站只需要域名 + passkey；
-- 可乐PT 接口有限流（列表/match 60 次/分/凭据，下载 120 次/分），插件已按批调用；
+- 插件只走可乐PT 的**开放 API**（接口说明见 <https://www.colapt.com/api-docs>）：哈希反查 `matchTorrentHashes`、签下载地址 `createDownloadLink`、连通检测 `personalStats`；
+- API Key 无效 / 被撤销（站点答 401）或缺范围（403 `api_key_scope_denied`）时插件发一条通知：到站点重建一把勾「读取」「下载」的 Key 填进来即可；
+- 插件只保存可乐的 API Key，其他站只需要域名 + passkey；
+- 可乐PT 接口有限流（每把 Key 读 60 次/分、下载 120 次/分；哈希反查一次最多 500 条、一次只算一次读），插件已按批调用；
 - 默认 20 个/小时是为了避免一次辅种太多触发源站风控，可自行调低。
 
 ## 安全与隐私

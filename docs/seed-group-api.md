@@ -1,5 +1,7 @@
 # 可乐保种组 · 站点接口对照（v1）
 
+> **历史文档**：保种组已在 0.11.0 拆到独立插件 [ColaSeedGroup](https://github.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup)，本仓库不再有这部分代码。文中的会话登录、验证码、Cookie + CSRF 写法都已作废：0.12.0 起插件只用可乐PT 开放 API（`X-API-Key`，文档见站点 `/api-docs`）。
+
 > 这一版**不需要站点新增任何接口**：解锁资格、资源池、取种都走站点已有的 API。
 > 原本设想的 `/api/v1/plugin/seed-group/*` 保留为「将来若要做专用池」的位置，插件会优先用它。
 

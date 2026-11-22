@@ -3,14 +3,16 @@
 
 逻辑（2026-10-25 定稿）：
   1. 扫用户配置的 qBittorrent / Transmission（可多个，也可用 MoviePilot 已配置的默认下载器）里**已完成**的种子；
-  2. 把这些种子的 info_hash 批量交给可乐PT 的 /api/v1/plugin/match 做反向匹配：
+  2. 把这些种子的 info_hash 批量交给可乐PT 开放 API 的哈希反查（POST /api/v1/torrents/hashes）：
        - via=source_info_hash：客户端里有同一份文件（来源是别的站），拉可乐这颗种子回原下载器辅种；
        - via=info_hash：客户端里已经是可乐这颗种子（跳过）；
   3. 可选方向二：对 via=info_hash 的可乐种子，下载可乐的 .torrent 算出 pieces_hash，
      去用户配置的其他 NexusPHP 站点 /api/pieces-hash 查同 pieces 的种子，命中就拉对方种子回来辅种；
   4. 每小时最多添加 N 个（默认 20，滚动 60 分钟窗口），是否跳过校验由用户设置（默认校验）。
 
-登录：可乐PT 用户名 + 密码 + 图形验证码（插件页面显示图片，设置里填 4 位数字后保存）。
+凭据：可乐PT 开放 API 的 API Key（站点「账号 → Key → API Key」创建，勾「读取」+「下载」），
+只放在请求头 X-API-Key 里；不再用账号密码 + 验证码登录，也不带 Cookie / CSRF / Origin。
+接口说明见站点的 /api-docs。
 """
 import base64
 import hashlib
@@ -19,7 +21,6 @@ import re
 import subprocess
 import time
 from urllib.parse import urlencode, urljoin
-import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from threading import Event, Lock
@@ -57,47 +58,18 @@ SITE_SKIP = {
     "www.ptsbao.club",
 }
 MANDATORY_TAG = "可乐辅种"   # 加进客户端的种子一律带这个标签，方便筛选/清理
-COLA_MATCH_BATCH = 500
+COLA_MATCH_BATCH = 500   # matchTorrentHashes 每种 key 一次最多 500 条，一次调用只计一次读预算
+# 可乐PT 开放 API（契约里带 x-open-api 的操作，文档在站点 /api-docs）
+COLA_MATCH_API = "/api/v1/torrents/hashes"            # matchTorrentHashes（read）
+COLA_STATS_API = "/api/v1/me/stats"                   # personalStats（read）
+COLA_DOWNLOAD_LINK_API = "/api/v1/torrents/{id}/download-links"   # createDownloadLink（download）
+COLA_KEY_PAGE = "https://www.colapt.com/account/tracker?tab=api"
+_HEX40 = re.compile(r"^[0-9a-f]{40}$")
 # colapt.com 在部分国内网络会被解析到连不通的 Cloudflare 段；这些是实测可用的备用段。
 COLA_FALLBACK_IPS = ("104.21.66.130", "172.67.132.88", "104.26.10.0")
 REQUEST_TIMEOUT = 20
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
 
-# ---------------- 可乐保种组 ----------------
-# 「可乐保种组」= 站点侧的定向保种计划：给授权成员开放一组资源池，成员按档位
-# （2T / 5T / 10T / 15T / 20T / 自定义≥2T）把池子纳入做种，**体积只能超、不能少**。
-# 站点的权限/资源接口尚未上线，这里先按预留的 v1 契约探测（见 docs/seed-group-api.md）：
-# 拿不到 200 就整块锁定，面板上直说缺什么，不静默失败。
-SEED_GROUP_TAG = "可乐保种组"
-GIB = 1024 ** 3
-# 站点「工作组」= rc_site_groups.title 以「工作组」开头的组（生产：工作组-审核 / 工作组-保种 /
-# 工作组-组长 / 工作组-转载）。插件不看 is_system、不看 vip，只认这个标题前缀，因为「转载组」
-# 是自建组（is_system=0）却同样是工作组。前缀可用配置项覆盖。
-SEED_GROUP_STAFF_PREFIX = "工作组"
-# 官方发布清单（机器面）：X-API-Key，一页最多 100 条，不回 Cookie。
-OFFICIAL_API = "/api/v1/automation/official/torrents"
-OFFICIAL_PAGE_LIMIT = 100
-# 限速上报收集端：走站点域名（HTTPS），不暴露源站 IP
-SEED_GROUP_REPORT_URL = "https://www.colapt.com/api/v1/plugin/seed-group/report"
-# 站点将来若提供专用的保种组资源池接口，插件优先走它；没有就走官方清单。
-SEED_GROUP_API = "/api/v1/plugin/seed-group"
-# 档位 -> 体积下限（GiB）。固定档之外还有一个 custom（自定义），下限同样不许低于 20T。
-SEED_GROUP_TIERS: Dict[str, int] = {"2T": 2048, "5T": 5120, "10T": 10240, "15T": 15360, "20T": 20480}
-SEED_GROUP_CUSTOM_TIER = "custom"
-SEED_GROUP_ALL_TIER = "all"        # 全站官种：有多少保多少（target 由池子总量决定）
-SEED_GROUP_CUSTOM_MIN_GIB = 1              # 自定义档只要求「不是 0」：100M / 100G / 1T / 1P 都行
-SEED_GROUP_CUSTOM_MAX_GIB = 1024 * 1024    # 上限 1 PiB（防手滑填天文数字）
-# 老配置里的 “20T+” 就是现在的 20T（档位改名，不改数值）
-SEED_GROUP_TIER_ALIASES: Dict[str, str] = {"20T+": "20T"}
-SEED_GROUP_TIER_LABELS: Dict[str, str] = {
-    "2T": "2T 档（≥ 2048 GiB）",
-    "5T": "5T 档（≥ 5120 GiB）",
-    "10T": "10T 档（≥ 10240 GiB）",
-    "15T": "15T 档（≥ 15360 GiB）",
-    "20T": "20T 档（≥ 20480 GiB）",
-    SEED_GROUP_CUSTOM_TIER: "自定义档（100M / 100G / 1T / 1P）",
-    SEED_GROUP_ALL_TIER: "全站官种（有多少保多少）",
-}
 SIZE_UNITS_GIB = {"M": 1.0 / 1024, "G": 1.0, "T": 1024.0, "P": 1024.0 * 1024}
 
 
@@ -451,7 +423,7 @@ def _torrent_info_hash_variants(data: bytes) -> List[str]:
 
     可乐PT 发布时会把 info.source 盖成 `[https://www.colapt.com] ColaPT`；同一颗种子在
     M-Team 是 `[kp.m-team.cc] M-Team - TP` —— 于是两边的 info_hash 必然不同，而
-    /api/v1/plugin/match 只按 info_hash / source_info_hash 反查，结果就是「内容一模一样
+    站点的哈希反查（matchTorrentHashes）只按 info_hash / source_info_hash 反查，结果就是「内容一模一样
     却匹配不到」。这里把 source 换成可乐的章 / 直接去掉，各算一遍 info_hash，再让站点反查。
     """
     try:
@@ -1056,7 +1028,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.11.2"
+    plugin_version = "0.12.0"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1067,11 +1039,8 @@ class ColaCrossSeed(_PluginBase):
     _crossseed_enabled = True   # 功能一：辅种
     _notify = True
     _cron = "0 */1 * * *"
-    _username = ""
-    _password = ""
-    _otp_code = ""
-    _captcha_code = ""
-    _session_token = ""
+    _api_key = ""            # 可乐PT 开放 API 的 Key（read + download），只放在 X-API-Key 请求头里
+    _key_alerted = False     # 本次加载已经提醒过「Key 不能用」，不每个请求都发一条
     _skip_check = False
     _max_per_hour = 0        # 0 = 不限（老板 2026-11-01：不要全局上限）
     _max_per_site = 20       # 单个站点每轮最多补多少
@@ -1117,7 +1086,6 @@ class ColaCrossSeed(_PluginBase):
     # 动态保种：体积达标后，删「做种人数最多」的、补「做种人数最少」的
     # 限速情况上报：只统计「开了保种组」的用户，辅种用户不采集、不上报
     _event = Event()
-    _csrf = ""
     # host -> 可用的 pieces-hash 路径（憨憨是 /nexusapi/pieces-hash，其余多为 /api/pieces-hash）；"" 表示不支持
     _pieces_paths: Dict[str, str] = {}
     _iyuu_rate_limited = False
@@ -1129,11 +1097,8 @@ class ColaCrossSeed(_PluginBase):
             self._crossseed_enabled = bool(config.get("crossseed_enabled", True))
             self._notify = bool(config.get("notify", True))
             self._cron = str(config.get("cron") or "0 */1 * * *").strip()
-            self._username = str(config.get("username") or "")
-            self._password = str(config.get("password") or "")
-            self._otp_code = str(config.get("otp_code") or "")
-            self._captcha_code = str(config.get("captcha_code") or "")
-            self._session_token = str(config.get("session_token") or "")
+            self._api_key = str(config.get("api_key") or "").strip()
+            self._key_alerted = False
             self._skip_check = bool(config.get("skip_check", False))
             self._direction = str(config.get("direction") or "both")
             self._use_mp_clients = bool(config.get("use_mp_clients", True))
@@ -1158,11 +1123,6 @@ class ColaCrossSeed(_PluginBase):
                 self._limit_dl_kib = 0
                 self._limit_up_kib = 0
             self._limit_lines = str(config.get("limit_lines") or "")
-        # 保存配置时如果填了验证码，立刻换一次 token（一次性，成功/失败都会清掉验证码字段）。
-        if self._captcha_code and self._username and self._password and not self._session_token:
-            self._login(self._captcha_code)
-            self._captcha_code = ""
-            self._persist()
         # IYUU 本地文件导入：填了容器内路径就以文件为准（粘进文本框的内容会被覆盖）。
         # 放在所有字段赋值之后：_iyuu_import 内部会 _persist()。
         if self._iyuu_json_file:
@@ -1192,11 +1152,7 @@ class ColaCrossSeed(_PluginBase):
             "crossseed_enabled": self._crossseed_enabled,
             "notify": self._notify,
             "cron": self._cron,
-            "username": self._username,
-            "password": self._password,
-            "otp_code": self._otp_code,
-            "captcha_code": "",
-            "session_token": self._session_token,
+            "api_key": self._api_key,
             "skip_check": self._skip_check,
             "max_per_hour": self._max_per_hour,
             "max_per_site": self._max_per_site,
@@ -1221,101 +1177,94 @@ class ColaCrossSeed(_PluginBase):
             "limit_lines": self._limit_lines,
         })
 
-    # ---------------- 站点登录 / 匹配 / 下载 ----------------
 
-    def _login(self, captcha_code: str) -> bool:
-        captcha_id = self.get_data("captcha_id") or ""
-        if not captcha_id:
-            logger.warn("可乐PT 登录失败：没有验证码 id，请先打开插件页面获取验证码")
-            return False
-        payload = {
-            "username": self._username,
-            "password": self._password,
-            "captcha_id": captcha_id,
-            "captcha_code": captcha_code,
-        }
-        if self._otp_code:
-            payload["code"] = self._otp_code
+    # ---------------- 可乐PT 开放 API / 匹配 / 下载 ----------------
+
+    def _key_alert(self, text: str) -> None:
+        """Key 不能用时提醒一次（每次加载插件最多一条），别让每个请求都刷一条通知。"""
+        if self._key_alerted:
+            return
+        self._key_alerted = True
         try:
-            # 走 _curl 而不是 requests：有些机器（含群晖/部分 NAS）Python 的 TLS 握手过不去，
-            # 但系统 curl 正常，登录就不会莫名其妙失败。
-            rsp = _curl("POST", f"{COLA_BASE}/api/v1/plugin/sessions", json_body=payload,
-                        timeout=REQUEST_TIMEOUT)
-        except Exception as err:
-            logger.error(f"可乐PT 登录异常：{err}")
-            return False
-        if rsp.status_code == 201:
-            self._session_token = (rsp.json() or {}).get("session_token") or ""
-            self.save_data("captcha_id", "")
-            self.save_data("captcha_cache", {})
-            logger.info("可乐PT 登录成功")
-            return bool(self._session_token)
-        body = rsp.text or ""
-        if rsp.status_code == 403 and "captcha" in body:
-            # 验证码错/过期：把缓存清掉，下次打开插件页会换一张新的
-            self.save_data("captcha_cache", {})
-            self.save_data("captcha_error", "验证码不对或已过期，重新打开插件页会换一张")
-            logger.warn("可乐PT 登录失败：验证码不对或已过期，已清掉旧验证码")
-        else:
-            logger.warn(f"可乐PT 登录失败：{rsp.status_code} {body[:160]}")
-        return False
+            self.post_message(mtype=NotificationType.SiteMessage, title="【可乐PT辅种】API Key 不能用", text=text)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _error_code(rsp: Optional[_HttpResult]) -> str:
+        """站点错误信封 {"error": {"code": ...}} 里的 code；不是这个形状就返回空串。"""
+        if rsp is None:
+            return ""
+        body = rsp.json({}) or {}
+        error = body.get("error") if isinstance(body, dict) else None
+        return str(error.get("code") or "") if isinstance(error, dict) else ""
 
     def _cola(self, method: str, path: str, **kwargs) -> Optional[_HttpResult]:
+        """调可乐PT 开放 API：只带 X-API-Key，不带 Cookie / CSRF / Origin（带了反而会被拒）。
+
+        没填 Key 或网络失败返回 None；其余一律把响应交回调用方按状态码处理。
+        """
+        if not self._api_key:
+            return None
         headers = kwargs.pop("headers", {})
-        headers["Cookie"] = f"reelcore_session={self._session_token}"
+        headers["X-API-Key"] = self._api_key
+        headers.setdefault("Accept", "application/json")
         try:
             rsp = _curl(method, f"{COLA_BASE}{path}", headers=headers, timeout=REQUEST_TIMEOUT, **kwargs)
         except Exception as err:
             logger.error(f"可乐PT 请求失败 {path}：{err}")
             return None
         if rsp.status_code == 401:
-            logger.warn("可乐PT 会话已失效，请重新登录")
-            self._session_token = ""
-            self._persist()
-            self.post_message(mtype=NotificationType.SiteMessage, title="【可乐PT辅种】需要重新登录",
-                              text="会话已失效：请打开插件页面获取新的验证码，在插件设置里填写后保存。")
-            return None
-        if rsp.status_code != 200:
+            logger.warn(f"可乐PT {path}：API Key 无效、已撤销或已过期")
+            self._key_alert(f"API Key 无效、已撤销或已过期。请到 {COLA_KEY_PAGE} 新建一把勾「读取」「下载」的 Key，"
+                            f"填进插件设置「API Key」后保存。")
+        elif rsp.status_code == 403 and self._error_code(rsp) == "api_key_scope_denied":
+            logger.warn(f"可乐PT {path}：这把 API Key 缺少需要的范围")
+            self._key_alert(f"这把 API Key 缺少需要的范围：辅种要「读取」（查哈希）和「下载」（取种子）两项。"
+                            f"请到 {COLA_KEY_PAGE} 新建一把两项都勾上的 Key。")
+        elif rsp.status_code not in (200, 201):
             logger.warn(f"可乐PT {path} 返回 {rsp.status_code}：{rsp.text[:160]}")
         return rsp
+
+    def _lookup(self, field: str, values: List[str]) -> List[Dict[str, Any]]:
+        """matchTorrentHashes：按 field（info_hashes / content_keys）分批反查，返回每批的响应体。
+
+        只发 40 位十六进制：一条格式不对，站点会把整批答 400。
+        """
+        clean = sorted({str(v or "").strip().lower() for v in values} - {""})
+        wanted = [v for v in clean if _HEX40.match(v)]
+        if len(wanted) < len(clean):
+            logger.info(f"{len(clean) - len(wanted)} 个不是 40 位十六进制（如 v2 种子），不参与反查")
+        bodies: List[Dict[str, Any]] = []
+        for start in range(0, len(wanted), COLA_MATCH_BATCH):
+            chunk = wanted[start:start + COLA_MATCH_BATCH]
+            rsp = self._cola("POST", COLA_MATCH_API, json_body={field: chunk})
+            if rsp is None:
+                logger.warn("可乐PT 哈希反查失败（网络或未填 API Key），跳过这批")
+                continue
+            if rsp.status_code != 200:
+                logger.warn(f"可乐PT 哈希反查返回 {rsp.status_code}，跳过这批")
+                continue
+            body = rsp.json({}) or {}
+            if isinstance(body, dict):
+                bodies.append(body)
+        return bodies
 
     def _match(self, hashes: List[str]) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
         """批量 match，返回 client_hash -> [匹配行]（同一 hash 可能同时命中 info_hash 与 source_info_hash）。"""
         by_hash: Dict[str, List[Dict[str, Any]]] = {}
-        # 465 个 hash 的 query 约 19KB，Cloudflare/网关会直接拒掉；按 100 个一批。
-        for start in range(0, len(hashes), 100):
-            chunk = hashes[start:start + 100]
-            rsp = self._cola("GET", "/api/v1/plugin/match", params={"hashes": ",".join(chunk)})
-            if rsp is None:
-                logger.warn("可乐PT 匹配请求失败（网络），跳过这批")
-                continue
-            if rsp.status_code != 200:
-                logger.warn(f"可乐PT 匹配返回 {rsp.status_code}，跳过这批")
-                continue
-            for item in (rsp.json() or {}).get("matched") or []:
+        for body in self._lookup("info_hashes", hashes):
+            for item in body.get("matched") or []:
                 by_hash.setdefault(item.get("client_hash", ""), []).append(item)
         return by_hash, ""
 
     SOURCE_VARIANT_LIMIT = 400   # 一轮最多为多少个未命中的种子导出 .torrent 做归一化补查
 
+
     def _match_content(self, keys: List[str]) -> Dict[str, List[Dict[str, Any]]]:
-        """按「文件清单指纹」反查站点。老站点还没有这个参数，回 400 就静默跳过。"""
+        """按「文件清单指纹」反查站点（matchTorrentHashes 的 content_keys）。"""
         out: Dict[str, List[Dict[str, Any]]] = {}
-        for start in range(0, len(keys), 100):
-            chunk = sorted(keys[start:start + 100])
-            rsp = self._cola("GET", "/api/v1/plugin/match", params={"keys": ",".join(chunk)})
-            if rsp is None:
-                continue
-            if rsp.status_code == 400:
-                logger.info("站点暂不支持按内容键反查（接口版本较旧），跳过这条通道")
-                return {}
-            if rsp.status_code != 200:
-                logger.info(f"内容键反查返回 HTTP {rsp.status_code}")
-                continue
-            try:
-                body = rsp.json() or {}
-            except Exception:
-                continue
+        for body in self._lookup("content_keys", keys):
             for row in body.get("content") or []:
                 key = (row.get("client_key") or "").strip().lower()
                 if key:
@@ -1438,56 +1387,26 @@ class ColaCrossSeed(_PluginBase):
                 logger.info(f"内容键（文件清单指纹）补中 {hit_count} 个")
         return by_hash
 
-    def _csrf_token(self) -> str:
-        """会话登录后拿 CSRF（POST /authorizations 要带）。"""
-        if self._csrf:
-            return self._csrf
-        rsp = self._cola("GET", "/api/v1/me")
-        if rsp is None or rsp.status_code != 200:
-            return ""
-        try:
-            self._csrf = ((rsp.json() or {}).get("session") or {}).get("csrf_token") or ""
-        except Exception:
-            self._csrf = ""
-        return self._csrf
 
     def _download_cola(self, torrent_id: int) -> bytes:
-        """站点的下载要两步：先签发 authorization，再带 authorization_id 取字节。"""
-        csrf = self._csrf_token()
-        if not csrf:
-            logger.warn("可乐PT 下载失败：拿不到 CSRF（会话可能已过期）")
+        """取可乐的种子：createDownloadLink 签一条 30 分钟的直链，再不带任何凭据 GET 它。"""
+        rsp = self._cola("POST", COLA_DOWNLOAD_LINK_API.format(id=int(torrent_id)), json_body={})
+        if rsp is None or rsp.status_code not in (200, 201):
+            return b""
+        url = str((rsp.json({}) or {}).get("download_url") or "")
+        if not url.startswith("http"):
+            logger.warn(f"可乐PT 下载地址响应缺少 download_url（种子 {torrent_id}）")
             return b""
         try:
-            rsp = _curl(
-                "POST",
-                f"{COLA_BASE}/api/v1/torrents/{torrent_id}/authorizations",
-                headers={
-                    "Cookie": f"reelcore_session={self._session_token}",
-                    "X-CSRF-Token": csrf,
-                    "Origin": COLA_BASE,
-                    "Idempotency-Key": str(uuid.uuid4()),
-                },
-                json_body={},
-                timeout=REQUEST_TIMEOUT,
-            )
+            # 签名直链本身就是凭据：不带 X-API-Key，免得 Key 跟着 30 分钟的链接出现在别处的日志里
+            got = _curl("GET", url, timeout=REQUEST_TIMEOUT)
         except Exception as err:
-            logger.error(f"可乐PT 签发下载授权失败：{err}")
+            logger.error(f"可乐PT 取种子失败（{torrent_id}）：{err}")
             return b""
-        if rsp.status_code != 200:
-            logger.warn(f"可乐PT 签发下载授权返回 {rsp.status_code}：{rsp.text[:160]}")
+        if got.status_code != 200:
+            logger.warn(f"可乐PT 取种子返回 {got.status_code}（{torrent_id}）")
             return b""
-        try:
-            authorization = int((rsp.json() or {}).get("id") or 0)
-        except Exception:
-            authorization = 0
-        if not authorization:
-            logger.warn("可乐PT 下载授权响应缺少 id")
-            return b""
-        rsp = self._cola("GET", f"/api/v1/torrents/{torrent_id}/download",
-                         params={"authorization_id": authorization})
-        if rsp is None or rsp.status_code != 200:
-            return b""
-        return rsp.content if _valid_torrent(rsp.content) else b""
+        return got.content if _valid_torrent(got.content) else b""
 
     def _site_lookup(self, site: Dict[str, Any], pieces_hash: str) -> Tuple[Optional[str], str]:
         host = (site.get("url") or "").split("://", 1)[-1].split("/")[0].lower()
@@ -3146,19 +3065,25 @@ class ColaCrossSeed(_PluginBase):
                         f"不可用 {len(sites) - good - warn} 个")
         return lines
 
+
     def _test_cola(self) -> str:
-        if not self._session_token:
-            return "❌ 可乐PT：未登录（打开插件页取验证码填一次）"
-        rsp = self._cola("GET", "/api/v1/me")
+        """personalStats：200 就说明 Key 能读；顺带显示等级名。下载范围要到真取种时才知道。"""
+        if not self._api_key:
+            return f"❌ 可乐PT：未填 API Key（在 {COLA_KEY_PAGE} 创建，勾「读取」「下载」）"
+        rsp = self._cola("GET", COLA_STATS_API)
         if rsp is None:
             return "❌ 可乐PT：连不上（网络/防火墙），稍后重试"
         if rsp.status_code == 200:
-            try:
-                return f"✅ 可乐PT：已登录（{((rsp.json() or {}).get('username') or '')}）"
-            except Exception:
-                return "✅ 可乐PT：已登录"
+            class_name = str((rsp.json({}) or {}).get("class_name") or "").strip()
+            return f"✅ 可乐PT：API Key 可用（{class_name or '未定级'}）"
         if rsp.status_code == 401:
-            return "❌ 可乐PT：会话过期，需要重新登录"
+            return "❌ 可乐PT：API Key 无效、已撤销或已过期，请重新创建"
+        if rsp.status_code == 403:
+            if self._error_code(rsp) == "api_key_scope_denied":
+                return "❌ 可乐PT：API Key 缺少「读取」范围，请新建一把勾「读取」「下载」的 Key"
+            return "❌ 可乐PT：账号没有权限（被停用或等级不够）"
+        if rsp.status_code == 429:
+            return "⚠️ 可乐PT：请求太频繁（每把 Key 每分钟有额度），稍后自动恢复"
         return f"❌ 可乐PT：HTTP {rsp.status_code}"
 
     def _test_iyuu(self) -> str:
@@ -3210,8 +3135,8 @@ class ColaCrossSeed(_PluginBase):
         self._event.clear()
         if not (self._enabled and self._crossseed_enabled):
             return
-        if not self._session_token:
-            logger.warn("可乐PT 未登录，跳过本次辅种")
+        if not self._api_key:
+            logger.warn("可乐PT 未填 API Key，跳过本次辅种")
             return
         clients = self._clients()
         if not clients:
@@ -3526,18 +3451,11 @@ class ColaCrossSeed(_PluginBase):
                       + (f"\n待下一轮重试：{len(self._pending())} 个" if self._pending() else "")),
             )
 
-    # ---------------- 可乐保种组 ----------------
-    #
-    # 与辅种是两条独立的腿：辅种是「客户端里已有 → 反向找可乐的种子」；
-    # 保种组是「站点官方资源池 → 按档位搬进客户端」，体积只能超、不能少。
-    # 解锁资格只认站点现成的东西：账号密码登录后读本人资料里的工作组头衔
-    # （GET /api/v1/me → GET /api/v1/users/{id}/profile 的 groups），
-    # 没有工作组头衔的账号插件直接拒绝解锁，保存配置时还会把开关强制关掉。
+    # ---------------- 运行状态 ----------------
 
-    UNLOCK_TTL = 86400          # 工作组资格校验结果的缓存时长（秒）
     def get_state(self) -> bool:
         # 保种组已经搬到独立插件（ColaSeedGroup），这里只看辅种开关
-        return bool(self._enabled and self._crossseed_enabled and self._session_token)
+        return bool(self._enabled and self._crossseed_enabled and self._api_key)
 
     def get_service(self) -> List[Dict[str, Any]]:
         services: List[Dict[str, Any]] = []
@@ -3557,25 +3475,18 @@ class ColaCrossSeed(_PluginBase):
     # ---------------- 插件页面 / API / 表单 ----------------
 
     def get_page(self) -> Optional[List[dict]]:
-        if not self._session_token:
-            captcha_id, image = self._fetch_captcha()
-            if not image:
-                reason = str(self.get_data("captcha_error") or "未知原因")
-                return [
-                    {"component": "div", "text": f"获取可乐PT 验证码失败：{reason}"},
-                    {"component": "div", "text": "确认这台机器能打开 https://www.colapt.com（浏览器里试一下），"
-                                                 "再重新打开插件页重试；若一直失败，把上面这行原因贴到 GitHub issue。"},
-                ]
+        if not self._api_key:
             return [
-                {"component": "div", "text": f"可乐PT 登录：验证码 id {captcha_id}（4 位数字），填到插件设置「验证码」后保存。"},
-                {"component": "VImg", "props": {"src": image, "max-width": 220, "class": "mt-3"}},
+                {"component": "div", "text": "还没填可乐PT 的 API Key。"},
+                {"component": "div", "text": f"到 {COLA_KEY_PAGE} 新建一把 Key，范围勾「读取」和「下载」，"
+                                             f"把它粘到插件设置「API Key」里保存即可。接口说明见 https://www.colapt.com/api-docs 。"},
             ]
         last = self.get_data("last_run") or {}
         report = self.get_data("test_report") or self._test_report or {}
         pending = self._pending()
         blocks: List[dict] = [
             # 版本写到页面上：用户在 issue 里反馈时，第一眼就能看到自己装的是哪一版
-            {"component": "div", "text": f"插件版本 v{self.plugin_version}；已登录可乐PT。上次运行：{last.get('at', '未运行')}；"
+            {"component": "div", "text": f"插件版本 v{self.plugin_version}；已填可乐PT API Key。上次运行：{last.get('at', '未运行')}；"
                                          f"可乐补种 {last.get('added', 0)}，其他站 {last.get('filled', 0)}，"
                                          f"重复 {last.get('duplicate', 0)}，失败 {last.get('failed', 0)}；"
                                          f"待重试 {len(pending)} 个。"}
@@ -3658,36 +3569,6 @@ class ColaCrossSeed(_PluginBase):
             blocks.append({"component": "div", "text": "保存一次配置会自动做连通性检测，结果显示在这里。"})
         return blocks
 
-    # 站点验证码 10 分钟内有效；插件缓存 5 分钟 —— 否则每次打开/刷新插件页都会换一张，
-    # 用户看到的那张立刻作废（「第一次看不清，再刷就不出来了」就是这个）。
-    CAPTCHA_TTL = 300
-
-    def _fetch_captcha(self, force: bool = False) -> Tuple[str, str]:
-        cached = self.get_data("captcha_cache") or {}
-        if (not force and cached.get("id") and cached.get("image")
-                and 0 <= time.time() - int(cached.get("at") or 0) < self.CAPTCHA_TTL):
-            return str(cached["id"]), str(cached["image"])
-        captcha_id, image, reason = "", "", ""
-        try:
-            rsp = _curl("GET", f"{COLA_BASE}/api/v1/plugin/captcha", timeout=REQUEST_TIMEOUT)
-            if rsp.status_code == 200:
-                body = rsp.json() or {}
-                captcha_id = str(body.get("captcha_id") or "")
-                image = str(body.get("image") or "")
-            else:
-                reason = f"站点返回 HTTP {rsp.status_code}"
-        except Exception as err:
-            reason = f"{type(err).__name__}: {err}"
-        if not image:
-            reason = reason or "站点没有返回验证码图片"
-            self.save_data("captcha_error", reason)
-            logger.warn(f"获取可乐PT 验证码失败：{reason}")
-            return "", ""
-        self.save_data("captcha_error", "")
-        self.save_data("captcha_id", captcha_id)
-        self.save_data("captcha_cache", {"id": captcha_id, "image": image, "at": int(time.time())})
-        return captcha_id, image
-
     def get_api(self) -> List[Dict[str, Any]]:
         return [
             {
@@ -3702,7 +3583,7 @@ class ColaCrossSeed(_PluginBase):
                 "endpoint": self.run_tests,
                 "methods": ["GET", "POST"],
                 "summary": "检测可乐/下载器/其他站连通性",
-                "description": "返回可乐登录、每个下载器、每个其他站的连接结果；结果也会显示在插件页",
+                "description": "返回可乐 API Key、每个下载器、每个其他站的连接结果；结果也会显示在插件页",
             },
             {
                 "path": "/sites/import",
@@ -3754,25 +3635,19 @@ class ColaCrossSeed(_PluginBase):
                                 "type": "info", "variant": "tonal", "density": "compact",
                                 "text": "两个功能互不影响，各有各的开关与运行间隔；"
                                         "「启用插件」是总开关，关掉后两个都不跑。"
-                                        "异常与重新登录提醒始终发送，不受「任务结果通知」影响。"}}]},
+                                        "异常与 API Key 失效提醒始终发送，不受「任务结果通知」影响。"}}]},
                     ]},
 
                     # ── ① 账号 ──
-                    self._form_section("① 可乐PT 账号",
-                                       "第一次使用先打开插件页取验证码，填到「验证码」保存即完成登录；"
-                                       "会话过期插件会发站内通知，重新取一次即可。"),
+                    self._form_section("① 可乐PT API Key",
+                                       "在站点「账号 → Key → API Key」新建一把 Key，范围勾「读取」和「下载」，"
+                                       "粘到这里保存。插件只把它放在 X-API-Key 请求头里，不再需要账号密码和验证码。"),
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "username", "label": "用户名"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "password", "label": "密码", "type": "password"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "captcha_code",
-                             "label": "验证码（先在插件页看图片）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "otp_code", "label": "两步验证码（可选）"}}]},
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VTextField", "props": {
+                                "model": "api_key", "label": "API Key", "type": "password",
+                                "persistent-hint": True,
+                                "hint": "读取：查哈希、检测连通；下载：取可乐的种子。接口说明见 www.colapt.com/api-docs"}}]},
                     ]},
 
                     # ── ② 下载器 ──
@@ -3880,7 +3755,7 @@ class ColaCrossSeed(_PluginBase):
             }
         ], {
             "enabled": False, "crossseed_enabled": True, "notify": True, "cron": "0 */1 * * *",
-            "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
+            "api_key": "",
             "skip_check": False, "max_per_hour": 0, "max_per_site": 20, "direction": "both",
             "use_mp_clients": True, "clients_json": "", "clients_lines": "",
             "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "", "sites_mode": "merge",
