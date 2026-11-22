@@ -289,67 +289,137 @@ class DedupeMemoryTest(unittest.TestCase):
         self.assertEqual(plugin._dead_hashes()[-1], "ff" * 20)
 
 
-class CaptchaTest(unittest.TestCase):
-    """验证码要缓存：每刷新一次就换一张，用户看到的那张立刻作废（issue #8）。"""
+class OpenApiTest(unittest.TestCase):
+    """可乐PT 只走开放 API：X-API-Key，不带 Cookie / CSRF / Origin，不再登录。"""
 
-    def _fake_curl(self, payload, status=200):
-        import json as _json
-        captured = []
+    KEY = "rcapi_test_key"
+
+    def _fake(self, answers):
+        """answers: [(status, body)]，按顺序答；body 是 dict 就当 JSON，bytes 原样给。"""
+        calls = []
+        queue = list(answers)
 
         def fake(method, url, **kwargs):
-            captured.append(url)
-            text = _json.dumps(payload, ensure_ascii=False)
+            calls.append({"method": method, "url": url, **kwargs})
+            status, body = queue.pop(0)
+            if isinstance(body, (bytes, bytearray)):
+                return mod._HttpResult(status, bytes(body), "")
+            text = json.dumps(body, ensure_ascii=False)
             return mod._HttpResult(status, text.encode(), text)
 
-        return fake, captured
+        return fake, calls
 
-    def test_cached_between_calls(self):
-        plugin = support.make_plugin(mod)
-        fake, calls = self._fake_curl({"captcha_id": "cid1", "image": "data:image/png;base64,AA"})
+    def _run(self, plugin, answers, func, *args):
+        fake, calls = self._fake(answers)
         original, mod._curl = mod._curl, fake
         try:
-            first = plugin._fetch_captcha()
-            second = plugin._fetch_captcha()
+            return func(*args), calls
         finally:
             mod._curl = original
-        self.assertEqual(first, ("cid1", "data:image/png;base64,AA"))
-        self.assertEqual(first, second)
-        self.assertEqual(len(calls), 1, "第二次应命中缓存，不该再请求站点")
 
-    def test_force_bypasses_cache(self):
-        plugin = support.make_plugin(mod)
-        fake, calls = self._fake_curl({"captcha_id": "cid2", "image": "data:image/png;base64,BB"})
-        original, mod._curl = mod._curl, fake
-        try:
-            plugin._fetch_captcha()
-            plugin._fetch_captcha(force=True)
-        finally:
-            mod._curl = original
+    def assertKeyOnly(self, call):
+        headers = call.get("headers") or {}
+        self.assertEqual(headers.get("X-API-Key"), self.KEY)
+        for banned in ("Cookie", "X-CSRF-Token", "Origin"):
+            self.assertNotIn(banned, headers)
+
+    def test_no_key_makes_no_request(self):
+        plugin = support.make_plugin(mod, _api_key="")
+        got, calls = self._run(plugin, [], plugin._match, ["a" * 40])
+        self.assertEqual(got, ({}, ""))
+        self.assertEqual(calls, [])
+
+    def test_match_posts_hashes_in_batches_of_500(self):
+        plugin = support.make_plugin(mod, _api_key=self.KEY)
+        hashes = [f"{n:040x}" for n in range(501)] + ["NOT-A-HASH", "b" * 64]
+        row = {"client_hash": "0" * 40, "id": 7, "info_hash": "c" * 40, "source_info_hash": "0" * 40,
+               "size_bytes": "1024", "published_at": None, "via": "source_info_hash"}
+        answers = [(200, {"checked": 500, "unmatched": 499, "matched": [row], "content": []}),
+                   (200, {"checked": 1, "unmatched": 1, "matched": [], "content": []})]
+        (by_hash, _), calls = self._run(plugin, answers, plugin._match, hashes)
         self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertEqual(call["method"], "POST")
+            self.assertTrue(call["url"].endswith("/api/v1/torrents/hashes"))
+            self.assertKeyOnly(call)
+        self.assertEqual(len(calls[0]["json_body"]["info_hashes"]), 500)
+        self.assertEqual(len(calls[1]["json_body"]["info_hashes"]), 1)
+        sent = calls[0]["json_body"]["info_hashes"] + calls[1]["json_body"]["info_hashes"]
+        self.assertTrue(all(re.match(r"^[0-9a-f]{40}$", h) for h in sent), "格式不对的不能发，否则整批 400")
+        self.assertEqual(by_hash["0" * 40][0]["id"], 7)
 
-    def test_failure_records_reason(self):
-        plugin = support.make_plugin(mod)
+    def test_match_content_uses_content_keys(self):
+        plugin = support.make_plugin(mod, _api_key=self.KEY)
+        row = {"client_key": "d" * 40, "id": 9, "info_hash": "e" * 40, "size_bytes": "10",
+               "release_name": "x", "published_at": None}
+        got, calls = self._run(plugin, [(200, {"matched": [], "content": [row]})],
+                               plugin._match_content, ["D" * 40])
+        self.assertEqual(calls[0]["json_body"], {"content_keys": ["d" * 40]})
+        self.assertEqual(got["d" * 40][0]["id"], 9)
 
-        def boom(*args, **kwargs):
-            raise RuntimeError("tls handshake failed")
-
-        original, mod._curl = mod._curl, boom
+    def test_download_signs_link_then_fetches_without_key(self):
+        plugin = support.make_plugin(mod, _api_key=self.KEY)
+        torrent = support.make_torrent()
+        link = "https://www.colapt.com/downloads/tok/42?exp=1&sig=s"
+        # 裸 python 下 bencode 是测试桩（键是 bytes），这里只验证「拿到的就是这份字节」
+        original, mod._valid_torrent = mod._valid_torrent, (lambda data: data == torrent)
         try:
-            cid, image = plugin._fetch_captcha()
+            got, calls = self._run(plugin, [(201, {"download_url": link}), (200, torrent)],
+                                   plugin._download_cola, 42)
         finally:
-            mod._curl = original
-        self.assertEqual((cid, image), ("", ""))
-        self.assertIn("tls handshake failed", plugin.get_data("captcha_error"))
+            mod._valid_torrent = original
+        self.assertEqual(got, torrent)
+        self.assertEqual(calls[0]["method"], "POST")
+        self.assertTrue(calls[0]["url"].endswith("/api/v1/torrents/42/download-links"))
+        self.assertKeyOnly(calls[0])
+        self.assertEqual(calls[1]["url"], link)
+        self.assertNotIn("X-API-Key", calls[1].get("headers") or {}, "签名直链本身就是凭据")
 
-    def test_http_error_records_status(self):
+    def test_download_refused_returns_empty(self):
+        plugin = support.make_plugin(mod, _api_key=self.KEY)
+        got, calls = self._run(plugin, [(404, {"error": {"code": "not_found"}})], plugin._download_cola, 1)
+        self.assertEqual(got, b"")
+        self.assertEqual(len(calls), 1)
+
+    def test_connection_test_shows_class_name(self):
+        plugin = support.make_plugin(mod, _api_key=self.KEY)
+        got, calls = self._run(plugin, [(200, {"class_name": "黄金可乐", "seeding": 3})], plugin._test_cola)
+        self.assertIn("黄金可乐", got)
+        self.assertTrue(got.startswith("✅"))
+        self.assertTrue(calls[0]["url"].endswith("/api/v1/me/stats"))
+        self.assertKeyOnly(calls[0])
+
+    def test_scope_denied_alerts_once(self):
+        plugin = support.make_plugin(mod, _api_key=self.KEY, _key_alerted=False)
+        sent = []
+        plugin.post_message = lambda **kwargs: sent.append(kwargs)
+        denied = {"error": {"code": "api_key_scope_denied", "message": "x"}}
+        got, _ = self._run(plugin, [(403, denied)], plugin._test_cola)
+        self.assertIn("读取", got)
+        self._run(plugin, [(403, denied)], plugin._test_cola)
+        self.assertEqual(len(sent), 1, "同一把 Key 的问题只提醒一次")
+
+    def test_missing_key_message(self):
+        plugin = support.make_plugin(mod, _api_key="")
+        self.assertIn("API Key", plugin._test_cola())
+        page = plugin.get_page()
+        self.assertIn("account/tracker?tab=api", json.dumps(page, ensure_ascii=False))
+
+    def test_form_has_key_field_and_no_login_fields(self):
         plugin = support.make_plugin(mod)
-        fake, _ = self._fake_curl({}, status=502)
-        original, mod._curl = mod._curl, fake
-        try:
-            self.assertEqual(plugin._fetch_captcha(), ("", ""))
-        finally:
-            mod._curl = original
-        self.assertIn("502", plugin.get_data("captcha_error"))
+        form, defaults = plugin.get_form()
+        text = json.dumps(form, ensure_ascii=False)
+        self.assertIn('"model": "api_key"', text)
+        for gone in ("username", "password", "captcha_code", "otp_code", "session_token"):
+            self.assertNotIn(f'"model": "{gone}"', text)
+            self.assertNotIn(gone, defaults)
+        self.assertEqual(defaults["api_key"], "")
+
+    def test_source_has_no_session_endpoints(self):
+        source = support.PLUGIN_PATH.read_text("utf-8")
+        for gone in ("/api/v1/plugin/match", "/api/v1/plugin/sessions", "/api/v1/plugin/captcha",
+                     "/authorizations", "reelcore_session", "X-CSRF-Token"):
+            self.assertNotIn(gone, source)
 
 
 class ParallelCurlTest(unittest.TestCase):

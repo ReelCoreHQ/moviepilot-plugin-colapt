@@ -1,5 +1,7 @@
 # 插件密钥方案：代码事实（已验证，2026-11-19）
 
+> **历史文档**：保种组已在 0.11.0 拆到独立插件 [ColaSeedGroup](https://github.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup)，本仓库不再有这部分代码。文中的会话登录、验证码、Cookie + CSRF 写法都已作废：0.12.0 起插件只用可乐PT 开放 API（`X-API-Key`，文档见站点 `/api-docs`）。
+
 本文件只记录**读过代码/线上 schema 确认**的事实，不含设计意见。设计讨论见
 `docs/plugin-key-design.md`。
 
