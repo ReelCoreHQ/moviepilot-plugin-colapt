@@ -16,7 +16,6 @@ import types
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLUGIN_PATH = ROOT / "plugins.v2" / "colacrossseed" / "__init__.py"
 # 拆出来的保种插件（2026-11-17）：它有自己的入口，测试用同一个装载器
-SEEDGROUP_PLUGIN_PATH = ROOT / "plugins.v2" / "colaseedgroup" / "__init__.py"
 
 
 def _loadable(name: str) -> bool:
@@ -130,18 +129,6 @@ def _install_stubs() -> None:
 
         _module("apscheduler.triggers.cron", CronTrigger=_StubCronTrigger)
 
-
-def load_seedgroup_plugin():
-    """导入拆出来的「可乐保种组」插件（带桩）。"""
-    _install_stubs()
-    name = "colaseedgroup_under_test"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, SEEDGROUP_PLUGIN_PATH)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def load_plugin():
