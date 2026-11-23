@@ -12,7 +12,8 @@
 
 凭据：可乐PT 开放 API 的 API Key（站点「账号 → Key → API Key」创建，勾「读取」+「下载」），
 只放在请求头 X-API-Key 里；不再用账号密码 + 验证码登录，也不带 Cookie / CSRF / Origin。
-接口说明见站点的 /api-docs。
+Key 来源二选一：① 从 MP「站点管理」里可乐站的 apikey 字段读取（只需在设置里选站点 id，
+换 Key 后自动跟上）；② 插件设置里手填兜底。接口说明见站点的 /api-docs。
 """
 import base64
 import hashlib
@@ -1027,19 +1028,21 @@ class TransmissionClient(_Client):
 class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
-    plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.12.0"
+    plugin_icon = "https://www.colapt.com/brand/cola/app-red-180.png"
+    plugin_version = "0.13.0"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
     plugin_order = 21
     auth_level = 1
 
-    _enabled = False            # MP 插件总开关：关掉后两个功能都不跑
-    _crossseed_enabled = True   # 功能一：辅种
+    _enabled = False            # MP 插件总开关：关掉后辅种不跑
+    _crossseed_enabled = True   # 辅种开关（保种组已拆到独立插件）
+    _onlyonce = False           # 参考 iyuuautoseed：勾一次跑一轮，保存后自动复位
     _notify = True
-    _cron = "0 */1 * * *"
+    _cron = "0 0 * * *"   # 默认每日 00:00 跑一次
     _api_key = ""            # 可乐PT 开放 API 的 Key（read + download），只放在 X-API-Key 请求头里
+    _mp_site_id = ""         # MP 站点管理里可乐站的 id（只存 id，apikey 每次初始化现读）
     _key_alerted = False     # 本次加载已经提醒过「Key 不能用」，不每个请求都发一条
     _skip_check = False
     _max_per_hour = 0        # 0 = 不限（老板 2026-11-01：不要全局上限）
@@ -1053,14 +1056,11 @@ class ColaCrossSeed(_PluginBase):
     _use_mp_clients = True
     _clients_json = ""
     _clients_lines = ""
-    _sites_json = ""
-    _sites_lines = ""
-    _iyuu_json = ""
-    _iyuu_json_file = ""       # 容器内路径，例如 /config/cola-sites.json；填了就以文件为准
-    _iyuu_token = ""
-    _sites_mode = "merge"
+    _iyuu_token = ""               # IYUU 云端匹配 Token（可选）
+    _mp_site_ids: List[Any] = []   # MP 站点管理里勾选的辅种站点 id（只存 id，凭据每次现读）
     _add_label = ""
-    _target_client = ""       # 辅种加到哪个下载器：留空=自动（优先正在做种的那台）
+    _target_client = ""       # 手填的辅种目标下载器名（与下面多选合并）；留空=自动（优先正在做种的那台）
+    _mp_target_clients: List[str] = []  # 从 MP 已配置下载器里多选的目标（只存名字，与手填合并）
     _target_state: Dict[str, Any] = {}   # 上一轮「目标下载器解析结果」，页面与日志共用
     _inherit_tags = True      # 辅种时继承原种子已有的标签（站点标签、已整理、订阅…）
     _extra_tags = ""          # 额外附加的标签，逗号分隔
@@ -1092,30 +1092,55 @@ class ColaCrossSeed(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
+        onlyonce_requested = False
         if config is not None:
             self._enabled = bool(config.get("enabled", False))
             self._crossseed_enabled = bool(config.get("crossseed_enabled", True))
+            self._onlyonce = bool(config.get("onlyonce", False))
+            onlyonce_requested = self._onlyonce
             self._notify = bool(config.get("notify", True))
-            self._cron = str(config.get("cron") or "0 */1 * * *").strip()
+            self._cron = str(config.get("cron") or "0 0 * * *").strip()
             self._api_key = str(config.get("api_key") or "").strip()
+            # 统一 str：老配置里可能存的是 int（早期下拉 value 是 int），
+            # 而选项 value 现在是 str，类型不一致会让 VSelect 回显成裸数字 ID。
+            self._mp_site_id = str(config.get("mp_site_id") or "").strip()
+            # MP 站点管理里填了可乐站的 API Key 时优先用它：用户在站点管理里换 Key，
+            # 插件下次保存/重载自动跟上，不必再来插件设置里改一遍。手填的 api_key 作兜底。
+            if self._mp_site_id:
+                mp_key = self._api_key_from_mp_site()
+                if mp_key:
+                    self._api_key = mp_key
+                else:
+                    logger.warn("MP 站点管理里选的可乐站没读到 API Key，退回插件设置里手填的 Key")
             self._key_alerted = False
             self._skip_check = bool(config.get("skip_check", False))
             self._direction = str(config.get("direction") or "both")
             self._use_mp_clients = bool(config.get("use_mp_clients", True))
             self._clients_json = str(config.get("clients_json") or "")
             self._clients_lines = str(config.get("clients_lines") or "")
-            self._sites_json = str(config.get("sites_json") or "")
-            self._sites_lines = str(config.get("sites_lines") or "")
-            self._iyuu_json = str(config.get("iyuu_json") or "")
-            self._iyuu_json_file = str(config.get("iyuu_json_file") or "").strip()
             self._iyuu_token = str(config.get("iyuu_token") or "")
-            self._sites_mode = str(config.get("sites_mode") or "merge")
+            # 多选同样归一化成 str：老配置里的 id 可能是 int，选项 value 已是 str，
+            # 不转的话 VSelect 严格匹配不上，回显退化成数字 ID。去重保序。
+            self._mp_site_ids = []
+            for _sid in (config.get("mp_site_ids") or []):
+                _s = str(_sid).strip()
+                if _s and _s not in self._mp_site_ids:
+                    self._mp_site_ids.append(_s)
             self._add_label = str(config.get("add_label") or "").strip()
             self._target_client = str(config.get("target_client") or "").strip()
+            # MP 下载器多选：只存名字（MP-xxx），与手填 target_client 合并成最终目标集合
+            self._mp_target_clients = [str(x).strip() for x in (config.get("mp_target_clients") or []) if str(x).strip()]
             self._inherit_tags = bool(config.get("inherit_tags", True))
             self._extra_tags = str(config.get("extra_tags") or "").strip()
             self._fallback_skip_check = bool(config.get("fallback_skip_check", True))
             self._retry_failed = bool(config.get("retry_failed", True))
+            # 这两个上限以前只写回配置、没在 init 里读回来 —— 表单改了不生效（2026-11-23 修）。
+            try:
+                self._max_per_hour = max(0, int(config.get("max_per_hour", 0) or 0))
+                self._max_per_site = max(1, int(config.get("max_per_site", 20) or 20))
+            except Exception:
+                self._max_per_hour = 0
+                self._max_per_site = 20
             try:
                 self._limit_dl_kib = max(0, min(10 ** 7, int(config.get("limit_dl_kib", 0) or 0)))
                 self._limit_up_kib = max(0, min(10 ** 7, int(config.get("limit_up_kib", 0) or 0)))
@@ -1123,36 +1148,35 @@ class ColaCrossSeed(_PluginBase):
                 self._limit_dl_kib = 0
                 self._limit_up_kib = 0
             self._limit_lines = str(config.get("limit_lines") or "")
-        # IYUU 本地文件导入：填了容器内路径就以文件为准（粘进文本框的内容会被覆盖）。
-        # 放在所有字段赋值之后：_iyuu_import 内部会 _persist()。
-        if self._iyuu_json_file:
-            import os
-            try:
-                if os.path.isfile(self._iyuu_json_file):
-                    with open(self._iyuu_json_file, "r", encoding="utf-8", errors="replace") as handle:
-                        file_text = handle.read()
-                    if file_text.strip() and file_text.strip() != (self._iyuu_json or "").strip():
-                        result = self._iyuu_import(file_text)
-                        logger.info(f"IYUU 文件导入：{self._iyuu_json_file} → 可用 {result.get('usable')} 个站")
-                    else:
-                        logger.info(f"IYUU 文件与已存配置一致，跳过导入：{self._iyuu_json_file}")
-                else:
-                    logger.warn(f"IYUU 文件不存在：{self._iyuu_json_file}")
-            except Exception as err:
-                logger.warn(f"IYUU 文件导入失败：{type(err).__name__}: {err}")
         self._event.clear()
-        if self._enabled and self._crossseed_enabled:
-            # 保存后自动检测一次连通性（后台线程，不卡保存）；结果显示在插件页。
-            import threading
+        import threading
+        if onlyonce_requested:
+            # 和官方 iyuuautoseed 一样：勾一次只跑一轮，马上把开关写回关，
+            # 否则每次点保存都会再触发一次。
+            self._onlyonce = False
+            self._persist()
+            # 和官方 iyuuautoseed 一样：onlyonce 无视启用总开关（get_state() or _onlyonce），
+            # 关着总开关也能手动跑一轮。API Key 是唯一硬性前提——没有它脚本无权调用可乐开放 API。
+            if self._api_key:
+                logger.info("可乐PT辅种：立即运行一次已触发（无视启用开关），3 秒后开始")
+                threading.Thread(target=self._run_once, daemon=True).start()
+            else:
+                logger.warn("已勾「立即运行一次」，但没有 API Key，跳过本轮")
+        # 保存后自动检测一次连通性（后台线程，不卡保存）；结果显示在插件页。
+        # 连通性检测只是读状态、刷新报告，不是辅种动作，不该被总开关挡住——
+        # 否则用户关着总开关时，老版本的旧报告会永远留在页面上刷不掉。
+        if self._api_key:
             threading.Thread(target=self.run_tests, daemon=True).start()
 
     def _persist(self) -> None:
         self.update_config({
             "enabled": self._enabled,
             "crossseed_enabled": self._crossseed_enabled,
+            "onlyonce": self._onlyonce,
             "notify": self._notify,
             "cron": self._cron,
             "api_key": self._api_key,
+            "mp_site_id": self._mp_site_id,
             "skip_check": self._skip_check,
             "max_per_hour": self._max_per_hour,
             "max_per_site": self._max_per_site,
@@ -1160,14 +1184,11 @@ class ColaCrossSeed(_PluginBase):
             "use_mp_clients": self._use_mp_clients,
             "clients_json": self._clients_json,
             "clients_lines": self._clients_lines,
-            "sites_json": self._sites_json,
-            "sites_lines": self._sites_lines,
-            "iyuu_json": self._iyuu_json,
-            "iyuu_json_file": self._iyuu_json_file,
             "iyuu_token": self._iyuu_token,
-            "sites_mode": self._sites_mode,
+            "mp_site_ids": self._mp_site_ids,
             "add_label": self._add_label,
             "target_client": self._target_client,
+            "mp_target_clients": self._mp_target_clients,
             "inherit_tags": self._inherit_tags,
             "extra_tags": self._extra_tags,
             "fallback_skip_check": self._fallback_skip_check,
@@ -1177,6 +1198,45 @@ class ColaCrossSeed(_PluginBase):
             "limit_lines": self._limit_lines,
         })
 
+
+    # ---------------- MP 站点管理：读取已配置的 API Key ----------------
+
+    def _api_key_from_mp_site(self) -> str:
+        """从 MP 站点管理读取勾选站的 apikey（站点签发的 Key，MP 透明存的列）。
+
+        取法与 MP 主程序调用站点开放 API 一致：
+          1) SitesHelper().get_indexer(domain) 适配器配置里的 apikey；
+          2) 退回站点对象的 apikey 字段。
+        读不到返回空串，调用方回退到手填的 api_key —— 不伪造、不猜测。
+        """
+        if not self._mp_site_id:
+            return ""
+        try:
+            from app.db.site_oper import SiteOper
+            rows = SiteOper().list_order_by_pri() or []
+        except Exception as err:
+            logger.warn(f"读取 MoviePilot 站点失败：{err}")
+            return ""
+        site = None
+        for row in rows:
+            if str(getattr(row, "id", "")) == str(self._mp_site_id):
+                site = row
+                break
+        if site is None:
+            return ""
+        domain = str(getattr(site, "domain", "") or "").strip()
+        key = ""
+        if domain:
+            try:
+                from app.helper.sites import SitesHelper
+                indexer = SitesHelper().get_indexer(domain) or {}
+                if isinstance(indexer, dict):
+                    key = str(indexer.get("apikey") or "").strip()
+            except Exception:
+                pass
+        if not key:
+            key = str(getattr(site, "apikey", "") or "").strip()
+        return key
 
     # ---------------- 可乐PT 开放 API / 匹配 / 下载 ----------------
 
@@ -1216,8 +1276,8 @@ class ColaCrossSeed(_PluginBase):
             return None
         if rsp.status_code == 401:
             logger.warn(f"可乐PT {path}：API Key 无效、已撤销或已过期")
-            self._key_alert(f"API Key 无效、已撤销或已过期。请到 {COLA_KEY_PAGE} 新建一把勾「读取」「下载」的 Key，"
-                            f"填进插件设置「API Key」后保存。")
+            self._key_alert(f"API Key 无效、已撤销或已过期。若用「MP 站点管理」读取，请更新该站点的 API Key 后重新保存插件；"
+                            f"手填的话到 {COLA_KEY_PAGE} 新建一把勾「读取」「下载」的 Key 再填进插件设置。")
         elif rsp.status_code == 403 and self._error_code(rsp) == "api_key_scope_denied":
             logger.warn(f"可乐PT {path}：这把 API Key 缺少需要的范围")
             self._key_alert(f"这把 API Key 缺少需要的范围：辅种要「读取」（查哈希）和「下载」（取种子）两项。"
@@ -1637,337 +1697,159 @@ class ColaCrossSeed(_PluginBase):
             self._target_ambiguous = [c.name for c in fuzzy]
         return []
 
-    def _line_sites(self) -> List[Dict[str, str]]:
-        """每行一个站点。两种写法都支持，可以混用：
 
-        位置写法：`域名,passkey` / `名称,域名,passkey` / `名称,域名,passkey,rsskey`
-        键值写法：`名称,https://域名,passkey=xxx,sid=123,rsskey=yyy,uid=456`
+    # ---------------- MP 站点管理：辅种站点下拉与读取 ----------------
 
-        键值写法的意义：**走 IYUU 匹配必须有 sid**。IYUU 云端只按 sid 回结果，插件要能用
-        「sid → 站点」找到下载地址；sid 来自 IYUU 导出的站点 JSON（`"sid": 数字`）。
-        没有 sid 的站只能走 pieces-hash / RSS 两条通道。
+    @staticmethod
+    def _passkey_from_rss(rss: str) -> str:
+        """从站点 RSS 地址里抠 passkey（MP v2 的 Site 模型没有独立 passkey 列）。"""
+        match = re.search(r"[?&](?:passkey|pass_key)=([0-9A-Za-z]{16,64})", str(rss or ""))
+        return match.group(1) if match else ""
 
-        rsskey 是站点 RSS 密钥，给没有 pieces-hash 接口的站用（见 _rss_index）。
-        识别方式是「像域名的那个 token 是 URL」，剩下两个 32 位十六进制按顺序是 passkey、rsskey，
-        所以写 `观众,https://audiences.me,passkey=…,sid=…` 这种键值行也不会把名字当成域名。
+    def _mp_site_options(self) -> List[Dict[str, Any]]:
+        """get_form 的辅种站点下拉：title=站点名、value=站点 id（与 iyuuautoseed 官方一致）。"""
+        try:
+            from app.db.site_oper import SiteOper
+            rows = SiteOper().list_order_by_pri() or []
+        except Exception as err:
+            logger.warn(f"读取 MoviePilot 站点列表失败：{err}")
+            return []
+        options: List[Dict[str, Any]] = []
+        for site in rows:
+            # value 必须统一成 str：配置里 _mp_site_id/_mp_site_ids 都是 str（见 init_plugin），
+            # 而 SiteOper 的 site.id 是 int。VSelect 做严格类型匹配，int 的 value 配上 str 的
+            # 选中值会匹配不上，回显时就退化成直接显示原始数字（例如「61」）。
+            sid = str(getattr(site, "id", "") or "").strip()
+            name = str(getattr(site, "name", "") or getattr(site, "domain", "") or sid)
+            if not sid or not name:
+                continue
+            options.append({"title": name, "value": sid})
+        return options
+
+    def _iyuu_site_index(self) -> Dict[str, Dict[str, Any]]:
+        """用 Token 拉 IYUU 全站索引：{sid: {base_url, download_page, ...}}。
+
+        IYUU 命中自带 sid，这里按 sid 反查站点地址与下载模板；MP 站点下拉不参与 sid 推导。
+        没有 Token / 请求失败就返回空，不影响 pieces-hash / RSS 两条本地通道。
         """
-        out: List[Dict[str, str]] = []
-        url_re = re.compile(r"^(https?://)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/.*)?$")
-        hex32 = re.compile(r"^[0-9a-fA-F]{32}$")
-        for line in (self._sites_lines or "").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
+        if not self._iyuu_token:
+            return {}
+        cached = self.get_data("iyuu_site_index") or {}
+        stamp = int(cached.get("at") or 0)
+        if cached.get("sites") and time.time() - stamp < 24 * 3600:
+            # 持久化层可能把 int key 变成 str；命中查询一律按 int sid 取，这里统一归一化。
+            sites: Dict[int, Dict[str, Any]] = {}
+            for key, value in (cached.get("sites") or {}).items():
+                sid = _as_int(key)
+                if sid:
+                    sites[sid] = value
+            return sites
+        try:
+            rsp = requests.get(f"{self.IYUU_API}/reseed/sites/index",
+                               headers=self._iyuu_headers(), timeout=30)
+            body = rsp.json() if rsp.status_code == 200 else {}
+        except Exception as err:
+            logger.warn(f"IYUU 站点索引读取失败：{err}")
+            return {}
+        if str(body.get("code")) not in ("0", "None") and body.get("code") not in (0, None):
+            logger.warn(f"IYUU 站点索引返回：{body.get('msg')}")
+            return {}
+        sites = {}
+        for site in ((body.get("data") or {}).get("sites") or []):
+            if not isinstance(site, dict):
                 continue
-            parts = self._split_line(line)
-            if len(parts) < 1:
-                continue
-            keyed: Dict[str, str] = {}
-            positional: List[str] = []
-            for token in parts:
-                if "=" in token:
-                    key, _, value = token.partition("=")
-                    keyed[key.strip().lower()] = value.strip()
-                else:
-                    positional.append(token)
-            url, name = "", ""
-            for i, token in enumerate(positional):
-                if url_re.match(token):
-                    url = token
-                    name = positional[i - 1] if i > 0 else ""
-                    rest = positional[i + 1:]
-                    break
-            else:
-                # 没有像域名的 token：按老规矩把第一个当域名，交给 _normalise_url 兜底
-                url = positional[0] if positional else ""
-                name = ""
-                rest = positional[1:]
-            passkey = keyed.get("passkey", "")
-            rsskey = keyed.get("rsskey", "") or keyed.get("rss", "")
-            for token in rest:
-                if not hex32.match(token):
-                    continue
-                if not passkey:
-                    passkey = token
-                elif not rsskey:
-                    rsskey = token
-            sid = 0
-            for raw_sid in (keyed.get("sid"), keyed.get("iyuu_sid")):
-                if raw_sid and str(raw_sid).strip().isdigit():
-                    sid = int(str(raw_sid).strip())
-                    break
-            uid = int(keyed["uid"]) if keyed.get("uid", "").strip().isdigit() else 0
-            channel = (keyed.get("channel") or "auto").strip().lower()
-            if channel not in ("auto", "pieces", "rss", "iyuu"):
-                channel = "auto"
-            enabled = (keyed.get("enabled", "1").strip().lower() not in ("0", "false", "no", "off"))
-            proxy = (keyed.get("proxy") or "").strip()
-            cookie = (keyed.get("cookie") or "").strip()
-            rss_url = (keyed.get("rss_url") or "").strip()
-            downhash = (keyed.get("downhash") or keyed.get("hash") or "").strip()
-            url = self._normalise_url(url, "https")
-            if not url or not passkey:
-                logger.warn(f"站点配置行缺少域名或 passkey：{line}")
-                continue
-            host = url.split("://", 1)[-1].split("/")[0].lower()
-            if host in SITE_SKIP:
-                continue
-            if host in SITE_REMAP:
-                url = SITE_REMAP[host]
-            out.append({
-                "name": name or url.split("://", 1)[-1].split("/")[0],
-                "url": url.rstrip("/") + "/",
-                "passkey": passkey,
-                "rsskey": rsskey,
-                "sid": sid,
-                "uid": uid,
-                "download_page": keyed.get("download_page", ""),
-                "x_api_key": keyed.get("x_api_key", ""),
-                "channel": channel,
-                "enabled": enabled,
-                "proxy": proxy,
-                "cookie": cookie,
-                "rss_url": rss_url,
-                "rss_interval": (keyed.get("rss_interval") or "").strip(),
-                "downhash": downhash,
-            })
-        return out
+            sid = _as_int(site.get("id"))
+            if sid:
+                sites[sid] = site
+        if sites:
+            self.save_data("iyuu_site_index", {"at": int(time.time()), "sites": sites})
+        return sites
 
-    def _iyuu_sites(self) -> List[Dict[str, str]]:
-        """直接导入 IYUU 导出的站点 JSON：只取启用且有 passkey 的站点。"""
-        raw = (self._iyuu_json or "").strip()
-        if not raw:
+    def _mp_sites(self) -> List[Dict[str, str]]:
+        """从 MP 站点管理读取勾选的站点，转成插件统一的站点字典。
+
+        passkey：SitesHelper().get_indexer(domain) 的适配器配置优先，退回 site.rss 的 ?passkey=；
+        它只影响 pieces-hash / RSS 这两条本地通道 —— IYUU 路线靠站点 Cookie/apikey 也能下种，
+        所以这里不再因为没有 passkey 就把站点丢掉（家园这类站就是例子）。
+        sid / download_page：IYUU 站点索引按域名补一份，只作兜底；
+        IYUU 命中结果自带 sid，真正下载时会按命中的 sid 重新取 download_page。
+        """
+        selected = {str(x) for x in (self._mp_site_ids or [])}
+        if not selected:
             return []
         try:
-            data = json.loads(raw)
+            from app.db.site_oper import SiteOper
+            rows = SiteOper().list_order_by_pri() or []
         except Exception as err:
-            logger.warn(f"IYUU 站点 JSON 解析失败：{err}")
+            logger.warn(f"读取 MoviePilot 站点失败：{err}")
             return []
-        if isinstance(data, dict):
-            data = data.get("sites") or list(data.values())
-        if not isinstance(data, list):
-            return []
+        helper = None
+        try:
+            from app.helper.sites import SitesHelper
+            helper = SitesHelper()
+        except Exception:
+            pass
+        iyuu_index = self._iyuu_site_index()
+        by_host_index: Dict[str, Dict[str, Any]] = {}
+        for info in iyuu_index.values():
+            base = str(info.get("base_url") or "").split("://", 1)[-1].strip("/").lower()
+            if base:
+                by_host_index[base] = info
         out: List[Dict[str, str]] = []
-        for item in data:
-            if not isinstance(item, dict) or _disabled(item):
+        for site in rows:
+            if str(getattr(site, "id", "")) not in selected:
                 continue
-            options = item.get("options") or {}
-            if isinstance(options, str):
-                try:
-                    options = json.loads(options)
-                except Exception:
-                    options = {}
-            if not isinstance(options, dict):
-                options = {}
-            passkey = str(options.get("passkey") or item.get("passkey") or "").strip()
-            if not passkey:
+            domain = str(getattr(site, "domain", "") or "").strip()
+            if not domain:
                 continue
-            base = (item.get("mirror") or item.get("base_url") or "").strip()
-            if not base:
-                continue
-            scheme = "http" if str(item.get("is_https")) == "0" else "https"
-            url = self._normalise_url(base, scheme)
-            if not url:
-                continue
+            url = self._normalise_url(domain, "https")
             host = url.split("://", 1)[-1].split("/")[0].lower()
             if host in SITE_SKIP:
-                logger.info(f"IYUU 导入跳过已关闭站点：{host}")
                 continue
             if host in SITE_REMAP:
                 url = SITE_REMAP[host]
-            # IYUU 的凭据不只有 passkey：下载模板里的 {uid}、家园的 downhash、
-            # cookie_required 站的 Cookie 都在这几个字段里。少一个就会「导入成功但辅种全失败」，
-            # 所以这里一次全带走（见 _site_download 的模板占位符）。
-            # IYUU 每站还带这些「导入后就能直接跑」的参数：
-            #   limit.count     → 本站每轮上限（IYUU 页面的「辅种数量」）
-            #   rss_url         → 站点自己的 RSS 直链（馒头这类带签名，插件可直接用）
-            #   curl_opt_proxy(_auth) → 本站代理
-            #   url_join.https  → 强制 https 还是 http
-            limit = options.get("limit") if isinstance(options.get("limit"), dict) else {}
-            join = options.get("url_join") if isinstance(options.get("url_join"), dict) else {}
-            proxy = _site_proxy(options.get("curl_opt_proxy"), options.get("curl_opt_proxy_auth"))
-            try:
-                per_site = int(str(limit.get("count") or 0).strip() or 0)
-            except Exception:
-                per_site = 0
+            indexer: Dict[str, Any] = {}
+            if helper is not None:
+                try:
+                    indexer = helper.get_indexer(domain) or {}
+                except Exception:
+                    indexer = {}
+            if not isinstance(indexer, dict):
+                indexer = {}
+            rss = str(indexer.get("rss") or getattr(site, "rss", "") or "")
+            passkey = str(indexer.get("passkey") or "").strip() or self._passkey_from_rss(rss)
+            # 没有 passkey 也保留：IYUU 路线可以用 Cookie/apikey 下载，
+            # pieces-hash / RSS 通道自己会检查凭据。
+            idx = by_host_index.get(host) or {}
+            proxy = indexer.get("proxy")
             out.append({
-                "name": item.get("nickname") or item.get("site") or url,
+                "mp_site_id": str(getattr(site, "id", "")),
+                "name": str(getattr(site, "name", "") or domain),
                 "url": url.rstrip("/") + "/",
                 "passkey": passkey,
-                "max_per_site": per_site,
-                "interval": _as_float(limit.get("sleep")),
-                "rss_url": str(options.get("rss_url") or ""),
-                "proxy": proxy,
-                "rsskey": str(options.get("rsskey") or ""),
-                "sid": _as_int(item.get("sid")),
-                "uid": _as_int(options.get("uid")),
-                "downhash": str(options.get("downhash") or ""),
-                "cookie": str(item.get("cookie") or options.get("cookie") or ""),
+                "rsskey": str(indexer.get("rsskey") or ""),
+                "sid": _as_int(idx.get("id")),
+                "uid": _as_int(indexer.get("uid")),
+                "download_page": str(idx.get("download_page") or ""),
+                "x_api_key": str(indexer.get("apikey") or getattr(site, "apikey", "") or ""),
                 "channel": "auto",
                 "enabled": True,
-                "download_page": item.get("download_page") or "",
-                "x_api_key": str(options.get("x_api_key") or item.get("x_api_key") or ""),
+                "proxy": "" if proxy is True or proxy is False or proxy is None else str(proxy),
+                "cookie": str(indexer.get("cookie") or getattr(site, "cookie", "") or ""),
+                "rss_url": rss,
+                "rss_interval": "",
+                "downhash": "",
             })
-        if out:
-            logger.info(f"IYUU 导入 {len(out)} 个启用站点（含 passkey/uid/downhash/cookie）")
         return out
-
-    def iyuu_import(self, **kwargs) -> Dict[str, Any]:
-        """一键导入 IYUU 导出的站点 JSON（MP 插件 API：POST /ColaCrossSeed/sites/import）。
-
-        参数可以放在 `json` / `payload` / `sites` 任一键里，值是 IYUU 导出的**原始文本**
-        （数组或 {"sites":[...]}），也可以直接传对象。不传参数就重跑一次配置里已存的内容。
-        导入后立刻返回解析摘要；原本「只用手写行」的用户会被改成「IYUU + 手写行补充」，
-        手写的行不会被丢掉。
-        """
-        payload = kwargs.get("json") or kwargs.get("payload") or kwargs.get("sites") or ""
-        return self._iyuu_import(payload)
-
-    def _iyuu_import(self, payload: Any) -> Dict[str, Any]:
-        raw = payload
-        if isinstance(raw, (dict, list)):
-            raw = json.dumps(raw, ensure_ascii=False)
-        raw = str(raw or "").strip()
-        if not raw:
-            raw = (self._iyuu_json or "").strip()
-        out: Dict[str, Any] = {"ok": False, "total": 0, "enabled": 0, "usable": 0,
-                               "skipped": [], "reason": ""}
-        if not raw:
-            out["reason"] = "没有可导入的内容：把 IYUU 导出的 JSON 整个粘进来"
-            return out
-        try:
-            data = json.loads(raw)
-        except Exception as err:
-            out["reason"] = f"JSON 解析失败：{err}"
-            return out
-        if isinstance(data, dict):
-            data = data.get("sites") or list(data.values())
-        if not isinstance(data, list):
-            out["reason"] = "JSON 顶层必须是数组（IYUU 导出的站点列表）"
-            return out
-        out["total"] = len(data)
-        previous = self._iyuu_json
-        try:
-            self._iyuu_json = raw
-            parsed = self._iyuu_sites()
-        finally:
-            self._iyuu_json = previous
-        out["usable"] = len(parsed)
-        if not parsed:
-            # 一个字都解析不出来就别覆盖：粘错一次不该把上一份好的配置弄丢
-            out["reason"] = "这份 JSON 里没有可用站点（缺 passkey 或域名），已保留原配置不变"
-            return out
-        for item in data:
-            if isinstance(item, dict) and not item.get("disabled"):
-                out["enabled"] += 1
-        imported_hosts = {x["url"].split("://", 1)[-1].split("/")[0].lower() for x in parsed}
-        for item in data:
-            if not isinstance(item, dict) or item.get("disabled"):
-                continue
-            raw_host = str(item.get("base_url") or item.get("mirror") or "").strip()
-            host = self._normalise_url(raw_host, "https") if raw_host else ""
-            host = host.split("://", 1)[-1].split("/")[0].lower() if host else ""
-            if not host:
-                continue
-            mapped = SITE_REMAP.get(host, "")
-            candidates = {host}
-            if mapped:
-                candidates.add(mapped.split("://", 1)[-1].split("/")[0].lower())
-            if not (candidates & imported_hosts):
-                out["skipped"].append(host)
-        self._iyuu_json = raw
-        # 默认切 merge：IYUU 的站全部生效，手写的行继续作为补充（行优先）。
-        # 想彻底只认 IYUU，把「站点来源」改成「只用 IYUU 导入」即可。
-        if (self._sites_mode or "") == "manual":
-            self._sites_mode = "merge"
-        self._persist()
-        out["ok"] = out["usable"] > 0
-        if not out["ok"]:
-            out["reason"] = "启用的站点里没有可用的（缺 passkey 或域名）"
-        logger.info(f"IYUU 一键导入：总计 {out['total']} 条，启用 {out['enabled']}，可用 {out['usable']}")
-        return out
-
-    IYUU_FILE_MAX_BYTES = 5 * 1024 * 1024
-
-    def iyuu_import_file(self, **kwargs) -> Dict[str, Any]:
-        """从**本地文件**导入 IYUU 配置（MP 插件 API：POST /ColaCrossSeed/sites/import-file）。
-
-        插件跑在容器里，路径是容器内路径；默认读 `/config/cola-sites.json`，
-        也就是宿主的 `<MP 配置目录>/cola-sites.json` —— 把文件丢进去、保存配置即生效。
-        """
-        path = str(kwargs.get("path") or self._iyuu_json_file or "/config/cola-sites.json").strip()
-        return self._iyuu_import_from_file(path)
-
-    def _iyuu_import_from_file(self, path: str) -> Dict[str, Any]:
-        import os
-        out: Dict[str, Any] = {"ok": False, "total": 0, "enabled": 0, "usable": 0,
-                               "skipped": [], "reason": "", "source_file": path}
-        if not path:
-            out["reason"] = "没有给文件路径"
-            return out
-        if not os.path.isfile(path):
-            out["reason"] = f"文件不存在：{path}（容器内路径；宿主放 <MP配置目录>/cola-sites.json）"
-            return out
-        try:
-            if os.path.getsize(path) > self.IYUU_FILE_MAX_BYTES:
-                out["reason"] = f"文件太大（上限 {self.IYUU_FILE_MAX_BYTES // 1024 // 1024} MB）"
-                return out
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                text = handle.read()
-        except Exception as err:
-            out["reason"] = f"读文件失败：{err}"
-            return out
-        result = self._iyuu_import(text)
-        result["source_file"] = path
-        result["source"] = "file"
-        return result
 
     def _other_sites(self) -> List[Dict[str, str]]:
-        """行文本为准，IYUU 导入补充（sites_mode=manual 时完全不看导入）。
+        """站点来源：只从 MP 站点管理读取勾选的站点（凭据每次现读）。
 
-        每个站点在自己的那一行里单独配置：域名、passkey、sid、rsskey、channel、enabled。
-        IYUU 导入只用来补齐「你没写但 IYUU 认识」的站；同一个域名以行文本为准。
+        早期支持 IYUU JSON 导入与手写行，现已移除——MP 站点管理是唯一来源。
+        是否要求 passkey 由各条下载通道自己判断；IYUU 路线有 Cookie/apikey 就够。
         """
-        mode = self._sites_mode or "merge"
-        line_sites = [] if mode == "iyuu_only" else self._line_sites()
-        iyuu_sites = [] if mode == "manual" else self._iyuu_sites()
-        # 行文本优先；同一个域名下，行里没写的 passkey / sid / rsskey 从 IYUU 导入里补齐 ——
-        # 这样「观众只写 passkey + rsskey」也能顺带拿到 IYUU 的 sid，两套通道同时可用。
-        by_host: Dict[str, Dict[str, str]] = {}
-        order: List[str] = []
-        for site in line_sites + iyuu_sites:
-            host = site["url"].split("://", 1)[-1].split("/")[0].lower()
-            if not host:
-                continue
-            existing = by_host.get(host)
-            if existing is None:
-                by_host[host] = dict(site)
-                order.append(host)
-                continue
-            for field in ("passkey", "sid", "rsskey", "uid", "downhash", "cookie",
-                          "download_page", "x_api_key", "rss_url", "proxy",
-                          "max_per_site", "interval"):
-                if not existing.get(field) and site.get(field):
-                    existing[field] = site[field]
-        sites: List[Dict[str, str]] = []
-        for host in order:
-            site = by_host[host]
-            if site.get("enabled") is False:
-                continue
-            if not site.get("passkey"):
-                logger.warn(f"站点 {host} 没有 passkey，已跳过")
-                continue
-            # IYUU 的「辅种数量」是每站上限：记下来给 _site_budget_left 用
-            try:
-                per_site = int(site.get("max_per_site") or 0)
-            except Exception:
-                per_site = 0
-            if 0 < per_site <= 200:
-                self._site_limits[site.get("url") or host] = per_site
-            gap = _as_float(site.get("interval"))
-            if gap:
-                self._site_intervals[site.get("url") or host] = min(gap, 30.0)
-            sites.append(site)
-        return sites
+        return self._mp_sites()
+
 
     # ---------------- 下载器 ----------------
 
@@ -2006,39 +1888,71 @@ class ColaCrossSeed(_PluginBase):
         # 里就已经把客户端列表收窄成一台，这里的自动判断天然只在那台里挑。
         return preferred
 
-    def _apply_target_client(self, clients: List["_Client"]) -> List["_Client"]:
-        """把「辅种加到哪台」落实到客户端列表上。
+    def _target_wants(self) -> List[str]:
+        """最终目标名单 = MP 下拉多选 + 手填，逐个规范化、去重、保序。
 
-        语义是**只要这一台**：留空才自动（谁在做种归谁）。以前这里只是给
+        两者是并集：多选来自 MP「设置 → 下载器」的实例名（MP-xxx），手填可补
+        自定义下载器（clients_lines 里的名字）。都留空才表示「自动」。
+        """
+        wants: List[str] = []
+        for raw in list(self._mp_target_clients or []) + [(self._target_client or "")]:
+            name = self._normalise_target(raw)
+            if name and name not in wants:
+                wants.append(name)
+        return wants
+
+    def _resolve_targets(self, clients: List["_Client"]) -> Tuple[List["_Client"], List[str], List[str]]:
+        """把最终目标名单解析成实际客户端，返回 (匹配到的, 问题描述, 歧义名字)。
+
+        每个目标单独走 `_resolve_target_clients`（保持原有的精确→别名→唯一包含
+        与歧义检测），再按名字并集；任何一个目标歧义/找不到都记下来，交给调用方
+        「本轮不加」—— 绝不把种子推到没被点名的机器上。
+        """
+        matched: Dict[str, "_Client"] = {}
+        problems: List[str] = []
+        ambiguous: List[str] = []
+        for name in self._target_wants():
+            got = self._resolve_target_clients(name, clients)
+            if getattr(self, "_target_ambiguous", None):
+                ambiguous.extend(self._target_ambiguous)
+                problems.append(f"`{name}` 同时匹配到多台：{', '.join(self._target_ambiguous)}")
+            elif not got:
+                problems.append(f"`{name}` 没匹配到任何下载器")
+            else:
+                for client in got:
+                    matched.setdefault(client.name, client)
+        return list(matched.values()), problems, ambiguous
+
+    def _apply_target_client(self, clients: List["_Client"]) -> List["_Client"]:
+        """把「辅种加到哪台」落实到客户端列表上（支持 MP 多选 + 手填）。
+
+        语义是**只要点名的那几台**：留空才自动（谁在做种归谁）。以前这里只是给
         `preferred` 打补丁 —— 目标机器上没有的种子照样会被加到别的机器上，
         所以用户看到「指定了但还是往 qB 推」。名字也更宽松：`tr` 能匹配
         `MP-tr辅种`、`tr辅种`（MP 枚举出来的实例带 `MP-` 前缀）。
         解析不出来就本轮不加，绝不把种子推到没被点名的机器上。
         """
-        wanted = (self._target_client or "").strip()
-        if not wanted:
+        wants = self._target_wants()
+        if not wants:
             self._target_state = {}
             return clients
-        matched = self._resolve_target_clients(wanted, clients)
+        matched, problems, ambiguous = self._resolve_targets(clients)
         available = [c.name for c in clients]
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if not matched and getattr(self, "_target_ambiguous", None):
-            self._target_state = {"wanted": wanted, "resolved": [], "available": available,
-                                  "ambiguous": list(self._target_ambiguous), "ok": False, "at": stamp}
-            logger.error(f"辅种目标 `{wanted}` 同时匹配到多台下载器："
-                         f"{', '.join(self._target_ambiguous)}。请写全名；如果名字本来就一样，"
-                         f"先去 MoviePilot 设置里给这两台改不同的名字。本轮不向任何下载器加种")
-            return []
-        if not matched:
-            self._target_state = {"wanted": wanted, "resolved": [], "available": available,
+        wanted_text = " + ".join(wants)
+        if problems:
+            self._target_state = {"wanted": wanted_text, "resolved": [c.name for c in matched],
+                                  "available": available, "problems": problems, "ambiguous": ambiguous,
                                   "ok": False, "at": stamp}
-            logger.error(f"辅种目标下载器 `{wanted}` 不存在；当前可用的有："
+            logger.error(f"辅种目标无法解析：{'; '.join(problems)}；当前可用："
                          f"{', '.join(available) or '（无）'}。本轮不向任何下载器加种")
+            if matched:
+                logger.error("（其中已解析到的目标也会一并停用，避免把种子推到没点名的机器上）")
             return []
-        self._target_state = {"wanted": wanted, "resolved": [c.name for c in matched],
+        self._target_state = {"wanted": wanted_text, "resolved": [c.name for c in matched],
                               "available": available, "ok": True, "at": stamp}
-        if [c.name for c in matched] != [wanted]:
-            logger.info(f"辅种目标 `{wanted}` → {', '.join(c.name for c in matched)}")
+        if [c.name for c in matched] != wants:
+            logger.info(f"辅种目标 `{wanted_text}` → {', '.join(c.name for c in matched)}")
         return matched
 
     def _mp_clients(self) -> List[_Client]:
@@ -2070,6 +1984,21 @@ class ColaCrossSeed(_PluginBase):
                                  getattr(instance, "get_torrents", None)))
             logger.info(f"MoviePilot 下载器已接入：{label}（{getattr(info, 'type', '?')}）")
         return out
+
+    def _mp_downloader_options(self) -> List[Dict[str, str]]:
+        """get_form 的下载器多选下拉：title=实例名+类型、value=MP-xxx（与 _mp_clients 的 label 一致）。"""
+        options: List[Dict[str, str]] = []
+        try:
+            from app.application.downloader import DownloaderHelper
+            services = DownloaderHelper().get_services() or {}
+        except Exception as err:
+            logger.warn(f"读取 MoviePilot 下载器列表失败：{err}")
+            return options
+        for name, info in services.items():
+            label = f"MP-{name}"
+            typ = str(getattr(info, "type", "") or "")
+            options.append({"title": f"{label}（{typ}）" if typ else label, "value": label})
+        return options
 
     def _clients(self, use_mp: Optional[bool] = None, lines: Optional[str] = None) -> List[_Client]:
         """列出下载器。`use_mp` / `lines` 可覆盖实例配置——保种组有自己的一套客户端设置。"""
@@ -2468,8 +2397,56 @@ class ColaCrossSeed(_PluginBase):
     IYUU_API = "http://2025.iyuu.cn"
     IYUU_CHUNK = 100
 
-    def _iyuu_sid_map(self) -> Dict[int, Dict[str, str]]:
-        return {int(s["sid"]): s for s in self._other_sites() if s.get("sid")}
+    @staticmethod
+    def _host_from_url(url: str) -> str:
+        return (str(url or "").split("://", 1)[-1].split("/")[0]
+                .split(":")[0].strip().lower())
+
+    def _iyuu_sid_map(self) -> Dict[int, Dict[str, Any]]:
+        """IYUU 路线要汇报的是 IYUU 全站 sid，不是从 MP 站点里凑出来的 sid。
+
+        和官方 iyuuautoseed 一样：Token 有效时先拉 /reseed/sites/index 拿全部支持站点，
+        把这些 sid 全报给 /reseed/sites/reportExisting；MP 站点下拉只用来过滤命中结果，
+        不参与“这个站有没有 sid”的判断。家园这类站因此不用在插件里手写任何站点信息。
+        """
+        out: Dict[int, Dict[str, Any]] = {}
+        for key, info in self._iyuu_site_index().items():
+            sid = int(key)
+            out[sid] = {
+                "sid": sid,
+                "name": str(info.get("name") or info.get("base_url") or sid),
+                "url": str(info.get("base_url") or ""),
+                "download_page": str(info.get("download_page") or ""),
+            }
+        return out
+
+    def _iyuu_site_for_entry(self, entry: Dict[str, Any],
+                             sites: List[Dict[str, str]]) -> Tuple[Optional[Dict[str, str]], str]:
+        """把 IYUU 命中里的 sid 反查成 MP 站点配置（官方做法）。
+
+        IYUU 返回的 seed 自带 sid 和 torrent_id；sid 对应的站点地址/下载模板来自 IYUU 站点索引，
+        Cookie/passkey/apikey 来自 MP 站点管理。这里只做两件事：用 base_url 的域名找到 MP 站点，
+        再确认它在③里被勾选。找不到时返回原因，不再让用户“补 sid=数字”。
+        """
+        sid = int(entry.get("sid") or 0)
+        idx = self._iyuu_site_index().get(sid) or {}
+        host = self._host_from_url(idx.get("base_url"))
+        if host.startswith("www."):
+            host = host[4:]
+        if not host:
+            return None, "IYUU 站点索引里没有这个 sid 的地址"
+        for site in sites or []:
+            site_host = self._host_from_url(site.get("url"))
+            if site_host.startswith("www."):
+                site_host = site_host[4:]
+            if site_host != host:
+                continue
+            merged = dict(site)
+            merged["sid"] = sid
+            if idx.get("download_page"):
+                merged["download_page"] = str(idx["download_page"])
+            return merged, ""
+        return None, "MP 站点管理里没有勾选这个站（或域名对不上）"
 
     def _iyuu_headers(self) -> Dict[str, str]:
         return {"token": self._iyuu_token, "User-Agent": "MoviePilot-ColaCrossSeed/0.4"}
@@ -2917,11 +2894,11 @@ class ColaCrossSeed(_PluginBase):
     def _test_clients(self) -> List[str]:
         lines: List[str] = []
         clients = self._clients()
-        wanted = (self._target_client or "").strip()
-        target_names = ({c.name for c in self._resolve_target_clients(wanted, clients)}
-                        if wanted and clients else set())
+        wants = self._target_wants()
+        target_names, problems, _ = self._resolve_targets(clients) if (wants and clients) else ([], [], [])
+        target_set = {c.name for c in target_names}
         for client in clients:
-            mark = " ← 辅种目标" if client.name in target_names else ""
+            mark = " ← 辅种目标" if client.name in target_set else ""
             torrents = client.list_completed()
             if torrents:
                 lines.append(f"✅ {client.name}：连接成功，已完成 {len(torrents)} 个种子{mark}")
@@ -2930,13 +2907,8 @@ class ColaCrossSeed(_PluginBase):
                 lines.append(f"⚠️ {client.name}：连接成功，但没有已完成种子（或读取失败）{mark}")
         if not lines:
             lines.append("❌ 没有可用下载器：检查「下载器」每行格式与地址")
-        if wanted and not target_names:
-            ambiguous = list(getattr(self, "_target_ambiguous", []) or [])
-            if ambiguous:
-                lines.append(f"❌ 辅种目标 `{wanted}` 同时匹配到多台：{', '.join(ambiguous)}；请写全名")
-            else:
-                lines.append(f"❌ 辅种目标 `{wanted}` 没匹配到任何下载器；"
-                             f"可用：{', '.join(c.name for c in clients) or '（无）'}")
+        for problem in problems:
+            lines.append(f"❌ 辅种目标{problem}；可用：{', '.join(c.name for c in clients) or '（无）'}")
         return lines
 
     def _probe_pieces(self, site: Dict[str, str]) -> Tuple[bool, str]:
@@ -3050,7 +3022,7 @@ class ColaCrossSeed(_PluginBase):
     def _test_sites(self) -> List[str]:
         sites = self._other_sites()
         if not sites:
-            return ["ℹ️ 没有配置其他站（可粘贴 IYUU 配置或填「域名,passkey」）"]
+            return ["ℹ️ 没有勾选其他站（在③区「MP 已配置站点」里多选即可）"]
         lines: List[str] = []
         # 以前用线程池并发探测；现在一律顺序跑 —— 见 auto_seed 里 RSS 索引那段的说明：
         # 在解释器层面，多线程里做网络/第三方 C 扩展会放大崩溃面，宁可慢一点。
@@ -3088,10 +3060,11 @@ class ColaCrossSeed(_PluginBase):
 
     def _test_iyuu(self) -> str:
         if not self._iyuu_token:
-            return "ℹ️ IYUU Token：未配置（可选；配置后用 IYUU 云端匹配，能覆盖没有 pieces-hash 的站）"
+            return ("ℹ️ IYUU Token：未配置（可选——不填也能补可乐、也能用 pieces-hash/RSS 补其他站；"
+                    "填了额外走 IYUU 云端，命中站点和下载模板由 IYUU 返回，MP 站点下拉只管范围和凭据）")
         sid_map = self._iyuu_sid_map()
         if not sid_map:
-            return "❌ IYUU Token：已填，但导入的站点没有 sid（请粘贴 IYUU 站点 JSON）"
+            return "⚠️ IYUU Token：已填，但读不到 IYUU 站点索引（检查 Token / 网络）"
         sid_sha1 = self._iyuu_sid_sha1(sorted(sid_map))
         if sid_sha1:
             return f"✅ IYUU Token：有效（{len(sid_map)} 个站点已汇报）"
@@ -3099,8 +3072,14 @@ class ColaCrossSeed(_PluginBase):
             return "⚠️ IYUU Token：已填，但云端限流（访问频率过快），稍后再试"
         return "❌ IYUU Token：无效或云端拒绝（检查 token）"
 
+    # 报告格式版本：老版本写下的 test_report 没有这个字段，里面全是已废弃的
+    # 「粘贴 IYUU 站点 JSON」「域名,passkey」文案。get_page 读到版本不符的就丢弃，
+    # 免得升级后还一直显示几个月前的旧检测结论。
+    _TEST_REPORT_SCHEMA = 2
+
     def run_tests(self, persist: bool = True) -> Dict[str, Any]:
         report = {
+            "schema": self._TEST_REPORT_SCHEMA,
             "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "cola": self._test_cola(),
             "iyuu": self._test_iyuu(),
@@ -3116,10 +3095,17 @@ class ColaCrossSeed(_PluginBase):
 
     # ---------------- 任务 ----------------
 
-    def auto_seed(self):
+    def _run_once(self) -> None:
+        """「立即运行一次」：等保存流程结束再跑一轮，避免和配置保存抢资源。"""
+        time.sleep(3)
+        # force=True：对齐官方 iyuuautoseed 的 get_state() or _onlyonce，
+        # 手动触发无条件跑一轮，不受启用总开关/辅种开关限制。
+        self.auto_seed(force=True)
+
+    def auto_seed(self, force: bool = False):
         """辅种主流程：任何未预料的异常都只记日志 + 站内通知，不要让 MoviePilot 报「执行失败」。"""
         try:
-            self._auto_seed()
+            self._auto_seed(force=force)
         except Exception as err:
             logger.error(f"辅种任务异常终止：{type(err).__name__}: {err}")
             try:
@@ -3129,11 +3115,13 @@ class ColaCrossSeed(_PluginBase):
             except Exception:
                 pass
 
-    def _auto_seed(self):
+    def _auto_seed(self, force: bool = False):
         # 事件是类级 Event：reload/停止会把上一实例的 set 带过来，这里先清掉，
         # 否则本次任务会在第一个 torrent 就 break（表现为 matched=0、耗时 1 秒）。
         self._event.clear()
-        if not (self._enabled and self._crossseed_enabled):
+        # force=「立即运行一次」：无视总开关照跑（官方也是 enabled or onlyonce）。
+        # 定时/周期任务 force=False，仍受开关控制。
+        if not force and not (self._enabled and self._crossseed_enabled):
             return
         if not self._api_key:
             logger.warn("可乐PT 未填 API Key，跳过本次辅种")
@@ -3175,16 +3163,11 @@ class ColaCrossSeed(_PluginBase):
         sites = []
         if self._direction in ("both", "other_only"):
             sites = self._other_sites()
-            if not sites:
-                try:
-                    sites = [s for s in json.loads(self._sites_json or "[]") if s.get("url") and s.get("passkey")]
-                except Exception:
-                    sites = []
         if sites:
             logger.info(f"其他站 {len(sites)} 个：{', '.join(s['name'] for s in sites[:6])}{'...' if len(sites) > 6 else ''}")
         stats = {"matched": 0, "added": 0, "filled": 0, "skipped": 0, "failed": 0,
                  "duplicate": 0, "retried": 0, "already": 0, "trackers": 0}
-        unknown_sids: set = set()
+        unmatched_iyuu_sids: Dict[int, str] = {}
         by_site: Dict[str, Dict[str, int]] = {}
         self._site_counter = {}   # 每轮重置：单站上限按轮算
         self._site_limits = {}    # 每轮重置：站点自己声明的上限（IYUU limit.count）
@@ -3227,7 +3210,7 @@ class ColaCrossSeed(_PluginBase):
         if len(scanned) > 1:
             logger.info(f"下载器 {len(scanned)} 个；同一颗种子跨客户端的归属已按「谁在做种」决定")
         # IYUU 云端匹配（有 token 时）：把客户端 hash 发过去，拿回「站点 + torrent_id」。
-        sid_map: Dict[int, Dict[str, str]] = {}
+        sid_map: Dict[int, Dict[str, Any]] = {}
         iyuu_hits: Dict[str, List[Dict[str, Any]]] = {}
         if self._iyuu_token and self._direction in ("both", "other_only"):
             sid_map = self._iyuu_sid_map()
@@ -3360,15 +3343,14 @@ class ColaCrossSeed(_PluginBase):
                         logger.info(f"IYUU 待处理 hash={torrent['hash'][:8]} 条目 {len(entries)}")
                     for entry in entries:
                         sid = int(entry.get("sid") or 0)
-                        site = sid_map.get(sid)
+                        site, why = self._iyuu_site_for_entry(entry, sites)
                         # 注意：channel 只决定 pieces-hash / RSS 这两条「探测型」通道走不走，
-                        # 不挡 IYUU。IYUU 是云端内容级匹配，只要站里有 sid 就能用；以前这里按
-                        # channel 过滤，13 个 channel=rss 的站等于把唯一能用的通道也关了。
+                        # 不挡 IYUU。IYUU 是云端内容级匹配，站点和 torrent_id 都是它返回的；
+                        # MP 站点下拉只决定“补哪些站”和“用哪套凭据”，不再要求插件里预置 sid。
                         torrent_id = str(entry.get("torrent_id") or "")
                         if not site:
-                            # IYUU 知道这个站，但插件里没有同 sid 的站点配置 → 下不到种。
-                            # 把 sid 打出来，用户照着在站点行补 `sid=NN` 就能用。
-                            unknown_sids.add(sid)
+                            # 和官方插件一致：IYUU 已经知道这个站，缺的是 MP 站点管理里的勾选/凭据。
+                            unmatched_iyuu_sids.setdefault(sid, why)
                             continue
                         if not torrent_id:
                             continue
@@ -3426,10 +3408,11 @@ class ColaCrossSeed(_PluginBase):
                         by_site.setdefault(site.get("name") or site.get("url") or "?", {"added": 0, "failed": 0})["added"] += 1
         if by_site:
             stats["by_site"] = by_site
-        if unknown_sids:
-            logger.warn("IYUU 返回了插件里没有配置的站点 sid："
-                        + ", ".join(str(x) for x in sorted(unknown_sids))
-                        + " → 在「其他站」里给对应站点补上 sid=数字 就能走 IYUU 下载")
+        if unmatched_iyuu_sids:
+            detail = ", ".join(f"{sid}（{why}）"
+                               for sid, why in sorted(unmatched_iyuu_sids.items()))
+            logger.warn("IYUU 命中的站点没有在 MP 站点管理里勾选/配置："
+                        + detail + " → 在③里勾选对应 MP 站点即可，无需手写 sid 或站点 JSON")
         self._finish(stats)
 
     def _finish(self, stats: Dict[str, int]) -> None:
@@ -3463,7 +3446,7 @@ class ColaCrossSeed(_PluginBase):
             services.append({
                 "id": "ColaCrossSeed",
                 "name": "可乐PT自动辅种",
-                "trigger": _cron_trigger(self._cron, "0 */1 * * *"),
+                "trigger": _cron_trigger(self._cron, "0 0 * * *"),
                 "func": self.auto_seed,
                 "kwargs": {},
             })
@@ -3474,74 +3457,270 @@ class ColaCrossSeed(_PluginBase):
 
     # ---------------- 插件页面 / API / 表单 ----------------
 
+    # 主页样式：借 MoviePilot 的 app-card-shell 卡片外观与 Vuetify 主题变量，
+    # 深浅色/透明主题都能跟上；类名带 colacrossseed- 前缀，不污染别的插件。
+    _PAGE_CSS = """
+    .colacrossseed-page { display: flex; flex-direction: column; gap: 12px; }
+    .colacrossseed-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .colacrossseed-stat { min-width: 0; padding: 10px 12px; }
+    .colacrossseed-stat__head { display: flex; align-items: center; gap: 6px; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: .75rem; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .colacrossseed-stat__head .v-icon { color: rgb(var(--app-card-accent-rgb)); }
+    .colacrossseed-stat__value { margin-top: 8px; font-size: 1.25rem; font-weight: 700; line-height: 1; }
+    .colacrossseed-stat__meta { margin-top: 4px; color: rgba(var(--v-theme-on-surface), .56); font-size: .72rem; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .colacrossseed-section { min-width: 0; }
+    .colacrossseed-section-head { display: flex; align-items: center; gap: 8px; min-height: 30px; margin-bottom: 6px; }
+    .colacrossseed-section-title { font-size: .95rem; font-weight: 600; letter-spacing: 0; }
+    .colacrossseed-collapse { min-width: 0; }
+    /* 右侧多留 52px：MP 插件页右下角有固定设置 FAB，避免展开箭头/数量被它盖住 */
+    .colacrossseed-collapse .v-expansion-panel-title { min-height: 40px; padding: 0 52px 0 12px !important; }
+    .colacrossseed-collapse .v-expansion-panel-text__wrapper { padding: 4px 52px 12px 12px; }
+    .colacrossseed-table-wrap { overflow-x: auto; border: 1px solid rgba(var(--v-theme-on-surface), .08); border-radius: 8px; }
+    .colacrossseed-table { min-width: 480px; }
+    .colacrossseed-table th { height: 34px !important; padding: 0 8px !important; color: rgba(var(--v-theme-on-surface), .62); font-size: .75rem; font-weight: 600 !important; white-space: nowrap; }
+    .colacrossseed-table td { height: 36px !important; padding: 0 8px !important; font-size: .8rem; vertical-align: middle; }
+    .colacrossseed-table tbody tr:last-child td { border-bottom: 0 !important; }
+    .colacrossseed-key { width: 130px; color: rgba(var(--v-theme-on-surface), .62); white-space: nowrap; }
+    .colacrossseed-site { font-weight: 600; white-space: nowrap; }
+    .colacrossseed-check-name { width: 150px; font-weight: 600; white-space: nowrap; }
+    .colacrossseed-meta { color: rgba(var(--v-theme-on-surface), .56); font-size: .72rem; }
+    html[data-theme="transparent"] .colacrossseed-table-wrap,
+    .v-theme--transparent .colacrossseed-table-wrap { backdrop-filter: blur(var(--transparent-blur, 10px)); background-color: rgba(var(--v-theme-surface), 0) !important; }
+    html[data-theme="transparent"] .colacrossseed-table,
+    html[data-theme="transparent"] .colacrossseed-table .v-table__wrapper,
+    html[data-theme="transparent"] .colacrossseed-table table,
+    html[data-theme="transparent"] .colacrossseed-table tbody tr,
+    .v-theme--transparent .colacrossseed-table,
+    .v-theme--transparent .colacrossseed-table .v-table__wrapper,
+    .v-theme--transparent .colacrossseed-table table,
+    .v-theme--transparent .colacrossseed-table tbody tr { background-color: transparent !important; }
+    @media (max-width: 720px) {
+        .colacrossseed-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .colacrossseed-stat { padding: 8px 10px; }
+        .colacrossseed-stat__value { font-size: 1.08rem; }
+        .colacrossseed-table { min-width: 420px; }
+    }
+    """
+
+    @staticmethod
+    def _page_stat(label: str, value: str, meta: str, color: str, icon: str) -> Dict[str, Any]:
+        """主页顶部统计卡片（外观与签到插件一致）。"""
+        return {
+            "component": "div",
+            "props": {"class": "colacrossseed-stat app-card-shell app-card-colorful",
+                      "style": f"--app-card-accent-rgb: var(--v-theme-{color});"},
+            "content": [
+                {"component": "div", "props": {"class": "colacrossseed-stat__head"}, "content": [
+                    {"component": "VIcon", "props": {"size": "x-small", "color": color}, "text": icon},
+                    {"component": "span", "text": label},
+                ]},
+                {"component": "div", "props": {"class": f"colacrossseed-stat__value text-{color}"}, "text": value},
+                {"component": "div", "props": {"class": "colacrossseed-stat__meta"}, "text": meta},
+            ],
+        }
+
+    @staticmethod
+    def _page_section(title: str, icon: str, count: Optional[int], body: Dict[str, Any]) -> Dict[str, Any]:
+        """主页分区：小图标 + 标题 + 右侧数量 chip。"""
+        head: List[Dict[str, Any]] = [
+            {"component": "VIcon", "props": {"size": "small", "color": "primary"}, "text": icon},
+            {"component": "span", "props": {"class": "colacrossseed-section-title"}, "text": title},
+            {"component": "VSpacer"},
+        ]
+        if count is not None:
+            head.append({"component": "VChip", "props": {"size": "x-small", "variant": "tonal", "color": "primary"},
+                         "text": f"{count} 个"})
+        return {"component": "div", "props": {"class": "colacrossseed-section"},
+                "content": [{"component": "div", "props": {"class": "colacrossseed-section-head"},
+                             "content": head}, body]}
+
+    @staticmethod
+    def _page_table(headers: List[str], rows: List[List[Dict[str, Any]]],
+                    empty_text: str = "暂无数据") -> Dict[str, Any]:
+        """主页紧凑表格；无数据时给一条提示。"""
+        if not rows:
+            return {"component": "VAlert", "props": {"type": "info", "text": empty_text,
+                    "variant": "tonal", "density": "compact", "prepend-icon": "mdi-information"}}
+        head = {"component": "thead", "content": [{"component": "tr", "content": [
+            {"component": "th", "props": {"class": "text-start"}, "text": h} for h in headers]}]}
+        body = {"component": "tbody", "content": [
+            {"component": "tr", "content": cells} for cells in rows]}
+        return {"component": "div", "props": {"class": "colacrossseed-table-wrap"},
+                "content": [{"component": "VTable", "props": {"hover": True, "density": "compact",
+                             "class": "colacrossseed-table"}, "content": [head, body]}]}
+
+    @staticmethod
+    def _page_td(text: str, cls: str = "") -> Dict[str, Any]:
+        props: Dict[str, Any] = {}
+        if cls:
+            props["class"] = cls
+        return {"component": "td", "props": props, "text": text}
+
+    @staticmethod
+    def _page_collapsible(title: str, icon: str, count: Optional[int],
+                          body: Dict[str, Any], meta: str = "") -> Dict[str, Any]:
+        """可折叠分节（手风琴、默认收起，点标题展开）。
+
+        MP 插件页支持 VExpansionPanel（见官方 siteuserdetail），这里照它的写法：
+        标题栏放图标 + 标题 + 数量 + 右侧时间，详情放 VExpansionPanelText。
+        """
+        # 不用 VSpacer：时间和数量紧跟标题左对齐，把最右侧让给展开箭头。
+        # MP 插件页右下角有固定的设置 FAB，任何靠最右的内容都会被它盖住。
+        title_content: List[Dict[str, Any]] = [
+            {"component": "VIcon", "props": {"size": "small", "color": "primary"}, "text": icon},
+            {"component": "span", "props": {"class": "colacrossseed-section-title"}, "text": title},
+        ]
+        if count is not None:
+            title_content.append({"component": "VChip", "props": {
+                "size": "x-small", "variant": "tonal", "color": "primary"}, "text": str(count)})
+        if meta:
+            title_content.append({"component": "span", "props": {"class": "colacrossseed-meta"},
+                                  "text": meta})
+        return {
+            "component": "VExpansionPanels",
+            "props": {"variant": "accordion", "multiple": True, "class": "colacrossseed-collapse"},
+            "content": [{
+                "component": "VExpansionPanel",
+                "content": [
+                    {"component": "VExpansionPanelTitle", "content": [
+                        {"component": "div", "props": {
+                            "class": "d-flex align-center ga-2 w-100"}, "content": title_content},
+                    ]},
+                    {"component": "VExpansionPanelText", "content": [body]},
+                ],
+            }],
+        }
+
     def get_page(self) -> Optional[List[dict]]:
         if not self._api_key:
             return [
-                {"component": "div", "text": "还没填可乐PT 的 API Key。"},
-                {"component": "div", "text": f"到 {COLA_KEY_PAGE} 新建一把 Key，范围勾「读取」和「下载」，"
-                                             f"把它粘到插件设置「API Key」里保存即可。接口说明见 https://www.colapt.com/api-docs 。"},
+                {"component": "div", "text": "还没拿到可乐PT 的 API Key。"},
+                {"component": "div", "text": f"最省事：在插件设置①里用下拉选 MP「站点管理」里已填好 API Key 的可乐站，保存即可；"
+                                             f"没配过的话到 {COLA_KEY_PAGE} 新建一把 Key，范围勾「读取」和「下载」，"
+                                             f"粘到「API Key（手填兜底）」里。接口说明见 https://www.colapt.com/api-docs 。"},
             ]
         last = self.get_data("last_run") or {}
+        if not isinstance(last, dict):
+            last = {}
         report = self.get_data("test_report") or self._test_report or {}
+        # 丢弃老版本遗留的检测报告（没有 schema 标记或版本不符）——里面是
+        # 「请粘贴 IYUU 站点 JSON」「域名,passkey」等早已删除的旧文案，升级后残留会误导。
+        if not isinstance(report, dict) or report.get("schema") != self._TEST_REPORT_SCHEMA:
+            report = {}
         pending = self._pending()
-        blocks: List[dict] = [
-            # 版本写到页面上：用户在 issue 里反馈时，第一眼就能看到自己装的是哪一版
-            {"component": "div", "text": f"插件版本 v{self.plugin_version}；已填可乐PT API Key。上次运行：{last.get('at', '未运行')}；"
-                                         f"可乐补种 {last.get('added', 0)}，其他站 {last.get('filled', 0)}，"
-                                         f"重复 {last.get('duplicate', 0)}，失败 {last.get('failed', 0)}；"
-                                         f"待重试 {len(pending)} 个。"}
-        ]
-        if isinstance(last, dict) and last.get("reason"):
-            blocks.append({"component": "div",
-                           "text": f"⚠️ 上一轮没加种：{last['reason']}"})
-        # 下载器清单 + 「辅种加到哪台」的解析结果：名字对不上是这里最容易踩的坑，
-        # 把可用名字直接列在页面上，用户不用去翻日志。
+
+        # ── 顶部：四张统计卡片 ──
+        added = int(last.get("added", 0) or 0)
+        filled = int(last.get("filled", 0) or 0)
+        duplicate = int(last.get("duplicate", 0) or 0)
+        already = int(last.get("already", 0) or 0)
+        failed = int(last.get("failed", 0) or 0)
+        at = str(last.get("at", "") or "")
+        run_short = at[5:16] if len(at) >= 16 else (at or "未运行")
+        summary = {"component": "div", "props": {"class": "colacrossseed-summary"}, "content": [
+            self._page_stat("上次运行", run_short, f"v{self.plugin_version}", "info", "mdi-clock-outline"),
+            self._page_stat("本轮补种", str(added + filled), f"可乐 {added} · 其他站 {filled}",
+                            "success" if (added + filled) else "info", "mdi-download-network"),
+            self._page_stat("跳过 / 已有", str(duplicate + already),
+                            f"重复 {duplicate} · 客户端已有 {already}", "warning", "mdi-skip-next"),
+            self._page_stat("失败 / 待重试", str(failed + len(pending)),
+                            f"失败 {failed} · 待重试 {len(pending)}",
+                            "error" if (failed or pending) else "info", "mdi-alert-circle-outline"),
+        ]}
+
+        sections: List[Dict[str, Any]] = [summary]
+
+        # 上一轮没加种的原因：显眼地放在最上面
+        if last.get("reason"):
+            sections.append({"component": "VAlert", "props": {
+                "type": "warning", "variant": "tonal", "density": "compact",
+                "prepend-icon": "mdi-information", "text": f"上一轮没加种：{last['reason']}"}})
+
+        # ── 运行状态：目标解析 + 在线下载器 + 站点账目 ──
         try:
             live_clients = self._clients()
         except Exception as err:
             live_clients = []
             logger.info(f"读取下载器列表失败：{type(err).__name__}: {err}")
         live_names = [c.name for c in live_clients]
-        wanted = (self._target_client or "").strip()
-        if wanted:
-            matched = [c.name for c in self._resolve_target_clients(wanted, live_clients)] if live_clients else []
-            ambiguous = list(getattr(self, "_target_ambiguous", []) or [])
-            if matched:
-                blocks.append({"component": "div",
-                               "text": f"辅种目标：`{wanted}` → {', '.join(matched)}（只往这一台加种）"})
-            elif ambiguous:
-                blocks.append({"component": "div",
-                               "text": (f"⚠️ 辅种目标 `{wanted}` 同时匹配到多台：{', '.join(ambiguous)}，"
-                                        f"本轮不会加种。请写全名")})
+        wants = self._target_wants()
+        runtime_rows: List[List[Dict[str, Any]]] = []
+        if wants:
+            matched, problems, _ = self._resolve_targets(live_clients) if live_clients else ([], [], [])
+            if not problems and matched:
+                count_text = "这一台" if len(matched) == 1 else f"这 {len(matched)} 台"
+                target_text = (f"{' + '.join(wants)} → {', '.join(c.name for c in matched)}"
+                               f"（只往{count_text}加种）")
+                target_color = "success"
             else:
-                blocks.append({"component": "div",
-                               "text": (f"⚠️ 辅种目标 `{wanted}` 没匹配到任何下载器，本轮不会加种。"
-                                        f"当前可用：{', '.join(live_names) or '（读不到下载器）'}")})
-        elif live_names:
-            blocks.append({"component": "div",
-                           "text": f"辅种目标：自动（谁在做种归谁）。当前下载器：{', '.join(live_names)}"})
-        if getattr(self, "_mp_enum_error", ""):
-            blocks.append({"component": "div",
-                           "text": f"⚠️ MoviePilot 多下载器接口不可用（{self._mp_enum_error}）："
-                                   f"只列出默认下载器，勾了「使用 MP 已配置下载器」也只看到这一台。"})
+                detail = '；'.join(problems) if problems else '目标没匹配到任何下载器'
+                target_text = f"{' + '.join(wants)}：{detail}，本轮不会加种。可用：{', '.join(live_names) or '（读不到）'}"
+                target_color = "error"
+        else:
+            target_text = "自动 —— 每台下载器各自匹配、各自加回自己"
+            target_color = "info"
+        target_cell = self._page_td(target_text)
+        target_cell["props"]["class"] = f"text-{target_color}"
+        runtime_rows.append([self._page_td("辅种目标", "colacrossseed-key"), target_cell])
+        runtime_rows.append([self._page_td("在线下载器", "colacrossseed-key"),
+                             self._page_td(" · ".join(live_names) if live_names else "（读不到下载器）")])
         sites = self._other_sites()
-        # IYUU 一键导入的账目：粘一次 JSON 之后，这里就是「到底生效了哪些」的唯一凭据
-        iyuu_imported = [] if (self._sites_mode or "merge") == "manual" else self._iyuu_sites()
-        if iyuu_imported:
-            uid_n = sum(1 for x in iyuu_imported if x.get("uid"))
-            hash_n = sum(1 for x in iyuu_imported if x.get("downhash"))
-            cookie_n = sum(1 for x in iyuu_imported if x.get("cookie"))
-            blocks.append({
-                "component": "div",
-                "text": (f"IYUU 导入：{len(iyuu_imported)} 个启用站点"
-                         f"（带 uid {uid_n} / downhash {hash_n} / Cookie {cookie_n}；"
-                         f"站点来源 {self._sites_mode or 'merge'}）"),
-                "props": {"style": "white-space: pre-wrap; line-height: 1.7"},
-            })
         if sites:
-            per = (last.get("by_site") or {}) if isinstance(last, dict) else {}
-            rows = []
-            for site in sites[:40]:
+            sid_n = sum(1 for x in sites if x.get("sid"))
+            rss_n = sum(1 for x in sites if x.get("rsskey"))
+            runtime_rows.append([self._page_td("站点", "colacrossseed-key"),
+                                 self._page_td(f"生效 {len(sites)} / 勾选 {len(self._mp_site_ids or [])}"
+                                               f"（IYUU {sid_n} · RSS {rss_n} · pieces-hash {len(sites)}）")])
+        if getattr(self, "_mp_enum_error", ""):
+            runtime_rows.append([self._page_td("MP 接口", "colacrossseed-key"),
+                                 self._page_td(f"多下载器接口不可用（{self._mp_enum_error}），只列默认下载器")])
+        sections.append(self._page_section("运行状态", "mdi-information-outline",
+                                           len(live_names) if live_names else None,
+                                           self._page_table(["项目", "状态"], runtime_rows)))
+
+        # ── 连通性检测：放在运行状态之后，详情可折叠 ──
+        if report:
+            lines = [report.get("cola", ""), report.get("iyuu", "")]
+            lines += report.get("clients") or []
+            lines += report.get("sites") or []
+            lines = [x for x in lines if x]
+            check_rows: List[List[Dict[str, Any]]] = []
+            for line in lines:
+                mark, color = "✓", "success"
+                if line.startswith("ℹ"):
+                    mark, color = "i", "info"
+                elif line.startswith("⚠") or "⚠" in line[:3]:
+                    mark, color = "!", "warning"
+                elif line.startswith("❌"):
+                    mark, color = "✕", "error"
+                # 去掉开头状态符号后按首个冒号拆成「名称 / 详情」，和站点清单一样分列
+                # NOTE: ℹ️/⚠️ 带 Unicode 变体选择符 FE0F，须一并去掉，否则名字里残留怪符号
+                cleaned = line.lstrip("✅⚠❌ℹ \ufe0f").strip()
+                name, detail = cleaned, ""
+                for sep in ("：", ":"):
+                    if sep in cleaned:
+                        name, detail = cleaned.split(sep, 1)
+                        name, detail = name.strip(), detail.strip()
+                        break
+                check_rows.append([
+                    {"component": "td", "props": {"class": f"colacrossseed-check-name text-{color}"},
+                     "text": f"{mark} {name}"},
+                    self._page_td(detail, "colacrossseed-meta"),
+                ])
+            sections.append(self._page_collapsible(
+                "连通性检测", "mdi-check-network", len(check_rows),
+                self._page_table(["项目", "详情"], check_rows),
+                meta=str(report.get("at", ""))))
+        else:
+            sections.append({"component": "VAlert", "props": {
+                "type": "info", "variant": "tonal", "density": "compact",
+                "prepend-icon": "mdi-information",
+                "text": "保存一次配置会自动做连通性检测，结果显示在这里。"}})
+
+        # ── 站点清单：表格，通道与上次补种数 ──
+        if sites:
+            per = last.get("by_site") or {}
+            site_rows: List[List[Dict[str, Any]]] = []
+            for site in sites:
                 name = site.get("name") or site.get("url")
                 chans = []
                 if site.get("sid"):
@@ -3549,25 +3728,28 @@ class ColaCrossSeed(_PluginBase):
                 if site.get("rsskey"):
                     chans.append("RSS")
                 chans.append("pieces-hash")
-                forced = site.get("channel") or "auto"
                 hit = per.get(name) or per.get(site.get("url")) or {}
-                rows.append(f"· {name}（{'/'.join(chans)}，{forced}）"
-                            + (f" → 上次补种 {hit.get('added', 0)}" if hit else ""))
-            blocks.append({"component": "div", "text": f"站点清单（{len(sites)} 个）：\n" + "\n".join(rows),
-                           "props": {"style": "white-space: pre-wrap; line-height: 1.7"}})
+                added_n = int(hit.get("added", 0) or 0)
+                site_rows.append([
+                    self._page_td(name, "colacrossseed-site"),
+                    self._page_td(" · ".join(chans), "colacrossseed-meta"),
+                    {"component": "td", "props": {"class": "text-right text-success" if added_n else "text-right"},
+                     "text": f"+{added_n}" if added_n else "—"},
+                ])
+            sections.append(self._page_collapsible("站点清单", "mdi-web", len(sites),
+                                                   self._page_table(["站点", "通道", "上次补种"], site_rows)))
+
+        # ── 待重试 ──
         if pending:
-            names = "\n".join(f"· {x.get('client', '?')} → {x.get('key', '')}" for x in pending[-8:])
-            blocks.append({"component": "div", "text": f"下一轮会先重试这些（最多 8 条）：\n{names}",
-                           "props": {"style": "white-space: pre-wrap; line-height: 1.7"}})
-        if report:
-            lines = [f"检测时间 {report.get('at', '')}", report.get("cola", ""), report.get("iyuu", "")]
-            lines += report.get("clients") or []
-            lines += report.get("sites") or []
-            blocks.append({"component": "div", "text": "\n".join([x for x in lines if x]),
-                           "props": {"style": "white-space: pre-wrap; line-height: 1.8"}})
-        else:
-            blocks.append({"component": "div", "text": "保存一次配置会自动做连通性检测，结果显示在这里。"})
-        return blocks
+            retry_rows = [
+                [self._page_td(str(x.get("client", "?"))), self._page_td(str(x.get("key", "")), "colacrossseed-meta")]
+                for x in pending[-8:]
+            ]
+            sections.append(self._page_section("下一轮优先重试", "mdi-refresh", len(pending),
+                                               self._page_table(["下载器", "种子"], retry_rows)))
+
+        return [{"component": "style", "text": self._PAGE_CSS},
+                {"component": "div", "props": {"class": "colacrossseed-page"}, "content": sections}]
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
@@ -3585,20 +3767,6 @@ class ColaCrossSeed(_PluginBase):
                 "summary": "检测可乐/下载器/其他站连通性",
                 "description": "返回可乐 API Key、每个下载器、每个其他站的连接结果；结果也会显示在插件页",
             },
-            {
-                "path": "/sites/import",
-                "endpoint": self.iyuu_import,
-                "methods": ["POST"],
-                "summary": "一键导入 IYUU 站点配置",
-                "description": "请求体传 IYUU 导出的 JSON（json/payload/sites 任一键），自动展开成站点；返回 total/enabled/usable/skipped",
-            },
-            {
-                "path": "/sites/import-file",
-                "endpoint": self.iyuu_import_file,
-                "methods": ["POST"],
-                "summary": "从本地文件导入 IYUU 配置",
-                "description": "请求体传 {\"path\": \"/config/cola-sites.json\"}（容器内路径）；不传则用设置里的「IYUU 配置文件路径」",
-            },
         ]
 
     @staticmethod
@@ -3611,7 +3779,7 @@ class ColaCrossSeed(_PluginBase):
         ]}
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """设置页排版：总开关 → 账号 → 下载器 → 站点 → 辅种行为 → 保种组。
+        """设置页排版：总开关 → 账号 → 下载器 → 站点 → 辅种行为。
 
         只重排、不改字段名：每个 `model` 都对应 init_plugin 读的那个键，defaults 与之一一对应。
         """
@@ -3628,42 +3796,57 @@ class ColaCrossSeed(_PluginBase):
                              "label": "启用辅种（功能一）"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VSwitch", "props": {"model": "notify", "label": "任务结果通知"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                            {"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即运行一次",
+                             "persistent-hint": True, "hint": "无视总开关跑一轮（需已填 API Key），3 秒后执行，跑完自动关掉"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VAlert", "props": {
                                 "type": "info", "variant": "tonal", "density": "compact",
-                                "text": "两个功能互不影响，各有各的开关与运行间隔；"
-                                        "「启用插件」是总开关，关掉后两个都不跑。"
+                                "text": "本插件只做辅种；保种组已拆到独立插件「可乐保种组」。"
+                                        "「启用插件」是总开关，关掉后这里不跑。"
                                         "异常与 API Key 失效提醒始终发送，不受「任务结果通知」影响。"}}]},
                     ]},
 
                     # ── ① 账号 ──
                     self._form_section("① 可乐PT API Key",
-                                       "在站点「账号 → Key → API Key」新建一把 Key，范围勾「读取」和「下载」，"
-                                       "粘到这里保存。插件只把它放在 X-API-Key 请求头里，不再需要账号密码和验证码。"),
+                                       "推荐在下拉里选 MP「站点管理」里已填好 API Key 的可乐站，插件每次保存/重载自动读取，换 Key 不用回这里改。"
+                                       "也可以手填一把作兜底；两处都填时以站点管理为准。"
+                                       "Key 要勾「读取」+「下载」，插件只放在 X-API-Key 请求头里。"),
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VSelect", "props": {
+                                "model": "mp_site_id", "label": "MP 站点管理里的可乐站（推荐）",
+                                "items": self._mp_site_options(), "clearable": True,
+                                "hint": "选一个在站点管理「令牌（API Key）」里填了可乐 Key 的站"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                             {"component": "VTextField", "props": {
-                                "model": "api_key", "label": "API Key", "type": "password",
+                                "model": "api_key", "label": "API Key（手填兜底）", "type": "password",
                                 "persistent-hint": True,
                                 "hint": "读取：查哈希、检测连通；下载：取可乐的种子。接口说明见 www.colapt.com/api-docs"}}]},
                     ]},
 
                     # ── ② 下载器 ──
                     self._form_section("② 下载器",
-                                       "勾「使用 MoviePilot 已配置下载器」就用 MP 里的那几台；"
-                                       "否则在下面按行填地址与账号。"),
+                                       "勾「使用 MP 已配置下载器」才会加载下面那组 MP 目标；关掉时只用自定义下载器。"
+                                       "MP 多选与手填目标名取并集；两个都留空=自动，每台下载器各自匹配自己的种子、各自加回自己。"
+                                       "自定义下载器在下方按行填地址与账号；校验相关设置已移到④区。"),
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VSwitch", "props": {"model": "use_mp_clients",
-                             "label": "使用 MP 已配置下载器"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "skip_check", "label": "辅种：跳过校验"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                             "label": "使用 MP 已配置下载器", "persistent-hint": True,
+                             "hint": "关掉后下面 MP 目标不生效"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VSelect", "props": {
+                                "model": "mp_target_clients", "label": "MP 已配置下载器（可多选）",
+                                "items": self._mp_downloader_options(), "multiple": True, "chips": True,
+                                "clearable": True,
+                                "hint": "选中即只往这几台加种；留空则看手填目标，两个都空=自动"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VTextField", "props": {"model": "target_client",
-                             "label": "辅种加到哪台（留空=自动）",
-                             "placeholder": "优先正在做种的那台"}}]},
+                             "label": "自定义下载器名（手填）",
+                             "placeholder": "留空即可；与多选取并集"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
@@ -3674,95 +3857,91 @@ class ColaCrossSeed(_PluginBase):
                     ]},
 
                     # ── ③ 站点来源 ──
-                    self._form_section("③ 站点来源（IYUU 一键导入）",
-                                       "把 IYUU 导出的站点 JSON 整个粘到下面「IYUU 站点 JSON」里保存即可生效，"
-                                       "不必再手写站点行；passkey / uid / downhash / Cookie 会一起带走。"),
+                    self._form_section("③ 站点来源",
+                                       "在下面「MP 已配置站点」里多选要补的站（只存 id，passkey/Cookie 从站点管理现读）。"
+                                       "IYUU Token 可选：不填也能补可乐、也能用 pieces-hash/RSS 补其他站；"
+                                       "填了额外走 IYUU 云端，命中站点和下载模板由 IYUU 返回，这里只决定补哪些站、用哪套凭据。"),
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VSelect", "props": {"model": "sites_mode", "label": "站点来源", "items": [
-                                {"title": "只用 IYUU 导入（推荐：粘一次 JSON 就生效）", "value": "iyuu_only"},
-                                {"title": "IYUU 导入 + 手写行补充（默认）", "value": "merge"},
-                                {"title": "只用手写的行（不看 IYUU 导入）", "value": "manual"}]}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VSelect", "props": {
+                                "model": "mp_site_ids", "label": "MP 已配置站点（推荐，可多选）",
+                                "items": self._mp_site_options(), "multiple": True, "chips": True,
+                                "clearable": True,
+                                "hint": "只在「双向 / 只补其他站」时需要，只补可乐可留空；凭据每次现读"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VTextField", "props": {"model": "iyuu_token",
-                             "label": "IYUU Token（可选，填了走云端匹配）", "placeholder": "IYUU..."}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "iyuu_json_file",
-                             "label": "IYUU 配置文件路径（容器内，填了就以文件为准）",
-                             "persistent-hint": True,
-                             "hint": "把导出的 JSON 放到宿主的 MP 配置目录下（容器内 /config/…），保存即导入",
-                             "placeholder": "/config/cola-sites.json"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VTextarea", "props": {"model": "iyuu_json", "rows": 5,
-                             "label": "IYUU 站点 JSON（把导出内容整个粘贴进来，保存即生效）",
-                             "placeholder": "[{\"site\":\"keepfrds\",\"nickname\":\"朋友\",\"base_url\":\"pt.keepfrds.com\",\"sid\":1,\"disabled\":0,\"options\":{\"passkey\":\"...\",\"uid\":\"...\"}}]"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VTextarea", "props": {"model": "sites_lines", "rows": 3,
-                             "label": "其他站（可选，手写补充）", "persistent-hint": True,
-                             "hint": "每行 域名,passkey；可带 sid= rsskey= channel= uid= downhash= cookie= proxy=",
-                             "placeholder": "https://pt.example.com,abcdef123456\n观众,https://audiences.me,passkey=...,rsskey=...,channel=rss"}}]},
+                             "label": "IYUU Token（可选）", "persistent-hint": True,
+                             "hint": "不填也能用；填了走云端匹配，站点与下载模板由 IYUU 返回",
+                             "placeholder": "IYUU..."}}]},
                     ]},
 
                     # ── ④ 辅种行为 ──
                     self._form_section("④ 辅种（功能一）",
-                                       "开关在页面最上面「启用辅种」；这里设的是它的运行间隔与行为。"
-                                       "控制辅多少、补到哪个方向、以及标签怎么带。"),
+                                       "开关在最上方「启用辅种（功能一）」；这里决定多久跑一次、补哪个方向、"
+                                       "每小时补多少，以及标签和校验策略。"),
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VTextField", "props": {"model": "cron",
                              "label": "辅种运行间隔（cron，5 段）", "persistent-hint": True,
-                             "hint": "例如 0 */1 * * * = 每小时；写错会静默按每小时跑",
-                             "placeholder": "0 */1 * * *"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSelect", "props": {"model": "direction", "label": "辅种方向", "items": [
+                             "hint": "默认 0 0 * * * = 每日 00:00；例 0 */1 * * * = 每小时。只接受 5 段，写错回落到每日 0 点",
+                             "placeholder": "0 0 * * *"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                            {"component": "VSelect", "props": {"model": "direction", "label": "辅种方向",
+                             "persistent-hint": True,
+                             "hint": "双向=两条都做；只补可乐=别站资源对应的可乐种拉回来；只补其他站=可乐种去其他站补",
+                             "items": [
                                 {"title": "双向", "value": "both"}, {"title": "只补可乐", "value": "cola_only"},
                                 {"title": "只补其他站", "value": "other_only"}]}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VTextField", "props": {"model": "max_per_hour",
-                             "label": "每小时上限（0 = 不限）", "type": "number"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                             "label": "每小时上限（0 = 不限）", "type": "number", "min": 0,
+                             "persistent-hint": True,
+                             "hint": "按滚动 60 分钟窗口统计成功添加数"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VTextField", "props": {"model": "max_per_site",
-                             "label": "单个站点每轮上限", "type": "number", "min": 1, "persistent-hint": True,
+                             "label": "单站每轮上限", "type": "number", "min": 1, "persistent-hint": True,
                              "hint": "默认 20；填非数字会连同「每小时上限」一起重置"}}]},
                     ]},
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VTextField", "props": {"model": "add_label",
                              "label": "辅种标签（可留空）", "placeholder": "cross-seed"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VTextField", "props": {"model": "extra_tags",
                              "label": "额外标签（逗号分隔）", "placeholder": "可乐PT,辅种"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "inherit_tags", "label": "继承原种子标签"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                            {"component": "VSwitch", "props": {"model": "inherit_tags", "label": "继承原种子标签",
+                             "persistent-hint": True, "hint": "把原种子的标签一起带过去"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                            {"component": "VSwitch", "props": {"model": "retry_failed", "label": "失败下轮先重试",
+                             "persistent-hint": True, "hint": "上一轮失败的种子下轮优先重试，占当轮预算"}}]},
                     ]},
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VSwitch", "props": {"model": "skip_check", "label": "辅种：跳过校验",
+                             "persistent-hint": True,
+                             "hint": "默认关。开了客户端直接认为文件完整；文件不在磁盘会 missingFiles，不会自动重下。"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                             {"component": "VSwitch", "props": {"model": "fallback_skip_check",
-                             "label": "校验失败降级为跳过校验重试"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "retry_failed", "label": "失败下轮先重试"}}]},
+                             "label": "校验失败降级为跳过校验重试", "persistent-hint": True,
+                             "hint": "默认开。第一次加种失败时用 skip_checking=true 再试一次；任务不暂停。TR 不支持跳过校验。"}}]},
                     ]},
 
                 ],
             }
         ], {
-            "enabled": False, "crossseed_enabled": True, "notify": True, "cron": "0 */1 * * *",
-            "api_key": "",
+            "enabled": False, "crossseed_enabled": True, "onlyonce": False,
+            "notify": True, "cron": "0 0 * * *",
+            "api_key": "", "mp_site_id": "",
             "skip_check": False, "max_per_hour": 0, "max_per_site": 20, "direction": "both",
             "use_mp_clients": True, "clients_json": "", "clients_lines": "",
-            "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "", "sites_mode": "merge",
+            "iyuu_token": "", "mp_site_ids": [],
             "add_label": "", "extra_tags": "", "inherit_tags": True, "target_client": "",
+            "mp_target_clients": [],
             "fallback_skip_check": True, "retry_failed": True,
             "limit_dl_kib": 0, "limit_up_kib": 0, "limit_lines": "",
-            "iyuu_json_file": "",
         }
 
 

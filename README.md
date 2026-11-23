@@ -45,109 +45,51 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colapt
    - `via=source_info_hash`：客户端里有同一份文件（来源别的站）→ **拉可乐这颗种子回原下载器辅种**；
    - `via=info_hash`：客户端里已经是可乐这颗种子 → 跳过；
 3. 可选方向二：对可乐的种子，用 IYUU 云端匹配（或站点 `/api/pieces-hash`）去其他站找同一份文件，命中就拉回来辅种；
-4. 每小时最多添加 N 个（滚动 60 分钟窗口，默认 20），是否跳过校验由你决定（默认校验）。
+4. 默认每日 00:00 自动跑一次（cron 可改）；每小时最多添加 N 个（滚动 60 分钟窗口，默认不限），是否跳过校验由你决定（默认校验）。
 
 ## 配置
 
 | 字段 | 说明 |
 |---|---|
 | 启用插件 | 总开关 |
-| 可乐PT API Key | 在站点「账号 → Key → API Key」（<https://www.colapt.com/account/tracker?tab=api>）新建一把 Key，范围勾**读取**和**下载**，粘到这里保存。插件只把它放在 `X-API-Key` 请求头里；不再需要账号密码、验证码和两步验证码 |
+| 立即运行一次 | 勾上后保存，3 秒后立刻跑一轮辅种；跑完自动关掉，不会每次保存都触发。**无视启用总开关**（和官方 IYUU 插件一致，总开关关着也能手动跑一轮），但需已填 API Key，没 Key 时只提示不执行 |
+| MP 站点管理里的可乐站（推荐） | 在 MP「站点管理」里给可乐站填好「令牌（API Key）」，然后在这个下拉里选中它即可——插件只存站点 id，每次保存自动读取该站的 Key；在站点管理里换 Key 后插件下次重载会自动跟上，不用回插件设置改 |
+| API Key（手填兜底） | 没在站点管理配过时用这个：到站点「账号 → Key → API Key」（<https://www.colapt.com/account/tracker?tab=api>）新建一把 Key，范围勾**读取**和**下载**，粘到这里。**两者都填时以站点管理的为准**；站点里没读到 Key 才退回手填。插件只把它放在 `X-API-Key` 请求头里，不需要账号密码、验证码 |
 | 使用 MoviePilot 已配置下载器 | 勾选后使用 MP 里的 qB/TR |
+| 辅种目标：MP 已配置下载器（可多选） | 从 MP「设置 → 下载器」里的实例多选，选中即**只往这几台加种**；只存实例名，MP 里改名/增删后重新选一下即可。名字支持模糊匹配（`tr` 能命中 `MP-tr辅种`） |
+| 自定义下载器名（手填） | 可补自定义下载器的名字（例如下面 `下载器` 行里配的非 MP 机器），与上面多选取并集；留空即可。**两个目标都留空=自动**：每台下载器各自匹配自己的种子、各自加回自己，不用配置。指定了目标时，任何一个解析不到或有重名歧义，本轮都不加种 |
 | 下载器 | 每行一个：`地址,用户名,密码`；Transmission 写 `tr,地址,用户名,密码`（qB 可写 `qb,地址,用户名,密码`） |
-| 其他站 | 每行一个站点，位置写法和键值写法都支持（见下） |
-| 直接导入 IYUU 站点配置 | 把 IYUU 导出的站点 JSON 整个粘贴进来，自动取「启用且有 passkey」的站点 |
-| IYUU Token | 填了就用 IYUU 云端做辅种匹配（覆盖没有 pieces-hash 的站） |
+| MP 已配置站点（可多选） | 从 MP「站点管理」里多选要补的站（显示中文站名，只存 id）。passkey/Cookie/代理每次现读——passkey 优先取站点适配器配置，退回站点 RSS 地址里的 `?passkey=`；站点管理里改了自动跟上 |
+| IYUU Token | **可选**：不填也能补可乐、也能用 pieces-hash/RSS 补其他站；填了额外走 IYUU 云端（覆盖没有 pieces-hash 的站）。和官方 `iyuuautoseed` 一样：站点与下载模板由 IYUU 返回，MP 站点下拉只决定补哪些站、用哪套凭据 |
 | 辅种方向 | 双向 / 只补可乐 / 只补其他站 |
-| 每小时最多添加 | 默认 20，可调（1–200） |
+| 每小时上限 | 默认 0 = 不限；按滚动 60 分钟窗口统计成功添加数。要限流可填正整数 |
+| 单站每轮上限 | 默认 20，防止单个站点一轮被刷太快 |
 | 跳过校验 | 默认关闭（默认校验）；Transmission 无此选项，等价于总是校验 |
 | 辅种标签 | 给补进来的种子打的标签（qB 用标签、TR 用 label）；留空则沿用种子原来的分类 |
 | 额外标签 | 逗号分隔，追加到补进来的种子上（例如站点名 `可乐PT`） |
 | 继承原种子标签 | 默认开：原种子上已有的标签（站点标签、已整理、订阅…）一并带到补进来的种子 |
 | 校验失败降级 | 默认开。校验态下失败最常见的原因是文件不完全一致（多一个 nfo/字幕），开启后自动用「跳过校验」重试一次 |
 | 失败下一轮重试 | 默认开。真正失败的种子进队列（最多 40 条），下一轮优先重试，插件页能看到待重试清单 |
-| 执行周期 | cron，默认每小时 |
+| 执行周期 | cron（5 段），默认 `0 0 * * *` = 每日 00:00；写错回落到每日 0 点 |
 
 ## 插件页与接口
 
-- 插件页显示：上次运行统计（匹配 / 可乐补种 / 其他站补种 / 重复 / 降级成功 / 失败）、待重试清单、连通性检测结果；
-- `POST /api/v1/plugin/ColaCrossSeed/run` 手动跑一次（仍守每小时上限）；
-- `POST /api/v1/plugin/ColaCrossSeed/test` 检测可乐、下载器、其他站连通性。
+- 插件页从上到下：四张统计卡片（上次运行 / 本轮补种 / 跳过已有 / 失败待重试）→ 运行状态 → 连通性检测（项目/详情两列，可折叠）→ 站点清单（可折叠）→ 待重试；旧版本遗留的检测报告会自动隐去；
+- `POST /api/v1/plugin/ColaCrossSeed/run` 手动跑一次辅种（仍守每小时上限）——注意这**不会**刷新连通性检测；
+- `POST /api/v1/plugin/ColaCrossSeed/test` 检测可乐、下载器、其他站连通性。每次保存配置也会自动检测一次（有 API Key 即可，不受总开关限制）。
+- 升级后老版本遗留的旧检测报告会自动隐去（带格式版本校验），不会再显示「请粘贴 IYUU 站点 JSON」等废弃文案；保存一次配置即生成干净的新报告。
 
-## 一键导入 IYUU 配置（推荐）
+## 站点来源：MoviePilot 站点管理
 
-不用手写站点行：把 **IYUU 导出的站点 JSON** 整个粘到「直接导入 IYUU 站点配置」里保存即可。
+辅种目标站**只从 MP「站点管理」读取**：在设置③的多选下拉里勾选要补的站即可，
+插件只保存站点 id，其余信息每次现读。不再需要粘贴 IYUU 站点 JSON、配置文件路径或手写站点行。
 
-- 插件自动展开：`域名 / passkey / uid / downhash / rsskey / x_api_key / 下载模板 / sid` 一次全带走；
-- `disabled=1` 的站自动跳过，已关闭的站（烧包）也不导入；
-- 保存后插件页会显示 `IYUU 导入：N 个启用站点（带 uid x / downhash y / Cookie z）`——这就是「生效了没」的凭据；
-- 「站点来源」三档：**只用 IYUU 导入**（不写行）／**IYUU + 手写行补充**（默认，行优先）／只用手写行；
-- **本地文件导入**：把导出的 JSON 放到宿主的 MP 配置目录（容器内 `/config/cola-sites.json`），
-  在设置里填「IYUU 配置文件路径」，保存即导入；文件为准，粘进文本框的内容会被覆盖；
-- 也可以用接口推送（脚本/定时同步 IYUU 配置）：
+- **passkey**：优先取站点适配器配置，退回站点 RSS 地址里的 `?passkey=...`；只影响 pieces-hash / RSS 这两条本地通道；
+- **Cookie / 代理 / apikey**：从 MP 站点对象现读，站点管理里改了自动跟上；
+- **IYUU 命中**：IYUU 云端返回的 `sid` 自带站点地址与下载模板，插件把它反查成 MP 站点，再用该站的 Cookie/apikey 下种；
+- 已关闭的站会自动跳过；没有 passkey 的站仍可走 IYUU（有 Cookie/apikey 即可），只是不走 pieces-hash / RSS。
 
-```bash
-curl -X POST "http://<MP地址>/api/v1/plugin/ColaCrossSeed/sites/import" \
-  -H "Authorization: Bearer <MP API Token>" -H "Content-Type: application/json" \
-  -d "{\"json\": $(cat cn_sites.json)}"
-```
-
-返回 `{ok, total, enabled, usable, skipped}`：`total` 是文件里的条数，`enabled` 是未禁用的，
-`usable` 是真正带 passkey 能被插件使用的，`skipped` 是被跳过的域名与原因。
-
-> 为什么以前「粘了也不全生效」：IYUU 的凭据不只有 passkey。下载模板里的 `{uid}`、家园的 `downhash`、
-> `cookie_required` 站的 Cookie 都分散在 `options` 与顶层字段里，少一个就会出现「导入成功但辅种全失败」。
-> 0.10.26 起一次全带走。
-
-## 每个站点单独配置
-
-「其他站」一行一个站点，字段按名字写，不写的位置留空即可：
-
-| 字段 | 作用 |
-|---|---|
-| `passkey` | 站点密钥（必填），下载和 pieces-hash 认证都用它 |
-| `sid` | IYUU 的站点编号，**走 IYUU 匹配必须有**（IYUU 导出的 JSON 里 `"sid": 数字`） |
-| `rsskey` | 站点 RSS 密钥，没有 pieces-hash 的站靠它做精确匹配 |
-| `uid` | 站点用户 id（少数站下载链接要用） |
-| `channel` | 只允许这个站用哪条通道：`pieces` / `rss` / `iyuu` / `auto`（默认） |
-| `enabled` | 写 `enabled=0` 临时停掉这个站，不用删行 |
-
-```
-观众,https://audiences.me,passkey=<32位>,rsskey=<32位>,channel=rss
-麒麟,https://www.hdkyl.in,passkey=<32位>,channel=pieces
-朋友,https://pt.keepfrds.com,passkey=<32位>,sid=12
-老站,https://old.example.com,passkey=<32位>,enabled=0
-```
-
-「站点来源」开关：
-
-- **行文本 + IYUU 导入**（默认）：手写的行优先，同一个域名下没写的 `passkey/sid/rsskey` 会从 IYUU 导入里补齐；
-- **只用手写的行**：完全忽略 IYUU 导入，适合只维护少数几个站的用户。
-
-插件页会列出每个站点、它能用哪几条通道（IYUU / RSS / pieces-hash）以及上次补种数。
-
-## 旧写法（仍然兼容）
-
-```
-# 只有 passkey：走 pieces-hash / RSS（如果还配了 rsskey）
-https://pt.example.com,abcdef1234567890abcdef1234567890
-
-# 名称 + passkey
-朋友,https://pt.keepfrds.com,abcdef1234567890abcdef1234567890
-
-# 没有 pieces-hash 的站：第 4 段写 RSS 密钥（观众就是这个写法）
-观众,https://audiences.me,<passkey>,<rsskey>
-
-# 要走 IYUU 云端匹配：必须有 sid（IYUU 导出的站点 JSON 里 `"sid": 数字`）
-观众,https://audiences.me,passkey=<passkey>,sid=42
-
-# 也可以把几种信息一次写全
-麒麟,https://www.hdkyl.in,passkey=<passkey>,sid=7,uid=30695
-```
-
-`sid` 只在 IYUU 通道用得上：IYUU 云端按 sid 回结果，插件靠 sid 找到对应站点去下载。
-不知道自己的 sid 时先不写，跑一轮后日志会打印「IYUU 返回了插件里没有配置的站点 sid：42」，
-照着补 `sid=42` 即可。
+> 站点管理里要确保目标站可登录（Cookie/apikey 有效）：家园这类站就靠站点 Cookie 兜底，不需要在插件里手写 sid、uid 或 downhash。
 
 ## 三条匹配通道
 
@@ -160,7 +102,7 @@ https://pt.example.com,abcdef1234567890abcdef1234567890
 | **站点 RSS（`rsskey`）** | 站点 RSS 密钥 | 没有 pieces-hash 的站（如 观众 audiences.me）。NexusPHP 的 `torrentrss.php` 每条 item 带 `guid=info_hash` 和 `enclosure` 直链，按 info_hash 精确匹配，不靠标题猜 |
 | IYUU 云端 | IYUU token | 收录在 IYUU 的站，按 info_hash 全站匹配 |
 
-RSS 通道的覆盖范围是「RSS 里能看到的种子」（一般是最近发布的），刚好是辅种最该抢的那批。插件按 10 分钟缓存一次；并且**强制**两次拉取至少隔 120 秒（观众 audiences.me、彩虹岛 ptchdbits.co 站点明确要求 ≥2 分钟），间隔按站持久化打点，重启、手动点「测试」都守得住；站点行可用 `rss_interval=秒` 调大，不能调小。
+RSS 通道的覆盖范围是「RSS 里能看到的种子」（一般是最近发布的），刚好是辅种最该抢的那批。插件按 10 分钟缓存一次；并且**强制**两次拉取至少隔 120 秒（观众 audiences.me、彩虹岛 ptchdbits.co 站点明确要求 ≥2 分钟），间隔按站持久化打点，重启、手动点「测试」都守得住。
 
 RSS 命中的是**同一 info_hash**，qB 不允许同 hash 双开，所以这条通道不加种，而是给客户端里已有的那颗种子补上该站的 announce —— 文件一个字节都不用多，站方照样记做种。
 
@@ -168,9 +110,9 @@ RSS 命中的是**同一 info_hash**，qB 不允许同 hash 双开，所以这�
 
 - 插件只走可乐PT 的**开放 API**（接口说明见 <https://www.colapt.com/api-docs>）：哈希反查 `matchTorrentHashes`、签下载地址 `createDownloadLink`、连通检测 `personalStats`；
 - API Key 无效 / 被撤销（站点答 401）或缺范围（403 `api_key_scope_denied`）时插件发一条通知：到站点重建一把勾「读取」「下载」的 Key 填进来即可；
-- 插件只保存可乐的 API Key，其他站只需要域名 + passkey；
+- 插件只保存可乐的 API Key 与 MP 站点 id，其他站的凭据从站点管理现读、不落盘；
 - 可乐PT 接口有限流（每把 Key 读 60 次/分、下载 120 次/分；哈希反查一次最多 500 条、一次只算一次读），插件已按批调用；
-- 默认 20 个/小时是为了避免一次辅种太多触发源站风控，可自行调低。
+- 单站每轮上限默认 20，是为了避免一次辅种太多触发源站风控；每小时总上限默认不限，需要更保守可自行调低。
 
 ## 安全与隐私
 
@@ -182,7 +124,7 @@ RSS 命中的是**同一 info_hash**，qB 不允许同 hash 双开，所以这�
 `main` 开了分支保护：**功能测试全绿 + 必须走 PR** 才能合入，直接 push 会被拒。
 
 ```bash
-# 44 个离线功能测试：不联网、不依赖 MoviePilot 运行时（app.* / bencode 缺失时自动打桩）
+# 离线功能测试：不联网、不依赖 MoviePilot 运行时（app.* / bencode 缺失时自动打桩）
 python -m unittest discover -s tests -v
 ```
 
