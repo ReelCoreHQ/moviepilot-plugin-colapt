@@ -71,32 +71,6 @@ class ManifestTest(unittest.TestCase):
         self.assertTrue(entry.get("plugin_readme", "").startswith("https://"))
 
 
-class SiteLineTest(unittest.TestCase):
-    def test_keyed_line(self):
-        plugin = support.make_plugin(mod, sites_lines=(
-            "观众,https://audiences.me,passkey=%s,sid=68,rsskey=%s,channel=rss,rss_interval=200\n"
-            % ("a" * 32, "b" * 32)))
-        sites = plugin._line_sites()
-        self.assertEqual(len(sites), 1)
-        s = sites[0]
-        self.assertEqual(s["name"], "观众")
-        self.assertEqual(s["url"], "https://audiences.me/")
-        self.assertEqual(s["passkey"], "a" * 32)
-        self.assertEqual(s["rsskey"], "b" * 32)
-        self.assertEqual(s["sid"], 68)
-        self.assertEqual(s["channel"], "rss")
-        self.assertEqual(s["rss_interval"], "200")
-
-    def test_positional_line(self):
-        plugin = support.make_plugin(mod, sites_lines="demo.example,%s\n" % ("c" * 32))
-        sites = plugin._line_sites()
-        self.assertEqual(sites[0]["url"], "https://demo.example/")
-        self.assertEqual(sites[0]["passkey"], "c" * 32)
-        self.assertEqual(sites[0]["channel"], "auto")
-
-    def test_line_without_passkey_is_skipped(self):
-        plugin = support.make_plugin(mod, sites_lines="demo.example\n")
-        self.assertEqual(plugin._line_sites(), [])
 
 
 class DownloadUrlTest(unittest.TestCase):
@@ -405,6 +379,124 @@ class OpenApiTest(unittest.TestCase):
         page = plugin.get_page()
         self.assertIn("account/tracker?tab=api", json.dumps(page, ensure_ascii=False))
 
+    def test_page_is_card_based_not_plain_text_dump(self):
+        """主页改成卡片 + 表格，不再是一大段纯文本堆叠。"""
+        plugin = support.make_plugin(mod, _api_key="k")
+        plugin.get_data = lambda key, default=None: (
+            {"last_run": {"at": "2026-11-23 14:06:00", "added": 4, "filled": 1,
+                          "duplicate": 0, "already": 424, "failed": 0},
+             "test_report": {"schema": 2, "at": "2026-11-23 14:05", "cola": "✅ 有效",
+                             "clients": ["✅ MP-保种：正常"], "sites": []}}.get(key, default))
+        plugin._clients = lambda: []
+        page = plugin.get_page()
+        text = json.dumps(page, ensure_ascii=False)
+        self.assertIn("colacrossseed-summary", text, "顶部应有统计卡片网格")
+        self.assertIn("colacrossseed-stat", text)
+        self.assertIn("colacrossseed-table", text, "站点/检测应用表格呈现")
+        self.assertIn("VTable", text)
+        self.assertIn("mdi-clock-outline", text, "四张卡片应有图标")
+        self.assertNotIn("插件版本 v0.14.3；已填可乐PT API Key", text, "旧的长串纯文本头已移除")
+
+    def test_page_order_runtime_then_check_then_sites(self):
+        """顺序：运行状态 → 连通性检测 → 站点清单；后两者详情可折叠。"""
+        plugin = support.make_plugin(mod, _api_key="k")
+        plugin.get_data = lambda key, default=None: (
+            {"last_run": {"at": "2026-11-23 15:00:00", "added": 1},
+            "test_report": {"schema": 2, "at": "2026-11-23 15:00", "cola": "✅ 有效",
+                            "clients": ["✅ MP-保种：正常"], "sites": []}}.get(key, default))
+        plugin._clients = lambda: []
+        plugin._other_sites = lambda: [{"name": "家园", "url": "https://example.com", "sid": 1}]
+        plugin._mp_site_ids = []
+        page = plugin.get_page()
+        content = page[-1]["content"]  # div.colacrossseed-page 的 content
+        titles = []
+        for node in content:
+            text = json.dumps(node, ensure_ascii=False)
+            if "连通性检测" in text:
+                titles.append("check")
+            if "运行状态" in text:
+                titles.append("runtime")
+            if "站点清单" in text:
+                titles.append("sites")
+        self.assertEqual(titles, ["runtime", "check", "sites"],
+                         "区块顺序应为 运行状态 → 连通性检测 → 站点清单")
+        # 连通性检测与站点清单详情用折叠组件（VExpansionPanels），默认收起
+        check_node = next(n for n in content if "连通性检测" in json.dumps(n, ensure_ascii=False))
+        sites_node = next(n for n in content if "站点清单" in json.dumps(n, ensure_ascii=False))
+        for node, name in ((check_node, "连通性检测"), (sites_node, "站点清单")):
+            text = json.dumps(node, ensure_ascii=False)
+            self.assertIn("VExpansionPanels", text, f"{name} 详情应可折叠")
+            self.assertIn("VExpansionPanelText", text, f"{name} 详情内容应在折叠面板里")
+            self.assertNotIn('"component": "VSpacer"', text,
+                             f"{name} 标题不应把时间/数量推到最右（会和 MP 设置 FAB 打架）")
+        css = page[0]["text"]
+        self.assertIn("padding: 0 52px", css, "折叠标题右侧要留白避开页面右下角设置 FAB")
+
+    def test_check_rows_split_name_and_detail(self):
+        """连通性检测结果按冒号拆成「项目 / 详情」两列，跟站点清单一样。"""
+        plugin = support.make_plugin(mod, _api_key="k")
+        plugin.get_data = lambda key, default=None: (
+            {"last_run": {},
+             "test_report": {"schema": 2, "at": "2026-11-23 15:50",
+                             "cola": "✅ 可乐PT：API Key 可用（普通会员）",
+                             "iyuu": "ℹ️ IYUU Token：未配置（可选）",
+                             "clients": ["✅ MP-下载：连接成功，已完成 97 个种子"],
+                             "sites": []}}.get(key, default))
+        plugin._clients = lambda: []
+        page = plugin.get_page()
+        text = json.dumps(page, ensure_ascii=False)
+        # 表头是两列「项目 / 详情」
+        self.assertIn('"text": "项目"', text)
+        self.assertIn('"text": "详情"', text)
+        # 名称列与详情列分开：状态标记+名称在一格，详情在另一格
+        self.assertIn('✓ 可乐PT', text, "名称列应只有状态+名称")
+        self.assertIn('API Key 可用（普通会员）', text, "详情列应只有说明")
+        self.assertIn('i IYUU Token', text, "ℹ 行用 i 标记并归到 info 色")
+        self.assertIn('✓ MP-下载', text)
+        self.assertIn('连接成功，已完成 97 个种子', text)
+        self.assertIn('colacrossseed-check-name', text, "名称列应有加粗样式")
+
+    def test_page_discards_stale_report_without_schema(self):
+        """老版本遗留的 test_report（无 schema）必须被丢弃，不能再显示 IYUU JSON 等旧文案。"""
+        plugin = support.make_plugin(mod, _api_key="k")
+        plugin.get_data = lambda key, default=None: (
+            {"last_run": {"at": "2026-11-23 15:12:00", "added": 0},
+             "test_report": {"at": "2026-11-19 16:20:18",
+                             "cola": "✅ 可乐PT：已登录（glaucus）",
+                             "iyuu": "⚠️ IYUU Token：已填，但导入的站点没有 sid（请粘贴 IYUU 站点 JSON）",
+                             "clients": [],
+                             "sites": ["⚠️ 没有配置其他站（可粘贴 IYUU 配置或填「域名,passkey」）"]}}.get(key, default))
+        plugin._clients = lambda: []
+        page = plugin.get_page()
+        text = json.dumps(page, ensure_ascii=False)
+        self.assertNotIn("请粘贴 IYUU 站点 JSON", text, "旧报告的 JSON 提示不应再显示")
+        self.assertNotIn("域名,passkey", text, "旧报告的手写站提示不应再显示")
+        self.assertNotIn("2026-11-19 16:20:18", text, "旧报告时间戳不应再显示")
+        self.assertIn("保存一次配置会自动做连通性检测", text, "应提示用户重新检测")
+
+    def test_refresh_check_ignores_enable_switch(self):
+        """保存配置后自动检测只要求有 Key，不受总开关限制——否则旧报告永远刷不掉。"""
+        plugin = support.make_plugin(mod)
+        started = []
+        saved_thread = mod.threading.Thread if hasattr(mod, "threading") else None
+        # init_plugin 里 import threading 是局部导入，直接让它真起线程但把 run_tests 换探针
+        plugin.run_tests = lambda: started.append(1)
+        import time as _time
+        try:
+            # 总开关关着，但有 Key → 仍触发检测
+            plugin.init_plugin({"enabled": False, "crossseed_enabled": False, "api_key": "k"})
+            deadline = _time.time() + 2
+            while not started and _time.time() < deadline:
+                _time.sleep(0.01)
+            self.assertEqual(started, [1])
+            # 没 Key → 不触发
+            started.clear()
+            plugin.init_plugin({"enabled": True, "crossseed_enabled": True, "api_key": ""})
+            _time.sleep(0.05)
+            self.assertEqual(started, [])
+        finally:
+            pass
+
     def test_form_has_key_field_and_no_login_fields(self):
         plugin = support.make_plugin(mod)
         form, defaults = plugin.get_form()
@@ -420,6 +512,219 @@ class OpenApiTest(unittest.TestCase):
         for gone in ("/api/v1/plugin/match", "/api/v1/plugin/sessions", "/api/v1/plugin/captcha",
                      "/authorizations", "reelcore_session", "X-CSRF-Token"):
             self.assertNotIn(gone, source)
+
+    def test_form_has_mp_site_dropdown(self):
+        """①区要有 MP 站点下拉（只存 id），手填 Key 保留作兜底。"""
+        plugin = support.make_plugin(mod)
+        form, defaults = plugin.get_form()
+        text = json.dumps(form, ensure_ascii=False)
+        self.assertIn('"model": "mp_site_id"', text)
+        self.assertIn('"model": "api_key"', text)
+        self.assertIn("mp_site_id", defaults)
+        self.assertEqual(defaults["mp_site_id"], "")
+
+    def test_site_and_iyuu_token_each_full_width(self):
+        """MP 站点多选与 IYUU Token 各占整行，站点 chips 才能铺满宽度不撑高。"""
+        plugin = support.make_plugin(mod)
+        form, _ = plugin.get_form()
+
+        def find_vcol(node, model):
+            if isinstance(node, dict):
+                text = json.dumps(node, ensure_ascii=False)
+                if node.get("component") == "VCol" and f'"model": "{model}"' in text:
+                    return node
+                for child in (node.get("content") or []):
+                    found = find_vcol(child, model)
+                    if found:
+                        return found
+            elif isinstance(node, list):
+                for child in node:
+                    found = find_vcol(child, model)
+                    if found:
+                        return found
+            return None
+
+        for model in ("mp_site_ids", "iyuu_token"):
+            col = find_vcol(form, model)
+            self.assertIsNotNone(col, f"应找到 {model} 所在的 VCol")
+            self.assertEqual(col["props"], {"cols": 12},
+                             f"{model} 应独占整行，不能再是 md:6 半宽")
+
+    def test_default_cron_is_daily_midnight(self):
+        """默认执行频率改为每日 00:00（0 0 * * *），表单默认值也要一致。"""
+        self.assertEqual(mod.ColaCrossSeed._cron, "0 0 * * *")
+        plugin = support.make_plugin(mod)
+        form, defaults = plugin.get_form()
+        self.assertEqual(defaults["cron"], "0 0 * * *")
+        self.assertIn("每日 00:00", json.dumps(form, ensure_ascii=False))
+        # 空配置初始化也应回落到每日 0 点
+        plugin.stop_service = lambda: None
+        plugin.init_plugin({"enabled": False})
+        self.assertEqual(plugin._cron, "0 0 * * *")
+
+    def test_form_text_has_no_stale_two_feature_claim(self):
+        plugin = support.make_plugin(mod)
+        form, _ = plugin.get_form()
+        text = json.dumps(form, ensure_ascii=False)
+        self.assertNotIn("两个功能互不影响", text)
+        self.assertIn("保种组已拆到独立插件", text)
+
+    def test_form_groups_skip_check_with_explanations(self):
+        plugin = support.make_plugin(mod)
+        form, _ = plugin.get_form()
+        text = json.dumps(form, ensure_ascii=False)
+        for phrase in ("双向=两条都做", "按滚动 60 分钟窗口统计成功添加数",
+                       "默认关。开了客户端直接认为文件完整",
+                       "TR 不支持跳过校验", "上一轮失败的种子下轮优先重试"):
+            self.assertIn(phrase, text)
+
+
+class MpApiKeyTest(unittest.TestCase):
+    """API Key 从 MP 站点管理读取：只存站点 id，apikey 每次现读，手填作兜底。"""
+
+    KEY = "rcapi_from_site_management"
+
+    class FakeSite:
+        def __init__(self, sid, name, domain, apikey=""):
+            self.id, self.name, self.domain, self.apikey = sid, name, domain, apikey
+
+    def _install_mp_modules(self, sites, indexers=None):
+        """往 sys.modules 注入假 MP 模块，返回恢复函数。"""
+        outer = self
+
+        class FakeSiteOper:
+            def list_order_by_pri(self):
+                return sites
+
+        class FakeSitesHelper:
+            def get_indexer(self, domain):
+                return (indexers or {}).get(domain, {})
+
+        injected = {
+            "app.db": {"__path__": []},
+            "app.db.site_oper": {"SiteOper": FakeSiteOper},
+            "app.helper": {"__path__": []},
+            "app.helper.sites": {"SitesHelper": FakeSitesHelper},
+        }
+        saved = {}
+        for name, attrs in injected.items():
+            saved[name] = (name in sys.modules, sys.modules.get(name))
+            stub = sys.modules.get(name) or type(sys)(name)
+            for key, value in attrs.items():
+                setattr(stub, key, value)
+            sys.modules[name] = stub
+
+        def restore():
+            for name, (existed, module) in saved.items():
+                if existed:
+                    sys.modules[name] = module
+                else:
+                    sys.modules.pop(name, None)
+        return restore
+
+    def test_reads_apikey_from_indexer(self):
+        """首选 SitesHelper().get_indexer(domain)['apikey']。"""
+        sites = [self.FakeSite(1, "可乐PT", "www.colapt.com", apikey="rcapi_on_site_object")]
+        restore = self._install_mp_modules(
+            sites, {"www.colapt.com": {"apikey": self.KEY}})
+        try:
+            plugin = support.make_plugin(mod, _mp_site_id="1", _api_key="rcapi_manual_fallback")
+            self.assertEqual(plugin._api_key_from_mp_site(), self.KEY)
+        finally:
+            restore()
+
+    def test_falls_back_to_site_object_apikey(self):
+        """适配器没给 apikey 时，退回站点对象的 apikey 字段。"""
+        sites = [self.FakeSite(2, "可乐PT", "www.colapt.com", apikey=self.KEY)]
+        restore = self._install_mp_modules(sites, {"www.colapt.com": {}})
+        try:
+            plugin = support.make_plugin(mod, _mp_site_id="2")
+            self.assertEqual(plugin._api_key_from_mp_site(), self.KEY)
+        finally:
+            restore()
+
+    def test_missing_site_or_key_returns_empty(self):
+        """站点 id 不存在、或站点没配 Key，都返回空串（不伪造）。"""
+        sites = [self.FakeSite(3, "别的站", "other.example.com")]
+        restore = self._install_mp_modules(sites, {})
+        try:
+            plugin = support.make_plugin(mod, _mp_site_id="999")   # 不存在的 id
+            self.assertEqual(plugin._api_key_from_mp_site(), "")
+            plugin._mp_site_id = "3"                              # 存在但没 Key
+            self.assertEqual(plugin._api_key_from_mp_site(), "")
+        finally:
+            restore()
+
+    def test_init_prefers_mp_key_over_manual(self):
+        """init_plugin：站点 Key 优先于手填；读不到时退回手填。"""
+        sites = [self.FakeSite(4, "可乐PT", "www.colapt.com", apikey="")]
+        restore = self._install_mp_modules(
+            sites, {"www.colapt.com": {"apikey": self.KEY}})
+        try:
+            plugin = support.make_plugin(mod)
+            plugin.stop_service = lambda: None
+            plugin.init_plugin({"enabled": False, "api_key": "rcapi_manual", "mp_site_id": "4"})
+            self.assertEqual(plugin._api_key, self.KEY)
+            self.assertEqual(plugin._mp_site_id, "4")
+        finally:
+            restore()
+
+    def test_init_falls_back_to_manual_when_mp_key_missing(self):
+        restore = self._install_mp_modules([], {})
+        try:
+            plugin = support.make_plugin(mod)
+            plugin.stop_service = lambda: None
+            plugin.init_plugin({"enabled": False, "api_key": "rcapi_manual", "mp_site_id": "nope"})
+            self.assertEqual(plugin._api_key, "rcapi_manual")
+        finally:
+            restore()
+
+    def test_site_options_only_store_id(self):
+        """下拉选项 title 用站点名、value 用 str 化的 id（与配置里的 str 类型一致）。"""
+        sites = [self.FakeSite(5, "可乐PT", "www.colapt.com")]
+        restore = self._install_mp_modules(sites, {})
+        try:
+            plugin = support.make_plugin(mod)
+            options = plugin._mp_site_options()
+            self.assertEqual(len(options), 1)
+            self.assertEqual(options[0]["value"], "5")
+            self.assertIsInstance(options[0]["value"], str,
+                                  "value 必须是 str，否则配置里的 str id 匹配不上，回显成数字")
+            self.assertEqual(options[0]["title"], "可乐PT")
+        finally:
+            restore()
+
+    def test_site_option_value_matches_stored_str_id(self):
+        """回归：MP 的 site.id 是 int，配置项是 str；VSelect 严格匹配，value 须统一 str。"""
+        sites = [self.FakeSite(61, "可乐PT", "www.colapt.com")]
+        restore = self._install_mp_modules(sites, {})
+        try:
+            plugin = support.make_plugin(mod)
+            options = plugin._mp_site_options()
+            stored = "61"  # init_plugin 里 str(config.get("mp_site_id")) 的结果
+            matched = [o for o in options if o["value"] == stored]
+            self.assertEqual(len(matched), 1, "存进去的 str id 应能匹配到一个选项，否则回显成裸数字 61")
+            self.assertEqual(matched[0]["title"], "可乐PT")
+        finally:
+            restore()
+
+    def test_init_normalizes_legacy_int_site_ids_to_str(self):
+        """老配置里存的 int 站点 id 必须转成 str，否则和新选项 str value 匹配不上、回显成数字。"""
+        restore = self._install_mp_modules([], {})
+        try:
+            plugin = support.make_plugin(mod)
+            plugin.stop_service = lambda: None
+            plugin.init_plugin({
+                "enabled": False, "api_key": "rcapi_manual",
+                "mp_site_id": 61,            # 老配置：单选是 int
+                "mp_site_ids": [61, 63, 61, ""],  # 老配置：多选是 int 列表，还有重复和空
+            })
+            self.assertEqual(plugin._mp_site_id, "61")
+            self.assertIsInstance(plugin._mp_site_id, str)
+            self.assertEqual(plugin._mp_site_ids, ["61", "63"], "转 str 并去重保序")
+            self.assertTrue(all(isinstance(x, str) for x in plugin._mp_site_ids))
+        finally:
+            restore()
 
 
 class ParallelCurlTest(unittest.TestCase):
@@ -795,6 +1100,97 @@ class TargetDuplicateNameTest(unittest.TestCase):
         self.assertTrue(plugin._target_state.get("ambiguous"))
 
 
+class TargetMultiSelectTest(unittest.TestCase):
+    """辅种目标：MP 下载器多选 + 手填取并集；单目标原有语义不变。"""
+
+    def _clients(self):
+        qb = support.FakeClient(); qb.name = "MP-qb下载"
+        tr = support.FakeClient(); tr.name = "MP-tr辅种"
+        pt = support.FakeClient(); pt.name = "自定义PT"
+        return [qb, tr, pt]
+
+    def test_multi_select_resolves_all(self):
+        plugin = support.make_plugin(mod, _mp_target_clients=["MP-qb下载", "MP-tr辅种"])
+        got = plugin._apply_target_client(self._clients())
+        self.assertEqual([c.name for c in got], ["MP-qb下载", "MP-tr辅种"])
+        self.assertTrue(plugin._target_state.get("ok"))
+
+    def test_merged_with_manual(self):
+        """多选 + 手填自定义名 → 三者并集（手填补 MP 列表里没有的下载器）。"""
+        plugin = support.make_plugin(mod, _mp_target_clients=["MP-qb下载"],
+                                     _target_client="自定义PT")
+        got = plugin._apply_target_client(self._clients())
+        self.assertEqual([c.name for c in got], ["MP-qb下载", "自定义PT"])
+
+    def test_dedupe_across_sources(self):
+        """两处填同一台只加一次。"""
+        plugin = support.make_plugin(mod, _mp_target_clients=["MP-tr辅种", "tr辅种"],
+                                     _target_client="MP-tr辅种")
+        self.assertEqual(plugin._target_wants(), ["MP-tr辅种", "tr辅种"])
+        got = plugin._apply_target_client(self._clients())
+        self.assertEqual([c.name for c in got], ["MP-tr辅种"])
+
+    def test_all_blank_keeps_auto(self):
+        plugin = support.make_plugin(mod, _mp_target_clients=[], _target_client="")
+        got = plugin._apply_target_client(self._clients())
+        self.assertEqual([c.name for c in got], ["MP-qb下载", "MP-tr辅种", "自定义PT"])
+
+    def test_one_bad_target_stops_all(self):
+        """任何一个目标不存在就整轮不加，绝不推到没点名的机器上。"""
+        plugin = support.make_plugin(mod, _mp_target_clients=["MP-qb下载", "不存在的机器"])
+        got = plugin._apply_target_client(self._clients())
+        self.assertEqual(got, [])
+        self.assertFalse(plugin._target_state.get("ok"))
+        self.assertTrue(plugin._target_state.get("problems"))
+
+    def test_manual_prefix_matching_still_works(self):
+        plugin = support.make_plugin(mod, _mp_target_clients=["tr"])  # 手填式短名放多选里也认
+        got = plugin._apply_target_client(self._clients())
+        self.assertEqual([c.name for c in got], ["MP-tr辅种"])
+
+    def test_form_has_multiselect_and_manual(self):
+        plugin = support.make_plugin(mod)
+        form, defaults = plugin.get_form()
+        text = json.dumps(form, ensure_ascii=False)
+        self.assertIn('"model": "mp_target_clients"', text)
+        self.assertIn('"model": "target_client"', text)  # 手填保留
+        self.assertIn('"multiple": true', text)
+        self.assertEqual(defaults["mp_target_clients"], [])
+
+    def test_mp_downloader_options(self):
+        """下拉项从 DownloaderHelper().get_services() 来，value 与 _mp_clients 的 label 一致。"""
+        outer = self
+
+        class FakeInfo:
+            type = "qbittorrent"
+
+        class FakeHelper:
+            def get_services(self):
+                return {"qb下载": FakeInfo(), "tr辅种": FakeInfo()}
+
+        saved = {}
+        for name, attrs in (("app.application", {"__path__": []}),
+                            ("app.application.downloader", {"DownloaderHelper": FakeHelper})):
+            saved[name] = (name in sys.modules, sys.modules.get(name))
+            stub = sys.modules.get(name) or type(sys)(name)
+            for key, value in attrs.items():
+                setattr(stub, key, value)
+            sys.modules[name] = stub
+        try:
+            plugin = support.make_plugin(mod)
+            options = plugin._mp_downloader_options()
+            self.assertEqual(options, [
+                {"title": "MP-qb下载（qbittorrent）", "value": "MP-qb下载"},
+                {"title": "MP-tr辅种（qbittorrent）", "value": "MP-tr辅种"},
+            ])
+        finally:
+            for name, (existed, module) in saved.items():
+                if existed:
+                    sys.modules[name] = module
+                else:
+                    sys.modules.pop(name, None)
+
+
 class PlaceResultTest(unittest.TestCase):
     """失败不能记 done：记了下一轮就永远跳过这颗（复审 M2）。"""
 
@@ -941,152 +1337,8 @@ class SiteReportTest(unittest.TestCase):
         self.assertTrue(lines[1].startswith("✅"))
 
 
-class IyuuRobustnessTest(unittest.TestCase):
-    GOOD = json.dumps([{"site": "keepfrds", "nickname": "朋友", "base_url": "pt.keepfrds.com",
-                        "sid": 1, "disabled": 0, "options": {"passkey": "a" * 32}}], ensure_ascii=False)
-
-    def _plugin(self):
-        plugin = support.make_plugin(mod)
-        plugin.update_config = lambda cfg: None
-        plugin._iyuu_json = ""
-        plugin._sites_lines = ""
-        plugin._sites_mode = "merge"
-        return plugin
-
-    def test_dirty_sid_does_not_crash(self):
-        plugin = self._plugin()
-        plugin._iyuu_json = json.dumps([{"site": "x", "base_url": "x.example", "sid": "abc",
-                                         "disabled": 0, "options": {"passkey": "b" * 32}}])
-        sites = plugin._iyuu_sites()
-        self.assertEqual(len(sites), 1)
-        self.assertEqual(sites[0]["sid"], 0)
-
-    def test_disabled_string_zero_is_enabled(self):
-        plugin = self._plugin()
-        plugin._iyuu_json = json.dumps([{"site": "x", "base_url": "x.example", "disabled": "0",
-                                         "options": {"passkey": "c" * 32}}])
-        self.assertEqual(len(plugin._iyuu_sites()), 1)
-
-    def test_empty_import_keeps_previous_config(self):
-        plugin = self._plugin()
-        plugin._iyuu_json = self.GOOD
-        out = plugin._iyuu_import(json.dumps([{"site": "y", "base_url": "y.example",
-                                               "disabled": 0}]))   # 没有 passkey
-        self.assertFalse(out["ok"])
-        self.assertEqual(plugin._iyuu_json, self.GOOD)
-
-    def test_top_level_credentials_also_read(self):
-        plugin = self._plugin()
-        plugin._iyuu_json = json.dumps([{"site": "x", "base_url": "x.example", "disabled": 0,
-                                         "passkey": "d" * 32, "x_api_key": "k"}])
-        sites = plugin._iyuu_sites()
-        self.assertEqual(sites[0]["passkey"], "d" * 32)
-        self.assertEqual(sites[0]["x_api_key"], "k")
 
 
-class IyuuFileImportTest(unittest.TestCase):
-    SAMPLE = json.dumps([{"site": "keepfrds", "nickname": "朋友",
-                          "base_url": "pt.keepfrds.com", "sid": 1, "disabled": 0,
-                          "options": {"passkey": "a" * 32}}], ensure_ascii=False)
-
-    def _plugin(self):
-        plugin = support.make_plugin(mod)
-        plugin.update_config = lambda cfg: None
-        plugin._iyuu_json = ""
-        plugin._iyuu_json_file = ""
-        plugin._sites_lines = ""
-        plugin._sites_mode = "merge"
-        return plugin
-
-    def test_import_from_file(self):
-        import tempfile
-        plugin = self._plugin()
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
-            handle.write(self.SAMPLE)
-            path = handle.name
-        try:
-            out = plugin._iyuu_import_from_file(path)
-        finally:
-            import os
-            os.unlink(path)
-        self.assertTrue(out["ok"])
-        self.assertEqual(out["usable"], 1)
-        self.assertEqual(out["source"], "file")
-
-    def test_missing_file_reports_reason(self):
-        plugin = self._plugin()
-        out = plugin._iyuu_import_from_file("/config/definitely-not-there.json")
-        self.assertFalse(out["ok"])
-        self.assertIn("文件不存在", out["reason"])
-
-    def test_empty_path_reports_reason(self):
-        plugin = self._plugin()
-        out = plugin._iyuu_import_from_file("")
-        self.assertFalse(out["ok"])
-        self.assertIn("路径", out["reason"])
-
-
-class IyuuExtraFieldsTest(unittest.TestCase):
-    """IYUU 站点里那些「导入后就能直接跑」的参数。"""
-
-    SAMPLE = json.dumps([{
-        "site": "m-team", "nickname": "馒头", "base_url": "api.m-team.cc",
-        "sid": 3, "disabled": 0, "download_page": "api/torrent/genDlToken",
-        "options": {
-            "passkey": "a" * 32, "x_api_key": "k",
-            "limit": {"count": "35", "sleep": "5"},
-            "url_join": {"https": "1", "ipv4": "1", "ipv6": "1"},
-            "rss_url": "https://rss.m-team.cc/api/rss/fetch?dl=1&uid=1",
-            "curl_opt_proxy": "192.168.1.2:8080",
-            "curl_opt_proxy_auth": "user:pass",
-        },
-    }], ensure_ascii=False)
-
-    def _plugin(self):
-        plugin = support.make_plugin(mod)
-        plugin.update_config = lambda cfg: None
-        plugin._iyuu_json = self.SAMPLE
-        plugin._sites_lines = ""
-        plugin._sites_mode = "iyuu_only"
-        plugin._site_limits = {}
-        return plugin
-
-    def test_rss_url_and_limit_are_imported(self):
-        site = self._plugin()._iyuu_sites()[0]
-        self.assertEqual(site["max_per_site"], 35)
-        self.assertIn("rss.m-team.cc", site["rss_url"])
-
-    def test_interval_imported(self):
-        site = self._plugin()._iyuu_sites()[0]
-        self.assertEqual(site["interval"], 5.0)
-
-    def test_proxy_is_assembled(self):
-        site = self._plugin()._iyuu_sites()[0]
-        self.assertEqual(site["proxy"], "http://user:pass@192.168.1.2:8080")
-
-    def test_proxy_helper_variants(self):
-        self.assertEqual(mod._site_proxy("", ""), "")
-        self.assertEqual(mod._site_proxy("1.2.3.4:8080", ""), "http://1.2.3.4:8080")
-        self.assertEqual(mod._site_proxy("1.2.3.4:8080", "u:p"), "http://u:p@1.2.3.4:8080")
-        self.assertEqual(mod._site_proxy("socks5h://1.2.3.4:1080", "u:p"),
-                         "socks5h://u:p@1.2.3.4:1080")
-
-    def test_per_site_limit_caps_budget(self):
-        plugin = self._plugin()
-        plugin._max_per_site = 20
-        sites = plugin._other_sites()
-        self.assertEqual(len(sites), 1)
-        url = sites[0]["url"]
-        self.assertEqual(plugin._site_limits.get(url), 35)
-        self.assertEqual(plugin._site_budget_left(url), 35)
-        plugin._site_counter[url] = 30
-        self.assertEqual(plugin._site_budget_left(url), 5)
-
-    def test_budget_falls_back_to_global(self):
-        plugin = self._plugin()
-        plugin._max_per_site = 12
-        plugin._site_limits = {}
-        self.assertEqual(plugin._site_budget_left("https://x.example/"), 12)
 
 
 class SpeedLimitTest(unittest.TestCase):
@@ -1182,67 +1434,232 @@ class SpeedLimitTest(unittest.TestCase):
         self.assertEqual(plugin._limit_up_kib, 0)
 
 
-class IyuuImportTest(unittest.TestCase):
-    SAMPLE = json.dumps([
-        {"id": 1, "sid": 1, "site": "keepfrds", "nickname": "朋友",
-         "base_url": "pt.keepfrds.com", "mirror": "", "cookie": "", "cookie_required": 0,
-         "download_page": "download.php?id={}&passkey={passkey}", "is_https": 2, "disabled": 0,
-         "options": {"passkey": "a" * 32, "uid": "133256"}},
-        {"id": 2, "sid": 2, "site": "hdhome", "nickname": "家园",
-         "base_url": "hdhome.org", "mirror": "", "cookie": "c=1", "cookie_required": 0,
-         "download_page": "download.php?id={}&uid={uid}&hash={hash}", "is_https": 1, "disabled": 0,
-         "options": {"passkey": "b" * 32, "uid": "1", "downhash": "abc"}},
-        {"id": 3, "sid": 3, "site": "off", "nickname": "关掉的",
-         "base_url": "off.example", "disabled": 1, "options": {"passkey": "c" * 32}},
-    ], ensure_ascii=False)
 
-    def _plugin(self):
+
+
+
+class MpSiteTest(unittest.TestCase):
+    """③站点来源：MP 站点下拉（存 id）、凭据现读、IYUU sid 反查（官方模式）。"""
+
+    class FakeSite:
+        def __init__(self, sid, name, domain, rss="", apikey="", cookie=""):
+            self.id, self.name, self.domain = sid, name, domain
+            self.rss, self.apikey, self.cookie = rss, apikey, cookie
+
+    def _install_mp_modules(self, sites, indexers=None):
+        """注入假 SiteOper / SitesHelper，返回恢复函数。"""
+        outer = self
+
+        class FakeSiteOper:
+            def list_order_by_pri(self):
+                return sites
+
+        class FakeSitesHelper:
+            def get_indexer(self, domain):
+                return (indexers or {}).get(domain, {})
+
+        injected = {
+            "app.db": {"__path__": []},
+            "app.db.site_oper": {"SiteOper": FakeSiteOper},
+            "app.helper": {"__path__": []},
+            "app.helper.sites": {"SitesHelper": FakeSitesHelper},
+        }
+        saved = {}
+        for name, attrs in injected.items():
+            saved[name] = (name in sys.modules, sys.modules.get(name))
+            stub = sys.modules.get(name) or type(sys)(name)
+            for key, value in attrs.items():
+                setattr(stub, key, value)
+            sys.modules[name] = stub
+
+        def restore():
+            for name, (existed, module) in saved.items():
+                if existed:
+                    sys.modules[name] = module
+                else:
+                    sys.modules.pop(name, None)
+        return restore
+
+    def test_options_title_is_site_name_value_is_id(self):
+        sites = [self.FakeSite(11, "观众", "audiences.me"), self.FakeSite(12, "馒头", "pt.keepfrds.com")]
+        restore = self._install_mp_modules(sites)
+        try:
+            plugin = support.make_plugin(mod)
+            self.assertEqual(plugin._mp_site_options(), [
+                {"title": "观众", "value": "11"}, {"title": "馒头", "value": "12"}])
+        finally:
+            restore()
+
+    def test_passkey_from_rss(self):
+        self.assertEqual(mod.ColaCrossSeed._passkey_from_rss(
+            "https://audiences.me/torrentrss.php?passkey=" + "a" * 32), "a" * 32)
+        self.assertEqual(mod.ColaCrossSeed._passkey_from_rss("https://x.me/rss.php"), "")
+
+    def test_mp_sites_reads_selected_only(self):
+        """只取勾选的站；passkey 从 RSS 抠；没 passkey 的站也留给 IYUU/Cookie 路线。"""
+        sites = [
+            self.FakeSite(1, "观众", "audiences.me",
+                          rss="https://audiences.me/rss?passkey=" + "a" * 32),
+            self.FakeSite(2, "家园", "hdhome.org", rss="https://hdhome.org/torrentrss.php",
+                          cookie="session=abc"),
+        ]
+        restore = self._install_mp_modules(sites)
+        try:
+            plugin = support.make_plugin(mod, _mp_site_ids=[1])
+            got = plugin._mp_sites()
+            self.assertEqual(len(got), 1)
+            self.assertEqual(got[0]["passkey"], "a" * 32)
+            self.assertIn("audiences.me", got[0]["url"])
+            self.assertEqual(got[0]["sid"], 0)   # 没 Token 时留空，走 pieces/RSS
+            plugin._mp_site_ids = [2]
+            got = plugin._mp_sites()
+            self.assertEqual(len(got), 1, "没 passkey 的站不能被丢掉——IYUU 靠 Cookie 也能下")
+            self.assertEqual(got[0]["passkey"], "")
+            self.assertEqual(got[0]["cookie"], "session=abc")
+        finally:
+            restore()
+
+    def test_iyuu_site_index_normalizes_cached_string_keys(self):
+        plugin = support.make_plugin(
+            mod,
+            store={"iyuu_site_index": {"at": int(time.time()),
+                                       "sites": {"99": {"base_url": "https://hdhome.org/"}}}},
+            _iyuu_token="token")
+        self.assertEqual(set(plugin._iyuu_site_index()), {99})
+
+    def test_iyuu_sid_map_reports_all_sids_from_index(self):
+        """IYUU 汇报的是全站 sid，不是从 MP 站点凑出来的 sid。"""
+        plugin = support.make_plugin(mod, _iyuu_token="token")
+        plugin._iyuu_site_index = lambda: {
+            3: {"base_url": "https://hdhome.org/",
+                "download_page": "download.php?id={}&uid={uid}&hash={hash}"},
+            7: {"base_url": "https://audiences.me/", "download_page": "dl/{id}/{passkey}"},
+        }
+        got = plugin._iyuu_sid_map()
+        self.assertEqual(set(got), {3, 7})
+        self.assertEqual(got[3]["url"], "https://hdhome.org/")
+        self.assertEqual(got[7]["download_page"], "dl/{id}/{passkey}")
+
+    def test_iyuu_entry_resolves_via_sid_to_selected_mp_site(self):
+        """命中 sid → IYUU 站点地址/模板 → MP 站点凭据，不需要用户手写 sid/JSON。"""
+        sites = [self.FakeSite(1, "家园", "hdhome.org",
+                               rss="https://hdhome.org/torrentrss.php", cookie="session=abc")]
+        restore = self._install_mp_modules(sites)
+        try:
+            plugin = support.make_plugin(mod, _iyuu_token="token", _mp_site_ids=[1])
+            plugin._iyuu_site_index = lambda: {
+                99: {"base_url": "https://www.hdhome.org/",
+                     "download_page": "download.php?id={}&uid={uid}&hash={hash}"},
+            }
+            selected = plugin._mp_sites()
+            resolved, why = plugin._iyuu_site_for_entry(
+                {"sid": 99, "torrent_id": 123456}, selected)
+            self.assertEqual(why, "")
+            self.assertIsNotNone(resolved)
+            self.assertIn("hdhome.org", resolved["url"])
+            self.assertEqual(resolved["sid"], 99)
+            self.assertEqual(resolved["download_page"],
+                             "download.php?id={}&uid={uid}&hash={hash}")
+            self.assertEqual(resolved["cookie"], "session=abc")
+
+            plugin._mp_site_ids = []
+            resolved, why = plugin._iyuu_site_for_entry(
+                {"sid": 99, "torrent_id": 123456}, plugin._mp_sites())
+            self.assertIsNone(resolved)
+            self.assertIn("没有勾选", why)
+        finally:
+            restore()
+
+    def test_iyuu_test_message_has_no_json_hint(self):
+        plugin = support.make_plugin(mod, _iyuu_token="token")
+        plugin._iyuu_site_index = lambda: {}
+        self.assertIn("读不到 IYUU 站点索引", plugin._test_iyuu())
+
+
+class RunOnceTest(unittest.TestCase):
+    """参考 iyuuautoseed 的「立即运行一次」：勾一次跑一轮，跑完自动复位。"""
+
+    def test_form_has_once_switch(self):
         plugin = support.make_plugin(mod)
-        plugin.update_config = lambda cfg: None
-        plugin._sites_lines = ""
-        plugin._sites_mode = "merge"
-        plugin._iyuu_json = ""
-        return plugin
+        form, defaults = plugin.get_form()
+        text = json.dumps(form, ensure_ascii=False)
+        self.assertIn('"model": "onlyonce"', text)
+        self.assertIn("立即运行一次", text)
+        self.assertIs(defaults["onlyonce"], False)
 
-    def test_import_carries_uid_downhash_cookie(self):
-        plugin = self._plugin()
-        out = plugin._iyuu_import(self.SAMPLE)
-        self.assertTrue(out["ok"])
-        self.assertEqual(out["total"], 3)
-        self.assertEqual(out["enabled"], 2)
-        self.assertEqual(out["usable"], 2)
-        by_host = {s["url"].split("://", 1)[-1].split("/")[0]: s for s in plugin._iyuu_sites()}
-        self.assertEqual(by_host["pt.keepfrds.com"]["uid"], 133256)
-        self.assertEqual(by_host["hdhome.org"]["downhash"], "abc")
-        self.assertEqual(by_host["hdhome.org"]["cookie"], "c=1")
+    def test_init_resets_once_and_reads_limits(self):
+        plugin = support.make_plugin(mod)
+        plugin.init_plugin({
+            "enabled": False,
+            "onlyonce": True,
+            "max_per_hour": 7,
+            "max_per_site": 3,
+        })
+        self.assertFalse(plugin._onlyonce)
+        self.assertFalse(plugin._store["__config__"]["onlyonce"])
+        self.assertEqual(plugin._max_per_hour, 7)
+        self.assertEqual(plugin._max_per_site, 3)
 
-    def test_import_switches_manual_to_merge(self):
-        # 原来只用行文本的用户：导入后变成「IYUU + 行文本」，手写行不会被丢掉
-        plugin = self._plugin()
-        plugin._sites_mode = "manual"
-        plugin._iyuu_import(self.SAMPLE)
-        self.assertEqual(plugin._sites_mode, "merge")
+    def test_run_once_calls_auto_seed_forced(self):
+        """立即运行一次必须 force=True，才能无视启用总开关。"""
+        plugin = support.make_plugin(mod)
+        calls = []
+        plugin.auto_seed = lambda force=False: calls.append(force)
+        saved = mod.time.sleep
+        mod.time.sleep = lambda _: None
+        try:
+            plugin._run_once()
+        finally:
+            mod.time.sleep = saved
+        self.assertEqual(calls, [True])
 
-    def test_iyuu_only_ignores_manual_lines(self):
-        plugin = self._plugin()
-        plugin._sites_mode = "iyuu_only"
-        plugin._sites_lines = "老站,https://old.example.com,passkey=" + "d" * 32
-        plugin._iyuu_json = self.SAMPLE
-        hosts = [s["url"] for s in plugin._other_sites()]
-        self.assertEqual(len(hosts), 2)
-        self.assertTrue(all("old.example.com" not in h for h in hosts))
+    def test_onlyonce_ignores_enable_switch_but_needs_api_key(self):
+        """官方语义：总开关关着也能钩一次跑一轮；只有 API Key 是硬前提。"""
+        plugin = support.make_plugin(mod)
+        reached = []
+        import time as _time
+        # _run_once 里本来 sleep(3) 再跑；这里直接把 _run_once 换成探针，避免真等 3 秒/联网
+        saved_run_once = getattr(plugin, "_run_once", None)
+        plugin._run_once = lambda: reached.append("once")
+        try:
+            # 关掉所有开关，但有 API Key → 仍然触发（无视 enabled/crossseed）
+            plugin.init_plugin({"onlyonce": True, "api_key": "k"})
+            deadline = _time.time() + 2
+            while not reached and _time.time() < deadline:
+                _time.sleep(0.01)
+            self.assertEqual(reached, ["once"])
+            self.assertFalse(plugin._onlyonce)  # 跑完自动复位
 
-    def test_import_rejects_bad_json(self):
-        plugin = self._plugin()
-        out = plugin._iyuu_import("{not json")
-        self.assertFalse(out["ok"])
-        self.assertIn("解析失败", out["reason"])
+            # 没有 API Key → 不触发
+            reached.clear()
+            plugin.init_plugin({"onlyonce": True, "api_key": ""})
+            _time.sleep(0.05)
+            self.assertEqual(reached, [])
+        finally:
+            if saved_run_once is not None:
+                plugin._run_once = saved_run_once
 
-    def test_import_without_payload_uses_stored(self):
-        plugin = self._plugin()
-        plugin._iyuu_json = self.SAMPLE
-        out = plugin._iyuu_import("")
-        self.assertTrue(out["ok"])
-        self.assertEqual(out["usable"], 2)
+    def test_auto_seed_force_bypasses_enable_check(self):
+        """force=True 时即使总开关关着，也不在开头那道 enable 检查处返回。"""
+        plugin = support.make_plugin(mod)
+        plugin._enabled = False
+        plugin._crossseed_enabled = False
+        plugin._api_key = "k"
+        plugin._event.clear()
+        reached = []
+        plugin._apply_target_client = lambda clients: clients
+        plugin.save_data = lambda *a, **k: None
+        # 用抛异常的 _clients 当探针：调到它就说明穿过了 enable 检查。
+        # 直接调 _auto_seed（不走 auto_seed 的 try/except，异常才会冒出来）。
+        def boom():
+            reached.append(1)
+            raise RuntimeError("probe")
+        plugin._clients = boom
+        with self.assertRaises(RuntimeError):
+            plugin._auto_seed(force=True)
+        self.assertEqual(reached, [1])
 
-
+        # force=False 时在 enable 检查处直接返回，连 _clients 都不碰
+        reached.clear()
+        plugin._auto_seed(force=False)
+        self.assertEqual(reached, [])
