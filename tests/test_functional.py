@@ -345,6 +345,8 @@ class OpenApiTest(unittest.TestCase):
         self.assertEqual(got, torrent)
         self.assertEqual(calls[0]["method"], "POST")
         self.assertTrue(calls[0]["url"].endswith("/api/v1/torrents/42/download-links"))
+        self.assertIsNone(calls[0].get("json_body"), "createDownloadLink 不收请求体，发 {} 会被 400（#67）")
+        self.assertIsNone(calls[0].get("data"))
         self.assertKeyOnly(calls[0])
         self.assertEqual(calls[1]["url"], link)
         self.assertNotIn("X-API-Key", calls[1].get("headers") or {}, "签名直链本身就是凭据")

@@ -1029,7 +1029,7 @@ class ColaCrossSeed(_PluginBase):
     plugin_name = "可乐PT辅种"
     plugin_desc = "参考 ReseedPuppy / IYUU 辅种插件：把客户端里已有的资源与可乐PT 对照，存在就拉可乐种子自动辅种；反向也支持去别的站补种。"
     plugin_icon = "https://www.colapt.com/brand/cola/app-red-180.png"
-    plugin_version = "0.13.0"
+    plugin_version = "0.13.1"
     plugin_author = "ColaPT"
     author_url = "https://www.colapt.com"
     plugin_config_prefix = "colacrossseed_"
@@ -1450,7 +1450,8 @@ class ColaCrossSeed(_PluginBase):
 
     def _download_cola(self, torrent_id: int) -> bytes:
         """取可乐的种子：createDownloadLink 签一条 30 分钟的直链，再不带任何凭据 GET 它。"""
-        rsp = self._cola("POST", COLA_DOWNLOAD_LINK_API.format(id=int(torrent_id)), json_body={})
+        # createDownloadLink 不收请求体：哪怕发 `{}`，网关也会 400「这个操作不接受请求内容」（#67）
+        rsp = self._cola("POST", COLA_DOWNLOAD_LINK_API.format(id=int(torrent_id)))
         if rsp is None or rsp.status_code not in (200, 201):
             return b""
         url = str((rsp.json({}) or {}).get("download_url") or "")
