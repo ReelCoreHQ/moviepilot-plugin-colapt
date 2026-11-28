@@ -217,26 +217,15 @@ def make_plugin(module, store=None, cls_name=None, **attrs):
     plugin.get_data = get_data
     plugin.save_data = save_data
     plugin.post_message = lambda **kwargs: None
-    plugin._sites_lines = attrs.pop("sites_lines", "")
-    plugin._sites_json = attrs.pop("sites_json", "")
-    plugin._iyuu_json = attrs.pop("iyuu_json", "")
-    plugin._iyuu_token = attrs.pop("iyuu_token", "")
-    plugin._sites_mode = attrs.pop("sites_mode", "merge")
     plugin._event = module.Event()
-    plugin._pieces_paths = {}
-    plugin._site_counter = {}
-    plugin._site_fails = {}
-    plugin._iyuu_rate_limited = False
     plugin._seedgroup_report = False      # 测试默认不往 23 汇报，避免真发请求
     plugin._max_per_hour = 0
-    plugin._max_per_site = 20
     plugin._skip_check = True
     plugin._fallback_skip_check = True
     plugin._retry_failed = True
     plugin._add_label = ""
     plugin._inherit_tags = True
     plugin._extra_tags = ""
-    plugin._target_client = ""
     for key, value in attrs.items():
         setattr(plugin, key, value)
     return plugin
